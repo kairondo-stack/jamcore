@@ -1,9 +1,25 @@
 use rosc::{decoder, OscType};
 use std::io;
 use std::io::Write;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::Duration;
+
+/// Ziele aus "host:port,host2:port2" auflösen (Hostnamen und IPs).
+fn parse_targets(spec: &str) -> Result<Vec<SocketAddr>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let addrs: Vec<SocketAddr> = part
+            .to_socket_addrs()
+            .map_err(|e| format!("Ziel ungültig {part}: {e}"))?
+            .collect();
+        if addrs.is_empty() {
+            return Err(format!("Ziel ohne Adresse: {part}"));
+        }
+        out.extend(addrs);
+    }
+    Ok(out)
+}
 
 fn relay(listen_port: u16, targets: Vec<SocketAddr>) -> io::Result<()> {
     let rx = UdpSocket::bind(("0.0.0.0", listen_port))?;
@@ -22,7 +38,9 @@ fn relay(listen_port: u16, targets: Vec<SocketAddr>) -> io::Result<()> {
                     Err(_) => eprintln!("[{listen_port}] Nicht-OSC-Datagramm von {src}"),
                 }
                 for t in &targets {
-                    tx.send_to(&buf[..n], t)?;
+                    if let Err(e) = tx.send_to(&buf[..n], t) {
+                        eprintln!("Senden an {t}: {e}");
+                    }
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
@@ -60,18 +78,9 @@ fn main() -> io::Result<()> {
         }
     };
 
-    let mut targets: Vec<SocketAddr> = Vec::new();
-    for p in std::env::var("OSC_TARGETS")
-        .unwrap_or_else(|_| format!("{target_ip}:7003"))
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-    {
-        let addr: SocketAddr = p
-            .trim()
-            .parse()
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Ziel ungültig {p}: {e}")))?;
-        targets.push(addr);
-    }
+    let spec = std::env::var("OSC_TARGETS").unwrap_or_else(|_| format!("{target_ip}:7003"));
+    let targets = parse_targets(&spec)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     println!("OSC Relay: lauscht 7000 + 7005, Ziel(e): {}", targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "));
 
     let t_targets = targets.clone();
@@ -83,4 +92,18 @@ fn main() -> io::Result<()> {
     let _ = t1.join();
     let _ = t2.join();
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_targets_resolves_hostnames_and_ips() {
+        let t = parse_targets("localhost:7003").unwrap();
+        assert!(t.iter().any(|a| a.port() == 7003));
+        let t = parse_targets("127.0.0.1:7003, 127.0.0.1:7004").unwrap();
+        assert_eq!(t.len(), 2);
+        assert!(parse_targets("").unwrap().is_empty());
+        assert!(parse_targets("127.0.0.1:99999").is_err());
+    }
 }

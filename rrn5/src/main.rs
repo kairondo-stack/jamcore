@@ -858,6 +858,20 @@ fn build_renoise_xml(pattern_length: i32, notes: &[(i32, String)]) -> String {
     xml
 }
 
+/// LCtrl+Home/LCtrl+9: globalen Zeitstempel für xValuesTime aufnehmen (C++ rrn5.cpp:2456+).
+fn lctrl_time_record(app: &mut App) {
+    if app.bpmscanfirstpress {
+        app.firstTime = Instant::now();
+        app.previousTime = app.firstTime;
+        app.bpmscanfirstpress = false;
+        app.xValuesTime.clear();
+    } else {
+        let cur = Instant::now();
+        let span = cur.duration_since(app.previousTime).as_secs_f64();
+        app.xValuesTime.push(span);
+    }
+}
+
 /// Pixel für Harmonics zeichnen? C++: r != 255 && g != 0 && b != 0 (rrn5.cpp:1676).
 fn harmonic_pixel_eligible(r: u8, g: u8, b: u8) -> bool {
     r != 255 && g != 0 && b != 0
@@ -1374,16 +1388,12 @@ fn handle_key(
                 }
             }
             Keycode::Home => {
-                if app.bpmscanfirstpress {
-                    app.firstTime = Instant::now();
-                    app.previousTime = app.firstTime;
-                    app.bpmscanfirstpress = false;
-                    app.xValuesTime.clear();
-                } else {
-                    let cur = Instant::now();
-                    let span = cur.duration_since(app.previousTime).as_secs_f64();
-                    app.xValuesTime.push(span);
-                }
+                lctrl_time_record(app);
+            }
+            Keycode::Num9 => {
+                // C++: LCtrl+9 fällt ohne break in den Home-Handler (Zeitaufnahme).
+                lctrl_time_record(app);
+                println!("xValuesTime: {} Einträge", app.xValuesTime.len());
             }
             Keycode::End => {
                 app.xValues = calculate_x_coordinates(&app.xValuesTime, app.xw);
@@ -1879,8 +1889,13 @@ fn handle_key(
             unsafe {
                 if let Ok(()) = x11cap::capture_clicked_window() {
                     if let Some((iw, ih, img)) = load_image_to_rgba("output.ppm") {
+                        // Wie C++: frame0.bmp ist der rohe Capture (ungeskaliert).
+                        if let Some(raw) =
+                            image::RgbaImage::from_raw(iw as u32, ih as u32, img.clone())
+                        {
+                            let _ = raw.save("frame0.bmp");
+                        }
                         scale_rgba_into(w, h, main_buffer, iw, ih, &img);
-                        save_rgba_bmp("frame0.bmp", w, h, main_buffer);
                         main_view.present(main_buffer, w, h);
                     }
                 }

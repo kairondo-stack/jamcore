@@ -240,6 +240,21 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Nachgezogen (4. Runde): Kleinkram & Doku
+
+- **bundle_udp:** Ziele werden per `ToSocketAddrs` aufgelöst (Hostnamen wie
+  `localhost`), Sendefehler pro Ziel werden geloggt statt den Relay-Thread zu
+  beenden. Unit-Test.
+- **rrn5 LCtrl+9:** C++-Fall-through in den Home-Handler portiert (Zeitaufnahme);
+  gemeinsamer Helfer `lctrl_time_record()`.
+- **rrn5 `frame0.bmp`:** speichert jetzt den rohen Capture (wie C++), nicht das
+  skalierte Hauptbild.
+- **Alt+G-Fall-through bewusst nicht portiert:** das C++-Fall-through (Toggle +
+  `leftset` + Farbwechsel gleichzeitig) ist offensichtlich versehentlich; gemäß
+  ⚠E3 ausgelassen.
+- **README.md** mit Crates, Build-/Testkommandos, E2E-Hook und Workflow.
+- `run_all.sh` führt jetzt auch it_live- und bundle_udp-Unit-Tests aus.
+
 ### Nachgezogen (3. Runde): restliche Fenster
 
 - **Graph-Fenster (pattern_recorder):** `run_graph_window()` mit Maus-Zeichnen
