@@ -240,6 +240,16 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Nachgezogen (6. Runde): Harmonics-Bereiche
+
+- **`useNotesSet`-X-Bereiche:** neuer reiner Helfer `in_notesset_range`
+  (Set n gilt für `x ∈ [setx[n-1][0], setx[n][0])`), Unit-Test; `is_note_in_chord`
+  und `is_note_in_chord_ext` nutzen ihn jetzt, `_ext` bekommt dafür das
+  Pixel-x übergeben (vorher wurden alle Sets unabhängig vom Bereich geprüft).
+- **C++-Bugs bewusst nicht übernommen:** `isNoteInChordpatt` übergibt den
+  Chord-Index statt Pixel-x und vergleicht `i < xValueschords.size()-1`;
+  Rust behält die funktionale Variante (⚠E3).
+
 ### Nachgezogen (5. Runde): letzte Interaktionen
 
 - **`eingabe()` Dezimaltaste:** `KpDecimal` hängt jetzt `.` an (vorher der

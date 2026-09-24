@@ -564,29 +564,15 @@ impl App {
         }
         let n = (((note + self.noteValueadd) % 12) + 12) % 12;
         if self.useNotesSet {
-            for v in 0..self.notessetcount as usize {
-                if v == 0 {
-                    if x < self.notessetx[v].first().copied().unwrap_or(0) {
-                        for &nn in self.notesset[v].iter() {
-                            if n == nn {
-                                return true;
-                            }
-                        }
-                    }
-                } else if let (Some(cx), Some(px)) = (
-                    self.notessetx[v].first().copied(),
-                    self.notessetx[v - 1].first().copied(),
-                ) {
-                    if x < cx && x >= px {
-                        for &nn in self.notesset[v].iter() {
-                            if n == nn {
-                                return true;
-                            }
-                        }
-                    }
-                }
-            }
-            return false;
+            let count = (self.notessetcount.max(0) as usize)
+                .min(self.notesset.len())
+                .min(self.notessetx.len());
+            return in_notesset_range(
+                n,
+                x,
+                &self.notesset[..count],
+                &self.notessetx[..count],
+            );
         }
         if self.useMajorChords && !self.useNotesSet {
             n == 0 || n == 4 || (self.usePerfectFifth && n == 7)
@@ -607,7 +593,7 @@ impl App {
                 let (maj, fifth, add) = self.chordTypes[c];
                 let nv = j * self.noteScale / hgt + add;
                 if (i as f32) < self.xValueschords[c] {
-                    if self.is_note_in_chord_ext(nv, maj, fifth) {
+                    if self.is_note_in_chord_ext(nv, i, maj, fifth) {
                         hit = true;
                     }
                 } else if c + 1 < self.xValueschords.len()
@@ -615,7 +601,7 @@ impl App {
                     && (i as f32) >= self.xValueschords[c]
                 {
                     let nv2 = j * self.noteScale / hgt;
-                    if self.is_note_in_chord_ext(nv2, maj, fifth) {
+                    if self.is_note_in_chord_ext(nv2, i, maj, fifth) {
                         hit = true;
                     }
                 }
@@ -624,20 +610,21 @@ impl App {
         }
     }
 
-    fn is_note_in_chord_ext(&self, note: i32, major: bool, fifth: bool) -> bool {
+    fn is_note_in_chord_ext(&self, note: i32, x: i32, major: bool, fifth: bool) -> bool {
         if !self.harmonics {
             return true;
         }
         let n = (((note + self.noteValueadd) % 12) + 12) % 12;
         if self.useNotesSet {
-            for v in self.notesset.iter() {
-                for &nn in v.iter() {
-                    if n == nn {
-                        return true;
-                    }
-                }
-            }
-            return false;
+            let count = (self.notessetcount.max(0) as usize)
+                .min(self.notesset.len())
+                .min(self.notessetx.len());
+            return in_notesset_range(
+                n,
+                x,
+                &self.notesset[..count],
+                &self.notessetx[..count],
+            );
         }
         if major {
             n == 0 || n == 4 || (fifth && n == 7)
@@ -856,6 +843,31 @@ fn build_renoise_xml(pattern_length: i32, notes: &[(i32, String)]) -> String {
     xml.push_str("<SubColumnMask>true true true false false false false false</SubColumnMask>\n");
     xml.push_str("</Column>\n</Column>\n</Columns>\n</PatternClipboard.BlockBuffer>\n");
     xml
+}
+
+/// Notenklasse in den harmonischen Sets prüfen; X-Bereiche gelten je Set
+/// (Set n gilt für x aus [setx[n-1][0], setx[n][0]), Set 0 für x < setx[0][0]).
+fn in_notesset_range(
+    n: i32,
+    x: i32,
+    sets: &[Vec<i32>],
+    setx: &[Vec<i32>],
+) -> bool {
+    for v in 0..sets.len() {
+        let cur = setx.get(v).and_then(|s| s.first()).copied();
+        let applies = if v == 0 {
+            cur.is_some_and(|cx| x < cx)
+        } else {
+            match (cur, setx.get(v - 1).and_then(|s| s.first()).copied()) {
+                (Some(cx), Some(px)) => x < cx && x >= px,
+                _ => false,
+            }
+        };
+        if applies && sets[v].contains(&n) {
+            return true;
+        }
+    }
+    false
 }
 
 /// LCtrl+Home/LCtrl+9: globalen Zeitstempel für xValuesTime aufnehmen (C++ rrn5.cpp:2456+).
@@ -1178,12 +1190,12 @@ fn find_and_draw_harmonics(
                     let (maj, fifth, add) = app.chordTypes[c];
                     let nv = (j + add) * app.noteScale / h;
                     let hit = if (i as f32) < app.xValueschords[c] {
-                        app.is_note_in_chord_ext(nv, maj, fifth)
+                        app.is_note_in_chord_ext(nv, i, maj, fifth)
                     } else if c + 1 < app.xValueschords.len()
                         && (i as f32) < app.xValueschords[c + 1]
                         && (i as f32) >= app.xValueschords[c]
                     {
-                        app.is_note_in_chord_ext(nv, maj, fifth)
+                        app.is_note_in_chord_ext(nv, i, maj, fifth)
                     } else {
                         false
                     };
@@ -2498,6 +2510,18 @@ mod tests {
             preview_note_vol(2, 0, 100, 100, 100, 200, -250, (0, 0, 0)).0,
             0
         );
+    }
+
+    #[test]
+    fn in_notesset_range_honors_x_bands() {
+        let sets = vec![vec![0, 4, 7], vec![2, 5, 9]];
+        let setx = vec![vec![100], vec![200]];
+        assert!(in_notesset_range(4, 50, &sets, &setx));
+        assert!(!in_notesset_range(2, 50, &sets, &setx));
+        assert!(in_notesset_range(2, 150, &sets, &setx));
+        assert!(!in_notesset_range(4, 150, &sets, &setx));
+        assert!(!in_notesset_range(2, 250, &sets, &setx));
+        assert!(!in_notesset_range(4, 250, &sets, &setx));
     }
 
     #[test]
