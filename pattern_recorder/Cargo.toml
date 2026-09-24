@@ -1,0 +1,11 @@
+[package]
+name = "pattern_recorder"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sdl2 = { version = "0.37", features = ["ttf"] }
+rosc = "0.9"
+shared_memory = "0.12"
+quick-xml = "0.37"
+libc = "0.2"

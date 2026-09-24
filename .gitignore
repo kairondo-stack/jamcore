@@ -1,0 +1,9 @@
+target/
+tests/e2e/fixtures/
+frame.bmp
+frame0.bmp
+frame4.bmp
+frame4save.bmp
+output.ppm
+snapshot.tga
+savesurf.bmp
