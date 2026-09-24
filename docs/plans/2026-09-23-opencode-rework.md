@@ -240,6 +240,16 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Schism-Integration (Handtest + Regression)
+
+- Handtest auf dem echten System: Export-Pattern in Schism (Alt+P) eingefügt und
+  von Schism zurückkopiert — die Rückkopie ist **zellgenau identisch** mit
+  `/tmp/schism_pattern.pit` (6 Noten, gleiche Reihen/Kanäle/Pitches inkl. C#4;
+  Schism schreibt Instrument `00` als leer, Zellbreite 11 + `|`).
+- Export als reine Funktion `notes_to_schism_pattern` extrahiert, Unit-Test mit
+  exakten Zeilen/Pitches; E2E prüft Format + Reihenfolge (Zeilen zeitbedingt
+  tolerant, Unit-Test exakt).
+
 ### Nachgezogen (6. Runde): Harmonics-Bereiche
 
 - **`useNotesSet`-X-Bereiche:** neuer reiner Helfer `in_notesset_range`

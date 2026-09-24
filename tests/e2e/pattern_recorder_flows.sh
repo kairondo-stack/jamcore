@@ -38,6 +38,23 @@ wait_for 15 test -s /tmp/schism_pattern.pit || fail "Schism-Datei fehlt: $(tail 
 assert_contains /tmp/schism_pattern.pit "Pasted Pattern - IT"
 xclip_schism="$(xclip -selection clipboard -o 2>/dev/null || true)"
 grep -q "Pasted Pattern - IT" <<<"$xclip_schism" || fail "Schism-Pattern nicht im Clipboard"
+python3 - <<'PY' || fail "Schism-Pattern weicht vom verifizierten Format ab"
+import re
+lines = open("/tmp/schism_pattern.pit").read().splitlines()
+assert lines[0] == "Pasted Pattern - IT", lines[0]
+assert len(lines) == 65, len(lines)
+rows = {}
+for ln, line in enumerate(lines[1:]):
+    assert line.startswith("|") and len(line) == 12, repr(line)
+    for ch, cell in enumerate(line.split("|")[1:]):
+        if re.search(r"[A-G]#?[-0-9]", cell):
+            rows[ln] = cell[:3]
+# Aufnahmedauer ist zeitabhängig -> Zeilen nur grob, Reihenfolge exakt prüfen
+assert len(rows) == 6, rows
+keys = sorted(rows)
+assert keys == sorted(keys) and keys[0] < 2 and keys[-1] > 54, keys
+assert [rows[r] for r in keys] == ["C-4", "C-4", "C#4", "C-4", "C#4", "D-4"], rows
+PY
 
 log "Phase C: Renoise-Import (Z) -> CSV"
 cat >"$TMP/renoise_import.xml" <<'XML'

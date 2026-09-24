@@ -469,6 +469,40 @@ fn sinus_interpolate(
     result
 }
 
+/// Schism-Clipboard-Format: "Pasted Pattern - IT" + je Zeile `|`-getrennte
+/// 11-Zeichen-Zellen (Note+Instrument+Channel+Effekt+Ende).
+fn notes_to_schism_pattern(notes4: &[Note3], pattern_length: i32) -> String {
+    let af = "|";
+    let ed = ".\n";
+    let ch_str = "..";
+    let eff_str = "...";
+    let empty = "..........";
+    let mut buff = String::from("Pasted Pattern - IT\n");
+    let mut bnote = false;
+    for i in 0..pattern_length.max(0) {
+        let mut line_str = String::new();
+        for note in notes4 {
+            if (note.timestamp * pattern_length as f32) as i32 == i {
+                line_str += af;
+                line_str += &midi_to_renoise_note(note.pitch);
+                line_str += "00";
+                line_str += ch_str;
+                line_str += eff_str;
+                line_str += ed;
+                bnote = true;
+            }
+        }
+        if !bnote {
+            line_str += af;
+            line_str += empty;
+            line_str += ed;
+        }
+        buff += &line_str;
+        bnote = false;
+    }
+    buff
+}
+
 /// Divisionsschutz: 0/NaN/negativ -> 1.0 (verhindert NaN-Timestamps).
 fn safe_divisor(v: f32) -> f32 {
     if v.is_finite() && v > 0.0 {
@@ -2700,36 +2734,7 @@ impl PatternRecorder {
     // ------------- Renoise/Clipboard -------------
     fn convert_notes_to_schism_pattern(&self, pattern_length: i32) {
         println!("Converting notes to Schism pattern...");
-        let af = "|";
-        let ed = ".\n";
-        let ch_str = "..";
-        let eff_str = "...";
-        let empty = "..........";
-        let mut buff = String::from("Pasted Pattern - IT\n");
-        let mut bnote = false;
-        for i in 0..pattern_length {
-            let mut line_str = String::new();
-            for ii in 0..self.notes4.len() {
-                if (self.notes4[ii].timestamp * pattern_length as f32) as i32 == i {
-                    let note_str = midi_to_renoise_note(self.notes4[ii].pitch);
-                    let instr = "00";
-                    line_str += af;
-                    line_str += &note_str;
-                    line_str += instr;
-                    line_str += ch_str;
-                    line_str += eff_str;
-                    line_str += ed;
-                    bnote = true;
-                }
-            }
-            if !bnote {
-                line_str += af;
-                line_str += empty;
-                line_str += ed;
-            }
-            buff += &line_str;
-            bnote = false;
-        }
+        let buff = notes_to_schism_pattern(&self.notes4, pattern_length);
         let temp_file = "/tmp/schism_pattern.pit";
         std::fs::write(temp_file, &buff).ok();
         let ok = copy_to_clipboard(temp_file);
@@ -4536,6 +4541,34 @@ mod tests {
         assert_eq!(renoise_note_to_midi("Off"), -1);
         assert_eq!(midi_to_renoise_note(renoise_note_to_midi("C-4")), "C-4");
         assert_eq!(midi_to_renoise_note(renoise_note_to_midi("A#3")), "A#3");
+    }
+
+    #[test]
+    fn notes_to_schism_pattern_matches_clipboard_format() {
+        let mk = |t: f32, p: i32| Note3::new(t, 0, p);
+        let notes = vec![
+            mk(0.0, 60),
+            mk(0.3348115, 60),
+            mk(0.50110865, 61),
+            mk(0.6674058, 60),
+            mk(0.77827054, 61),
+            mk(0.88913524, 62),
+            mk(1.0, 0),
+        ];
+        let s = notes_to_schism_pattern(&notes, 64);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "Pasted Pattern - IT");
+        assert_eq!(lines.len(), 65);
+        for l in &lines[1..] {
+            assert_eq!(l.len(), 12, "Zellenbreite: {l}");
+        }
+        assert_eq!(lines[1], "|C-400......");
+        assert_eq!(lines[22], "|C-400......");
+        assert_eq!(lines[33], "|C#400......");
+        assert_eq!(lines[43], "|C-400......");
+        assert_eq!(lines[50], "|C#400......");
+        assert_eq!(lines[57], "|D-400......");
+        assert_eq!(notes_to_schism_pattern(&[], 3).lines().count(), 4);
     }
 
     #[test]
