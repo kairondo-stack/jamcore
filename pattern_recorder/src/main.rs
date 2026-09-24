@@ -404,6 +404,71 @@ fn graph_points_to_notes(points: &[(i32, i32)], start_time: f32, end_time: f32) 
         .collect()
 }
 
+/// Eingabezeichen anhängen; nur ein Dezimalpunkt (KpDecimal) wird akzeptiert.
+fn append_input_token(input: &mut String, ch: char) {
+    if ch == '.' && input.contains('.') {
+        return;
+    }
+    input.push(ch);
+}
+
+/// Sinus-Interpolation zwischen Start-/End-Index (C++: interpolateNotesWithSinusPitch).
+fn sinus_interpolate(
+    notes4: &[Note3],
+    start: usize,
+    end: usize,
+    steps_per_intervala: i32,
+    steps_per_intervale: i32,
+    factorpi: f32,
+    noteanz: f32,
+    curve: i32,
+) -> Vec<Note3> {
+    let mut result: Vec<Note3> = Vec::new();
+    if notes4.is_empty() {
+        return result;
+    }
+    result.push(notes4[0].clone());
+    if start >= end || end >= notes4.len() {
+        return result;
+    }
+    let steps = end - start;
+    let steps_per_intervaladd = (steps_per_intervale - steps_per_intervala) as f32 / steps as f32;
+    for i in start..end {
+        let t_start = notes4[i].timestamp;
+        let t_end = notes4[i + 1].timestamp;
+        let range = t_end - t_start;
+        if range <= 0.0 {
+            continue;
+        }
+        let steps_per_interval = (steps_per_intervala as f32 + steps_per_intervaladd) as i32;
+        for j in 1..=steps_per_interval {
+            let t = t_start + range * j as f32 / (steps_per_interval + 1) as f32;
+            let normalized = (t - t_start) * (factorpi * M_PI as f32) / range;
+            let sine_value = normalized.sin();
+            let mut pitch = 0;
+            if curve == 1 {
+                pitch = (sine_value * noteanz * (t / notes4[end].timestamp) / notes4[end].timestamp)
+                    as i32
+                    + notes4[i].pitch;
+            } else if curve == 2 {
+                pitch = (sine_value
+                    * noteanz
+                    * (1.0 - (t / notes4[end].timestamp) / notes4[end].timestamp))
+                    as i32
+                    + notes4[i].pitch;
+            } else if curve == 3 {
+                pitch = (sine_value * noteanz) as i32 + notes4[i].pitch;
+            }
+            let mut new_note = notes4[i].clone();
+            new_note.timestamp = t;
+            new_note.pitch = pitch;
+            result.push(new_note);
+        }
+        result.push(notes4[i + 1].clone());
+    }
+    result
+}
+
 /// Divisionsschutz: 0/NaN/negativ -> 1.0 (verhindert NaN-Timestamps).
 fn safe_divisor(v: f32) -> f32 {
     if v.is_finite() && v > 0.0 {
@@ -901,11 +966,10 @@ impl PatternRecorder {
                         return input;
                     }
                     if let Some(d) = digit_value(kc) {
-                        input += &d.to_string();
+                        append_input_token(&mut input, char::from_digit(d, 10).unwrap_or('0'));
                         println!("input: {}", input);
                     } else if kc == Keycode::KpDecimal {
-                        let v = kc.into_i32();
-                        input += &v.to_string();
+                        append_input_token(&mut input, '.');
                         println!("input: {}", input);
                     }
                 }
@@ -2961,6 +3025,7 @@ impl PatternRecorder {
 
     fn interpolate_notes_with_sinus_pitch(
         &mut self,
+        pump: &mut EventPump,
         notes4: &[Note3],
         steps_per_intervala: i32,
         steps_per_intervale: i32,
@@ -2968,58 +3033,25 @@ impl PatternRecorder {
         noteanz: f32,
         curve: i32,
     ) -> Vec<Note3> {
-        let mut result: Vec<Note3> = Vec::new();
         if notes4.is_empty() {
-            return result;
+            return Vec::new();
         }
-        result.push(notes4[0].clone());
-        // C++ ruft hier anfendIndex() (interaktiv) auf; wir nutzen die zuletzt gesetzten Indizes.
+        // C++ ruft hier interaktiv anfendIndex() auf.
+        self.anfend_index(pump);
         let start = self.start_index.clamp(0, notes4.len() as i32 - 1) as usize;
         let end = self
             .end_index
             .clamp(0, notes4.len() as i32 - 1) as usize;
-        let selectrange = notes4[end].timestamp - notes4[start].timestamp;
-        let _ = selectrange;
-        let steps = end - start;
-        let steps_per_intervaladd =
-            (steps_per_intervale - steps_per_intervala) as f32 / steps as f32;
-        let mut i = start;
-        while i < end {
-            let t_start = notes4[i].timestamp;
-            let t_end = notes4[i + 1].timestamp;
-            let range = t_end - t_start;
-            if range <= 0.0 {
-                i += 1;
-                continue;
-            }
-            let steps_per_interval =
-                (steps_per_intervala as f32 + steps_per_intervaladd) as i32;
-            for j in 1..=steps_per_interval {
-                let t = t_start + range * j as f32 / (steps_per_interval + 1) as f32;
-                let normalized = (t - t_start) * (factorpi * M_PI as f32) / range;
-                let sine_value = normalized.sin();
-                let mut pitch = 0;
-                if curve == 1 {
-                    pitch = (sine_value * noteanz
-                        * (t / notes4[end].timestamp)
-                        / notes4[end].timestamp) as i32
-                        + notes4[i].pitch;
-                } else if curve == 2 {
-                    pitch = (sine_value * noteanz
-                        * (1.0 - (t / notes4[end].timestamp) / notes4[end].timestamp)) as i32
-                        + notes4[i].pitch;
-                } else if curve == 3 {
-                    pitch = (sine_value * noteanz) as i32 + notes4[i].pitch;
-                }
-                let mut new_note = notes4[i].clone();
-                new_note.timestamp = t;
-                new_note.pitch = pitch;
-                result.push(new_note);
-            }
-            result.push(notes4[i + 1].clone());
-            i += 1;
-        }
-        result
+        sinus_interpolate(
+            notes4,
+            start,
+            end,
+            steps_per_intervala,
+            steps_per_intervale,
+            factorpi,
+            noteanz,
+            curve,
+        )
     }
 
     // ------------- CSV -------------
@@ -4043,7 +4075,7 @@ fn main() -> Result<(), String> {
                         let curve: i32 = svalue1111.parse().unwrap_or(0);
                         let n4 = recorder.notes4.clone();
                         let notes5 = recorder.interpolate_notes_with_sinus_pitch(
-                            &n4, sa, se, pi, amp, curve,
+                            &mut pump, &n4, sa, se, pi, amp, curve,
                         );
                         recorder.notes5 = notes5.clone();
                         recorder.notes4 = notes5;
@@ -4088,6 +4120,7 @@ fn main() -> Result<(), String> {
                         let patanz = playpatanz.clamp(0, 8) as usize;
                         for i in 0..patanz {
                             recorder.notes55[i] = recorder.interpolate_notes_with_sinus_pitch(
+                                &mut pump,
                                 &n4,
                                 sa + (i as f32 * interpadd) as i32,
                                 sa + ((i + 1) as f32 * interpadd) as i32,
@@ -4513,6 +4546,41 @@ mod tests {
         assert_eq!(renoise_note_to_midi("Off"), -1);
         assert_eq!(midi_to_renoise_note(renoise_note_to_midi("C-4")), "C-4");
         assert_eq!(midi_to_renoise_note(renoise_note_to_midi("A#3")), "A#3");
+    }
+
+    #[test]
+    fn append_input_token_allows_single_decimal_point() {
+        let mut s = String::new();
+        append_input_token(&mut s, '1');
+        append_input_token(&mut s, '.');
+        append_input_token(&mut s, '5');
+        append_input_token(&mut s, '.');
+        assert_eq!(s, "1.5");
+    }
+
+    #[test]
+    fn sinus_interpolate_inserts_between_notes() {
+        let notes = vec![
+            Note3::new(0.0, 0, 60),
+            Note3::new(0.5, 0, 62),
+            Note3::new(1.0, 0, 64),
+        ];
+        let out = sinus_interpolate(&notes, 0, 2, 1, 1, 1.0, 0.0, 3);
+        assert_eq!(out.len(), 5);
+        assert!((out[1].timestamp - 0.25).abs() < 1e-6);
+        assert!((out[3].timestamp - 0.75).abs() < 1e-6);
+        assert_eq!(out[1].pitch, 60);
+        assert_eq!(out[3].pitch, 62);
+        assert_eq!(out[4].pitch, 64);
+        assert!(sinus_interpolate(&[], 0, 0, 1, 1, 1.0, 0.0, 3).is_empty());
+    }
+
+    #[test]
+    fn sinus_interpolate_degrades_gracefully_on_bad_range() {
+        let notes = vec![Note3::new(0.0, 0, 60), Note3::new(1.0, 0, 62)];
+        let out = sinus_interpolate(&notes, 1, 0, 1, 1, 1.0, 0.0, 3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].pitch, 60);
     }
 
     #[test]

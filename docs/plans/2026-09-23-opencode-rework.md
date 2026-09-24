@@ -240,6 +240,16 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Nachgezogen (5. Runde): letzte Interaktionen
+
+- **`eingabe()` Dezimaltaste:** `KpDecimal` hängt jetzt `.` an (vorher der
+  rohe SDL-Keycode), Helper `append_input_token` verhindert doppelte Punkte.
+- **Sinus-Interpolation:** `interpolate_notes_with_sinus_pitch` ruft wie C++
+  interaktiv `anfend_index()` auf; Kernlogik als reine Funktion
+  `sinus_interpolate` ausgelagert inkl. Schutz bei leerem/ungültigem Bereich.
+- **E2E Phase E:** kompletter `D`+`3`-Flow mit Parametern und interaktiven
+  Indizes → CSV mit interpolierten Noten.
+
 ### Nachgezogen (4. Runde): Kleinkram & Doku
 
 - **bundle_udp:** Ziele werden per `ToSocketAddrs` aufgelöst (Hostnamen wie

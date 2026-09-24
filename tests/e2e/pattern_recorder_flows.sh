@@ -66,4 +66,12 @@ assert_contains "$TMP/pr_graph.log" "stepGraph2: 501 Punkte"
 assert_contains "$TMP/pr_graph.log" "pitchstepGraph2:"
 assert_contains "$TMP/pr_graph.log" "pitchGraph:"
 
+log "Phase E: Sinus-Interpolation (D+3) mit interaktiven Indizes"
+WORK_E="$(run_pr sinus "$REC_KEYS,D,3,1,Return,1,Return,1,Return,2,Return,5,Return,3,Return,0,Return,3,Return,J,1,S,1,Quit")"
+wait_for 15 test -s "$WORK_E/pattern 0.csv" || fail "Interpolations-CSV fehlt: $(tail -5 "$TMP/pr_sinus.log")"
+assert_contains "$TMP/pr_sinus.log" "Anz Interpolationen am Anfang?"
+assert_contains "$TMP/pr_sinus.log" "Anfangsindex \(0 bis"
+lines=$(wc -l <"$WORK_E/pattern 0.csv")
+[ "$lines" -ge 2 ] || fail "Interpolations-CSV zu kurz: $lines"
+
 log "OK"
