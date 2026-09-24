@@ -478,16 +478,6 @@ fn safe_divisor(v: f32) -> f32 {
     }
 }
 
-/// Gültiger Index in einen Puffer, `None` bei negativ/zu groß.
-fn checked_index(i: i32, len: usize) -> Option<usize> {
-    if i < 0 {
-        None
-    } else {
-        let i = i as usize;
-        (i < len).then_some(i)
-    }
-}
-
 fn record_key_action(kc: Keycode, alleseins: bool, scaletoa: bool) -> RecordAction {
     if kc == Keycode::Num0 {
         return RecordAction::Stop;
