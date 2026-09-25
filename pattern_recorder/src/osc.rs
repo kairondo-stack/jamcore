@@ -4,6 +4,18 @@ use std::net::UdpSocket;
 
 const OSC_PORT: u16 = 7005;
 
+/// Port aus der Umgebung (RENOISE_OSC_PORT), sonst 7005.
+pub fn port_from(value: Option<String>) -> u16 {
+    value
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(OSC_PORT)
+}
+
+fn osc_port() -> u16 {
+    port_from(std::env::var("RENOISE_OSC_PORT").ok())
+}
+
 fn osc_send(msg: OscMessage) {
     let data = match encoder::encode(&OscPacket::Message(msg)) {
         Ok(d) => d,
@@ -13,7 +25,7 @@ fn osc_send(msg: OscMessage) {
         }
     };
     if let Ok(sock) = UdpSocket::bind(("127.0.0.1", 0)) {
-        let _ = sock.send_to(&data, ("127.0.0.1", OSC_PORT));
+        let _ = sock.send_to(&data, ("127.0.0.1", osc_port()));
     }
 }
 

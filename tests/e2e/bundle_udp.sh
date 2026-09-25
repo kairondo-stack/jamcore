@@ -13,14 +13,15 @@ python3 "$DIR/osc_listen.py" 7003 "$TMP/relay.jsonl" 8 &
 APP_PIDS+=("$!")
 sleep 0.5
 
-log "Starte Relay"
-run_app "$TMP/bundle.log" "$ROOT/bundle_udp/target/debug/bundle_udp" 127.0.0.1 >/dev/null
-sleep 0.5
+log "Starte Relay (Ports 7100/7105, 7005 kann z.B. von Renoise belegt sein)"
+OSC_LISTEN_PORTS=7100,7105 run_app "$TMP/bundle.log" "$ROOT/bundle_udp/target/debug/bundle_udp" 127.0.0.1 >/dev/null
+wait_for 5 grep -q "Relay läuft auf Port 7100" "$TMP/bundle.log" || fail "Relay 7100 nicht bereit"
+wait_for 5 grep -q "Relay läuft auf Port 7105" "$TMP/bundle.log" || fail "Relay 7105 nicht bereit"
 
-log "OSC-Nachricht an 7000"
-SENT_HEX="$(python3 "$DIR/udp_send.py" 7000 "/test/one" i 42)"
-log "Rohdaten (Nicht-OSC) an 7005"
-RAW_HEX="$(python3 "$DIR/udp_send.py" 7005 --raw 68656c6c6f207261772064617461)"
+log "OSC-Nachricht an 7100"
+SENT_HEX="$(python3 "$DIR/udp_send.py" 7100 "/test/one" i 42)"
+log "Rohdaten (Nicht-OSC) an 7105"
+RAW_HEX="$(python3 "$DIR/udp_send.py" 7105 --raw 68656c6c6f207261772064617461)"
 
 wait_for 5 test -s "$TMP/relay.jsonl" || fail "Relay hat nichts weitergeleitet"
 assert_contains "$TMP/relay.jsonl" '"/test/one"'

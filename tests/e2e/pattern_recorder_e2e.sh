@@ -14,15 +14,15 @@ cp "$ROOT/sagan.ttf" "$WORK/" 2>/dev/null || true
 start_xvfb :94
 (cd "$ROOT" && cargo build -q --manifest-path pattern_recorder/Cargo.toml)
 
-log "OSC-Mitschnitt 7005"
-python3 "$DIR/osc_listen.py" 7005 "$TMP/pr_osc.jsonl" 15 &
+log "OSC-Mitschnitt 7105"
+python3 "$DIR/osc_listen.py" 7105 "$TMP/pr_osc.jsonl" 15 &
 APP_PIDS+=("$!")
 sleep 0.5
 
 log "Starte pattern_recorder (injizierte Tastenfolge)"
 pr_log="$TMP/pr.log"
 E2E_KEYS="R,1,wait:150,1,wait:150,2,wait:150,3,wait:150,0,J,1,S,1,H,1,S,Down,Left,6,4,Return" \
-  bash -c "cd '$WORK' && SDL_AUDIODRIVER=dummy '$ROOT/pattern_recorder/target/debug/pattern_recorder' >'$pr_log' 2>&1" &
+  bash -c "cd '$WORK' && RENOISE_OSC_PORT=7105 SDL_AUDIODRIVER=dummy '$ROOT/pattern_recorder/target/debug/pattern_recorder' >'$pr_log' 2>&1" &
 pr_pid=$!
 APP_PIDS+=("$pr_pid")
 
@@ -36,7 +36,7 @@ awk -F, 'NF != 4 { exit 1 }' "$WORK/pattern 0.csv" || fail "CSV-Spalten != 4"
 grep -Eq ',[01]$' "$WORK/pattern 0.csv" || fail "CSV glide nicht 0/1"
 
 log "OSC-Playback"
-wait_for 10 test -s "$TMP/pr_osc.jsonl" || fail "kein OSC auf 7005: $(cat "$pr_log")"
+wait_for 10 test -s "$TMP/pr_osc.jsonl" || fail "kein OSC auf 7105: $(cat "$pr_log")"
 assert_contains "$TMP/pr_osc.jsonl" "trigger/note_on"
 
 log "Renoise-Pattern ins Clipboard (Länge 64)"

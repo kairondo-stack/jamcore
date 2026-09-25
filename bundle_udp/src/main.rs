@@ -5,6 +5,21 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
+/// Lauschports aus "7000,7005" parsen (Default bleibt 7000,7005).
+fn parse_ports(spec: &str) -> Result<Vec<u16>, String> {
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        out.push(
+            part.parse::<u16>()
+                .map_err(|e| format!("Port ungültig {part}: {e}"))?,
+        );
+    }
+    if out.is_empty() {
+        return Err("keine Ports angegeben".to_string());
+    }
+    Ok(out)
+}
+
 /// Ziele aus "host:port,host2:port2" auflösen (Hostnamen und IPs).
 fn parse_targets(spec: &str) -> Result<Vec<SocketAddr>, String> {
     let mut out = Vec::new();
@@ -34,7 +49,9 @@ fn relay(listen_port: u16, targets: Vec<SocketAddr>) -> io::Result<()> {
             Ok((n, src)) => {
                 match decoder::decode_udp(&buf[..n]) {
                     Ok((_, rosc::OscPacket::Message(msg))) => log_message(listen_port, &msg),
-                    Ok((_, _)) => eprintln!("[7000] Bundle erhalten; wird roh weitergeleitet"),
+                    Ok((_, _)) => {
+                        eprintln!("[{listen_port}] Bundle erhalten; wird roh weitergeleitet")
+                    }
                     Err(_) => eprintln!("[{listen_port}] Nicht-OSC-Datagramm von {src}"),
                 }
                 for t in &targets {
@@ -81,21 +98,45 @@ fn main() -> io::Result<()> {
     let spec = std::env::var("OSC_TARGETS").unwrap_or_else(|_| format!("{target_ip}:7003"));
     let targets = parse_targets(&spec)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    println!("OSC Relay: lauscht 7000 + 7005, Ziel(e): {}", targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", "));
-
-    let t_targets = targets.clone();
-    let t1 = thread::spawn(move || relay(7000, t_targets));
-
-    let t_targets = targets.clone();
-    let t2 = thread::spawn(move || relay(7005, t_targets));
-
-    let _ = t1.join();
-    let _ = t2.join();
+    let ports = parse_ports(
+        &std::env::var("OSC_LISTEN_PORTS").unwrap_or_else(|_| "7000,7005".into()),
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    println!(
+        "OSC Relay: lauscht {}, Ziel(e): {}",
+        ports
+            .iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>()
+            .join(" + "),
+        targets.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")
+    );
+    let mut handles = Vec::new();
+    for port in ports {
+        let t_targets = targets.clone();
+        handles.push(thread::spawn(move || {
+            if let Err(e) = relay(port, t_targets) {
+                eprintln!("Relay auf Port {port} beendet: {e}");
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
     Ok(())
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ports_accepts_lists_and_rejects_garbage() {
+        assert_eq!(parse_ports("7000,7005").unwrap(), vec![7000, 7005]);
+        assert_eq!(parse_ports(" 7100 ").unwrap(), vec![7100]);
+        assert!(parse_ports("").is_err());
+        assert!(parse_ports("7000,abc").is_err());
+        assert!(parse_ports("70000").is_err());
+    }
 
     #[test]
     fn parse_targets_resolves_hostnames_and_ips() {

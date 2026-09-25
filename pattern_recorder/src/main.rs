@@ -4544,6 +4544,14 @@ mod tests {
     }
 
     #[test]
+    fn osc_port_env_override() {
+        assert_eq!(osc::port_from(None), 7005);
+        assert_eq!(osc::port_from(Some("7105".to_string())), 7105);
+        assert_eq!(osc::port_from(Some("kaputt".to_string())), 7005);
+        assert_eq!(osc::port_from(Some("0".to_string())), 7005);
+    }
+
+    #[test]
     fn notes_to_schism_pattern_matches_clipboard_format() {
         let mk = |t: f32, p: i32| Note3::new(t, 0, p);
         let notes = vec![
@@ -4750,6 +4758,47 @@ mod tests {
 </PatternClipboard.BlockBuffer>"#;
         let lines = parse_line_notes(xml);
         assert_eq!(lines, vec![(3, "E-5".to_string(), "02".to_string())]);
+    }
+
+    #[test]
+    fn parse_line_notes_handles_renoise_copies_without_empty_lines() {
+        // Echte Renoise-Rückkopie: nur Zeilen mit Noten, kein self-closing, UTF-8-Deklaration.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<PatternClipboard.BlockBuffer doc_version="0">
+  <Columns>
+    <Column>
+      <Column>
+        <Lines>
+          <Line index="0">
+            <NoteColumns>
+              <NoteColumn>
+                <Note>C-4</Note>
+                <Instrument>00</Instrument>
+              </NoteColumn>
+            </NoteColumns>
+          </Line>
+          <Line index="31">
+            <NoteColumns>
+              <NoteColumn>
+                <Note>C#5</Note>
+                <Instrument>00</Instrument>
+              </NoteColumn>
+            </NoteColumns>
+          </Line>
+        </Lines>
+        <ColumnType>NoteColumn</ColumnType>
+        <SubColumnMask>true true true false false false false false</SubColumnMask>
+      </Column>
+    </Column>
+  </Columns>
+</PatternClipboard.BlockBuffer>"#;
+        assert_eq!(
+            parse_line_notes(xml),
+            vec![
+                (0, "C-4".to_string(), "00".to_string()),
+                (31, "C#5".to_string(), "00".to_string()),
+            ]
+        );
     }
 
     #[test]

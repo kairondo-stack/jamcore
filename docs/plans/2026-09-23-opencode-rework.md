@@ -240,6 +240,17 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Renoise-Integration (Handtest + Regression)
+
+- Handtest am echten Renoise 3.5.2 (X11/XWayland): unser Pattern-XML (64 Zeilen,
+  6 Noten bei 0/21/31/42/49/56) eingefügt; Renoise-Rückkopie der Spur enthält
+  exakt dieselben Noten → Paste funktioniert.
+- Import: Renoise-Clipboard → `pattern_recorder` `Z` → CSV mit MIDI 60/60/61/60/61/62
+  und normalisierten Zeiten; bestätigt den Oktav-/Kreuz-Fix aus Runde 5 gegen
+  echtes Renoise (vorher wäre 72/73/74 herausgekommen).
+- Regression: Unit-Test für Renoise-Rückkopien ohne Leerzeilen, E2E Phase C
+  zusätzlich mit `C#5` (MIDI 73).
+
 ### Schism-Integration (Handtest + Regression)
 
 - Handtest auf dem echten System: Export-Pattern in Schism (Alt+P) eingefügt und

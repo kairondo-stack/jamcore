@@ -64,6 +64,7 @@ cat >"$TMP/renoise_import.xml" <<'XML'
 <Line index="0"/>
 <Line index="4"><NoteColumns><NoteColumn><Note>C-4</Note><Instrument>00</Instrument></NoteColumn></NoteColumns></Line>
 <Line index="8"><NoteColumns><NoteColumn><Note>E-4</Note><Instrument>01</Instrument></NoteColumn></NoteColumns></Line>
+<Line index="12"><NoteColumns><NoteColumn><Note>C#5</Note><Instrument>02</Instrument></NoteColumn></NoteColumns></Line>
 </Lines><ColumnType>NoteColumn</ColumnType></Column></Column></Columns>
 </PatternClipboard.BlockBuffer>
 XML
@@ -74,6 +75,7 @@ wait_for 15 test -s "$WORK_C/pattern 0.csv" || fail "Import-CSV fehlt: $(tail -5
 assert_contains "$TMP/pr_import.log" "Successfully converted"
 grep -q ",60," "$WORK_C/pattern 0.csv" || fail "C-4 (MIDI 60) fehlt in CSV: $(cat "$WORK_C/pattern 0.csv")"
 grep -q ",64," "$WORK_C/pattern 0.csv" || fail "E-4 (MIDI 64) fehlt in CSV"
+grep -q ",73," "$WORK_C/pattern 0.csv" || fail "C#5 (MIDI 73) fehlt in CSV"
 
 log "Phase D: Graph-Fenster (Klicks, F, V, 0 -> Noten)"
 WORK_D="$(run_pr graph "$REC_KEYS,G,0,Return,5,Return,click:100:100,click:100:250,click:300:300,click:500:250,F,V,O,0,Quit")"
