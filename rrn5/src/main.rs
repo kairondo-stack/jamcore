@@ -8,6 +8,7 @@
 //   - OSC-Empfang (Port 7010) entfällt (in rrn5.cpp auskommentiert).
 mod osc;
 mod shared;
+mod video;
 mod x11cap;
 
 use shared::SharedMemoryEditor;
@@ -37,6 +38,33 @@ fn push_test_keys(spec: &str) {
             unsafe {
                 let mut raw = std::mem::zeroed::<sdl2::sys::SDL_Event>();
                 raw.type_ = sdl2::sys::SDL_EventType::SDL_QUIT as u32;
+                sdl2::sys::SDL_PushEvent(&mut raw);
+            }
+            continue;
+        }
+        if let Some(rest) = name.strip_prefix("mousedown:") {
+            let mut parts = rest.split(':');
+            let x: i32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let y: i32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            unsafe {
+                let mut raw = std::mem::zeroed::<sdl2::sys::SDL_Event>();
+                raw.type_ = sdl2::sys::SDL_EventType::SDL_MOUSEBUTTONDOWN as u32;
+                raw.button.type_ = sdl2::sys::SDL_EventType::SDL_MOUSEBUTTONDOWN as u32;
+                raw.button.button = 1;
+                raw.button.state = 1;
+                raw.button.x = x;
+                raw.button.y = y;
+                sdl2::sys::SDL_PushEvent(&mut raw);
+            }
+            continue;
+        }
+        if name.eq_ignore_ascii_case("mouseup") {
+            unsafe {
+                let mut raw = std::mem::zeroed::<sdl2::sys::SDL_Event>();
+                raw.type_ = sdl2::sys::SDL_EventType::SDL_MOUSEBUTTONUP as u32;
+                raw.button.type_ = sdl2::sys::SDL_EventType::SDL_MOUSEBUTTONUP as u32;
+                raw.button.button = 1;
+                raw.button.state = 0;
                 sdl2::sys::SDL_PushEvent(&mut raw);
             }
             continue;
@@ -356,6 +384,11 @@ struct App {
     bpmo3: bool,
     biialpha: bool,
     cvcamload: bool,
+    video: Option<video::VideoSource>,
+    video_is_camera: bool,
+    video_path: Option<String>,
+    shm_mode: video::ShmMode,
+    shm_last: Instant,
     surfacesh: bool,
     sendbpm: bool,
     leftset: bool,
@@ -467,6 +500,11 @@ impl App {
             bpmo3: false,
             biialpha: true,
             cvcamload: false,
+            video: None,
+            video_is_camera: false,
+            video_path: None,
+            shm_mode: video::ShmMode::Throttle,
+            shm_last: now,
             surfacesh: false,
             sendbpm: true,
             leftset: false,
@@ -1815,6 +1853,26 @@ fn handle_key(
             app.surfacesh = !app.surfacesh;
             println!("surfacesh: {}", app.surfacesh);
         }
+        Keycode::Z => {
+            if app.video_is_camera {
+                app.video = None;
+                app.video_is_camera = false;
+                println!("Kamera aus");
+            } else {
+                match video::VideoSource::open_camera(0) {
+                    Ok(v) => {
+                        app.video = Some(v);
+                        app.video_is_camera = true;
+                        println!("Kamera an (640x480)");
+                    }
+                    Err(e) => println!("{e}"),
+                }
+            }
+        }
+        Keycode::Num8 => {
+            app.shm_mode = video::next_shm_mode(app.shm_mode);
+            println!("SHM-Modus: {}", app.shm_mode.as_str());
+        }
         Keycode::Greater => {
             app.noteValueadd -= 1;
             println!("{}", app.noteValueadd);
@@ -1979,7 +2037,7 @@ fn handle_key(
 // ---------------------------------------------------------------------------
 fn frame_logic(
     app: &mut App,
-    editor: &SharedMemoryEditor,
+    editor: &mut SharedMemoryEditor,
     video: &sdl2::VideoSubsystem,
     main_view: &mut View,
     second_view: &mut View,
@@ -1991,6 +2049,29 @@ fn frame_logic(
 ) {
     let w = app.xw;
     let h = app.yh;
+
+    // Kamera/Video: laufend anzeigen; während der Pixelauswahl (linke/mittlere
+    // Maustaste) steht das Bild.
+    if let Some(src) = app.video.as_mut() {
+        let freeze = app.isLeftMouseButtonHeld || app.isMiddleMouseButtonHeld;
+        if !freeze {
+            if let Some((fw, fh, rgba)) = src.next_frame_rgba() {
+                scale_rgba_into(w, h, main_buffer, fw, fh, &rgba);
+                main_view.present(main_buffer, w, h);
+                let publish = match app.shm_mode {
+                    video::ShmMode::Every => true,
+                    video::ShmMode::Throttle => app.shm_last.elapsed().as_millis() >= 200,
+                    video::ShmMode::Off => false,
+                };
+                if publish {
+                    app.shm_last = Instant::now();
+                    if let Err(e) = editor.write_image(fw, fh, &rgba) {
+                        eprintln!("MyImageShm: {e}");
+                    }
+                }
+            }
+        }
+    }
 
     if app.isRightMouseButtonHeld {
         fill_buf(second, Color::RGB(app.rr as u8, app.gg as u8, app.bb as u8));
@@ -2399,9 +2480,39 @@ fn main() {
     };
     println!("Fenstergröße: {xw}x{yh}");
 
+    let video_arg = args
+        .iter()
+        .position(|a| a == "--video")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+    let shm_arg = args
+        .iter()
+        .position(|a| a == "--shm")
+        .and_then(|i| args.get(i + 1))
+        .cloned();
+
     let mut app = App::new(xw, yh);
     app.frames_dir = frames_dir;
     app.filenames = filenames;
+    if let Some(mode) = shm_arg.as_deref().and_then(video::parse_shm_mode) {
+        app.shm_mode = mode;
+    } else if let Some(bad) = shm_arg.as_deref() {
+        eprintln!("Unbekannter SHM-Modus '{bad}' – nutze every|throttle|off");
+    }
+    app.video_path = video_arg;
+    if let Some(path) = app.video_path.clone() {
+        match video::VideoSource::open_file(&path) {
+            Ok(v) => {
+                println!("Video geladen: {path}");
+                app.video = Some(v);
+            }
+            Err(e) => eprintln!("{e}"),
+        }
+    }
+    println!(
+        "Tasten: Z = Kamera an/aus, 8 = SHM-Modus (aktuell {}), --video <pfad>",
+        app.shm_mode.as_str()
+    );
 
     let sdl = match sdl2::init() {
         Ok(s) => s,

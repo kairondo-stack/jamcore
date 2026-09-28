@@ -240,6 +240,20 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Kamera/Video in rrn5 (OpenCV)
+
+- `rrn5/src/video.rs`: `VideoSource` (Kamera-Index oder Videodatei, Video geloopt),
+  BGR→RGBA, `ShmMode` (every/throttle/off) — reine Helfer mit Unit-Tests.
+- Steuerung: `Z` Kamera (Index 0, 640×480) an/aus; `--video <pfad>` für Dateien;
+  `--shm every|throttle|off` (Default throttle) und `8` schaltet den Modus.
+- **Standbild**: während linker/mittlerer Maustaste (Pixelauswahl) wird das
+  Videobild nicht aktualisiert, sonst läuft es weiter.
+- Publikation: Frames werden im gewählten Modus via `write_image` ins
+  MyImageShm geschrieben (Originalauflösung).
+- E2E `rrn5_video.sh`: Testvideo (Example `make_testvideo`, MJPG), prüft
+  bewegt vs. eingefroren (3 identische SHM-Samples bei Maus-Down) und den
+  Fehlerpfad bei fehlender Datei.
+
 ### Mikrofon-BPM (pattern_recorder)
 
 - Neues Modul `micbpm.rs`: Onset-Erkennung (Energie + Schwerpunkt-Zeit),
