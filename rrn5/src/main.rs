@@ -396,6 +396,7 @@ struct App {
     live_last_note: Instant,
     live_next_col: Instant,
     live_notes_this_sweep: u32,
+    live_drawn_this_sweep: u32,
     max_notes_per_sec: u32,
     live_verbose: bool,
     surfacesh: bool,
@@ -520,6 +521,7 @@ impl App {
             live_last_note: now,
             live_next_col: now,
             live_notes_this_sweep: 0,
+            live_drawn_this_sweep: 0,
             max_notes_per_sec: std::env::var("RRN5_MAX_NOTES_PER_SEC")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -631,20 +633,21 @@ impl App {
 
     /// Eine Spalte des aktuellen Kamera-/Videoframes scannen und abspielen.
     /// Taktsynchron: ein Sweep dauert einen Beat; freilaufend: kontinuierlich.
-    fn live_scan_step(&mut self, frame: &[u8]) {
+    fn live_scan_step(&mut self, frame: &[u8], third: &mut [u8]) -> bool {
         if !self.live_scan {
-            return;
+            return false;
         }
         let w = self.xw.max(1);
         let h = self.yh.max(1);
         if frame.len() < (w * h * 4) as usize {
-            return;
+            return false;
         }
         let left = self.leftrand.clamp(0, w);
         let right = (w - self.rightrand).max(left);
         if right <= left {
-            return;
+            return false;
         }
+        let mut drew = false;
         let columns = (right - left).max(1) as i64;
         let mut column_ns = if self.timePerPixelns > 0 {
             livescan::column_interval_ns(h, self.timePerPixelns)
@@ -680,12 +683,19 @@ impl App {
                 continue;
             }
             let x = self.live_x.clamp(left, right - 1);
+            if x == left {
+                // Sweep-Anzeige im dritten Fenster neu aufsetzen (wie `o`)
+                fill_buf(third, Color::RGB(self.rr as u8, self.gg as u8, self.bb as u8));
+            }
             let hits = livescan::scan_column(frame, w, h, x, &filter);
             for (y, r, g, b) in hits {
                 let (note, vol) = self.event_note_volume(x, y, r, g, b);
                 if !self.is_note_in_chordpatt(note, x, y, h) {
                     continue;
                 }
+                set_px(third, w, x, y, Color::RGB(r, g, b));
+                self.live_drawn_this_sweep += 1;
+                drew = true;
                 if self.renoisenote
                     && livescan::note_allowed(
                         self.live_last_note.elapsed(),
@@ -708,15 +718,18 @@ impl App {
             let next = livescan::next_column(x, left, right, step);
             if next == left {
                 println!(
-                    "Live-Scan: Sweep beendet, {} Noten ({} Modus)",
+                    "Live-Scan: Sweep beendet, {} Noten, {} gezeichnet ({} Modus)",
                     self.live_notes_this_sweep,
+                    self.live_drawn_this_sweep,
                     if self.live_beat { "Takt" } else { "frei" }
                 );
                 self.live_notes_this_sweep = 0;
+                self.live_drawn_this_sweep = 0;
             }
             self.live_x = next;
             self.live_next_col += Duration::from_nanos(column_ns as u64);
         }
+        drew
     }
 
     fn is_note_in_chord(&self, note: i32, x: i32) -> bool {
@@ -2235,7 +2248,9 @@ fn frame_logic(
                 }
             }
         }
-        app.live_scan_step(main_buffer);
+        if app.live_scan_step(main_buffer, third) {
+            third_view.present(third, w, h);
+        }
     }
 
     if app.isRightMouseButtonHeld {

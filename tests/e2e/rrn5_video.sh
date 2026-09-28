@@ -76,6 +76,13 @@ assert_contains "$TMP/rrn5_live_osc.jsonl" "trigger/note_on"
 wait_for 8 grep -q "Sweep beendet" "$TMP/rrn5_live.log" || fail "kein Sweep-Abschluss im Log"
 wait_for 8 grep -q "taktsynchron" "$TMP/rrn5_live.log" || fail "Taktmodus nicht aktiv"
 wait "$p3" 2>/dev/null || fail "Live-Scan-Lauf Exit != 0"
+python3 - "$TMP/rrn5_live.log" <<'PY' || fail "Dauerloop oder Zeichnung fehlt"
+import re, sys
+log = open(sys.argv[1]).read()
+sweeps = re.findall(r"Sweep beendet, (\d+) Noten, (\d+) gezeichnet", log)
+assert len(sweeps) >= 3, f"nur {len(sweeps)} Sweeps (Dauerloop?)"
+assert max(int(d) for _, d in sweeps) >= 1, "nichts im 3. Fenster gezeichnet"
+PY
 
 log "Fehlende Videodatei -> klare Meldung, App läuft weiter"
 printf '200 150\n' | E2E_KEYS=Quit \
