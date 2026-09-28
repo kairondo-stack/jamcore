@@ -240,6 +240,23 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Mikrofon-BPM (pattern_recorder)
+
+- Neues Modul `micbpm.rs`: Onset-Erkennung (Energie + Schwerpunkt-Zeit),
+  IOI-Histogramm mit Oktav-Faltung (60–200 BPM), Konfidenz; reine Funktionen
+  mit Unit-Tests (90/120/128/175 BPM, Stille/Rauschen, fold_bpm).
+- SDL2-Audio-Capture (44,1 kHz mono) in Ringpuffer, Fehler nicht fatal.
+- T-Menü: `T`+`L` Live-Anzeige (alle 2 s, ändert nichts), `T`+`M` Einzelmessung
+  8 s, `T`+`Enter` übernimmt BPM (intern + Shared Memory + OSC an Renoise).
+- E2E Phase F: Dummy-Treiber → „keine klaren Beats“ ohne Absturz.
+
+### OSC-Relay: EINTR-Fix
+
+- Ursache der „OSC geht nach Laptop-Aufklappen nicht mehr“-Ausfälle:
+  `recv_from` liefert nach Suspend/Resume `EINTR`, der Relay-Thread beendete
+  sich. Jetzt sind `Interrupted`/`WouldBlock`/`TimedOut` transient (Unit-Test),
+  andere Fehler werden geloggt und der Relay läuft weiter.
+
 ### Renoise-Integration (Handtest + Regression)
 
 - Handtest am echten Renoise 3.5.2 (X11/XWayland): unser Pattern-XML (64 Zeilen,

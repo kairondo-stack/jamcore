@@ -1,3 +1,4 @@
+mod micbpm;
 mod notes;
 mod osc;
 mod shared;
@@ -780,6 +781,31 @@ struct PatternRecorder {
     renoise_recording: bool,
     renoise_play_and_record_enabled: bool,
     timestampvalue: f32,
+
+    mic_buffer: Arc<Mutex<Vec<f32>>>,
+    mic_live: Arc<AtomicBool>,
+    mic_last: Option<(f32, f32)>,
+    mic_last_check: Instant,
+    _mic: Option<sdl2::audio::AudioDevice<MicCapture>>,
+}
+
+/// SDL-Capture-Callback: schreibt Mikrofon-Samples in den Ringpuffer.
+struct MicCapture {
+    sink: Arc<Mutex<Vec<f32>>>,
+}
+
+impl AudioCallback for MicCapture {
+    type Channel = f32;
+    fn callback(&mut self, out: &mut [f32]) {
+        if let Ok(mut buf) = self.sink.lock() {
+            buf.extend_from_slice(out);
+            let max = 44100 * 4;
+            if buf.len() > max {
+                let drop = buf.len() - max;
+                buf.drain(..drop);
+            }
+        }
+    }
 }
 
 impl PatternRecorder {
@@ -914,6 +940,11 @@ impl PatternRecorder {
             renoise_recording: false,
             renoise_play_and_record_enabled: false,
             timestampvalue: 0.0,
+            mic_buffer: Arc::new(Mutex::new(Vec::new())),
+            mic_live: Arc::new(AtomicBool::new(false)),
+            mic_last: None,
+            mic_last_check: Instant::now(),
+            _mic: None,
         })
     }
 
@@ -2319,6 +2350,64 @@ impl PatternRecorder {
 
     fn set_bpm(&mut self) {
         osc::send_bpm_to_renoise(self.sd().bpm);
+    }
+
+    /// Mikrofon-Capture öffnen (einmalig, nicht fatal).
+    fn open_mic(&mut self, sdl: &Sdl) -> Result<(), String> {
+        if self._mic.is_some() {
+            return Ok(());
+        }
+        let audio = sdl.audio().map_err(|e| e.to_string())?;
+        let desired = AudioSpecDesired {
+            freq: Some(44100),
+            channels: Some(1),
+            samples: Some(1024),
+        };
+        let sink = Arc::clone(&self.mic_buffer);
+        let dev = audio
+            .open_capture(None, &desired, move |_spec| MicCapture { sink })
+            .map_err(|e| format!("Mikrofon: {e}"))?;
+        dev.resume();
+        self._mic = Some(dev);
+        Ok(())
+    }
+
+    fn mic_estimate(&self) -> Option<(f32, f32)> {
+        let buf = self.mic_buffer.lock().ok()?;
+        let mut est = micbpm::BpmEstimator::new(44100);
+        est.push(&buf);
+        est.estimate()
+    }
+
+    /// Im Live-Modus alle ~2 s schätzen und anzeigen (ändert nichts).
+    fn mic_tick(&mut self) {
+        if !self.mic_live.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.mic_last_check.elapsed().as_secs_f32() < 2.0 {
+            return;
+        }
+        self.mic_last_check = Instant::now();
+        match self.mic_estimate() {
+            Some((bpm, conf)) => {
+                self.mic_last = Some((bpm, conf));
+                println!("Mic-BPM: {bpm:.1} (Konfidenz {conf:.2})");
+            }
+            None => println!("Mic-BPM: keine klaren Beats"),
+        }
+    }
+
+    /// Zuletzt angezeigten Mikrofon-BPM übernehmen (intern + OSC + Shared Memory).
+    fn adopt_mic_bpm(&mut self) {
+        let Some((bpm, conf)) = self.mic_last else {
+            println!("Kein Mic-BPM vorhanden – erst T+M messen.");
+            return;
+        };
+        self.sd_mut().bpm = bpm;
+        self.updatebpm(bpm);
+        self.set_bpm();
+        self.zeitfaktor();
+        println!("Mic-BPM übernommen: {bpm:.1} (Konfidenz {conf:.2})");
     }
 
     // ------------- Record -------------
@@ -4018,6 +4107,40 @@ fn main() -> Result<(), String> {
                             println!("BPM: {}", recorder.sd().bpm);
                         }
                         tpressed = false;
+                    } else if tpressed && kc == Keycode::L {
+                        let live = !recorder.mic_live.load(Ordering::Relaxed);
+                        match recorder.open_mic(&sdl) {
+                            Ok(()) => {
+                                recorder.mic_live.store(live, Ordering::Relaxed);
+                                recorder.mic_last_check = Instant::now()
+                                    - Duration::from_secs(3);
+                                println!(
+                                    "Mic-BPM Live-Modus: {}",
+                                    if live { "an" } else { "aus" }
+                                );
+                            }
+                            Err(e) => println!("{e}"),
+                        }
+                        tpressed = false;
+                    } else if tpressed && kc == Keycode::M {
+                        match recorder.open_mic(&sdl) {
+                            Ok(()) => {
+                                println!("Mikrofon-Messung läuft 8 s …");
+                                thread::sleep(Duration::from_secs(8));
+                                match recorder.mic_estimate() {
+                                    Some((bpm, conf)) => {
+                                        recorder.mic_last = Some((bpm, conf));
+                                        println!("Mic-BPM: {bpm:.1} (Konfidenz {conf:.2})");
+                                    }
+                                    None => println!("Mic-BPM: keine klaren Beats"),
+                                }
+                            }
+                            Err(e) => println!("{e}"),
+                        }
+                        tpressed = false;
+                    } else if tpressed && kc == Keycode::Return {
+                        recorder.adopt_mic_bpm();
+                        tpressed = false;
                     } else if kc == Keycode::Q {
                         q_pressed = true;
                     } else if q_pressed && (kc == Keycode::Num3 || kc == Keycode::Num4) {
@@ -4402,6 +4525,8 @@ fn main() -> Result<(), String> {
                 _ => {}
             }
         }
+
+        recorder.mic_tick();
 
         if recorder.sd().p1 {
             if playrenoise {

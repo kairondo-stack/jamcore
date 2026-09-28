@@ -177,27 +177,6 @@ fn wait_enter() {
 // ---------------------------------------------------------------------------
 // Ein-/Ausgabe-Helfer
 // ---------------------------------------------------------------------------
-fn read_stdin_f32() -> f32 {
-    use std::io::BufRead;
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    line.trim().parse().unwrap_or(0.0)
-}
-
-fn read_stdin_i32() -> i32 {
-    use std::io::BufRead;
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    line.trim().parse().unwrap_or(0)
-}
-
-fn read_stdin_str() -> String {
-    use std::io::BufRead;
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    line.trim().to_string()
-}
-
 fn read_filenames(directory: &str) -> Vec<String> {
     filter_image_files(directory)
 }
@@ -710,6 +689,80 @@ fn preview_note_vol(
     (pnote, pvol)
 }
 
+/// Eingabezeichen im SDL-Fenster: Ziffern und Dezimalpunkt.
+fn input_char(kc: Keycode) -> Option<char> {
+    let v = kc.into_i32();
+    let base = Keycode::Num0.into_i32();
+    if v >= base && v <= Keycode::Num9.into_i32() {
+        return char::from_digit((v - base) as u32, 10);
+    }
+    if kc == Keycode::Period || kc == Keycode::KpDecimal {
+        return Some('.');
+    }
+    None
+}
+
+/// Eingabe direkt im SDL-Fenster (wie Eingabei im Original), Enter schließt ab.
+fn sdl_input_string() -> String {
+    let mut input = String::new();
+    loop {
+        if let Some(ev) = poll_event_compat() {
+            if let Event::KeyDown {
+                keycode: Some(kc),
+                ..
+            } = ev
+            {
+                if kc == Keycode::Return {
+                    return input;
+                }
+                if let Some(ch) = input_char(kc) {
+                    input.push(ch);
+                    println!("input: {input}");
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn sdl_input_f32() -> f32 {
+    sdl_input_string().trim().parse().unwrap_or(0.0)
+}
+
+fn sdl_input_i32() -> i32 {
+    sdl_input_string().trim().parse().unwrap_or(0)
+}
+
+/// "500x240" parsen und auf maximal 500x240 begrenzen (min. 1x1).
+fn parse_size(spec: &str) -> Option<(i32, i32)> {
+    let (w, h) = spec.split_once(|c| c == 'x' || c == 'X')?;
+    let w: i32 = w.trim().parse().ok()?;
+    let h: i32 = h.trim().parse().ok()?;
+    Some((w.max(1), h.max(1)))
+}
+
+/// Größe aus `--size WxH` oder `RRN5_SIZE` (jede Auflösung, min. 1x1).
+fn resolve_size(args: &[String]) -> Option<(i32, i32)> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--size" {
+            return it.next().and_then(|v| parse_size(v));
+        }
+    }
+    std::env::var("RRN5_SIZE")
+        .ok()
+        .and_then(|v| parse_size(&v))
+}
+
+/// Fensterpositionen für Haupt-/Zweit-/Drittfenster, an die Bildschirmgröße angepasst.
+fn view_positions(screen_w: i32, screen_h: i32, xw: i32, yh: i32) -> [(i32, i32); 3] {
+    let x = (screen_w - xw).max(0);
+    let bottom = (screen_h - yh).max(0);
+    let y1 = if 480 + yh <= screen_h { 480 } else { bottom };
+    let y2 = if 960 + yh <= screen_h { 960 } else { bottom };
+    [(x, 0), (x, y1), (x, y2)]
+}
+
 /// Nächster Bildindex mit Umlauf (None bei leerer Liste).
 fn next_frame_index(current: usize, len: usize, step: i32) -> Option<usize> {
     if len == 0 {
@@ -1068,11 +1121,11 @@ fn read_key_event2(app: &mut App) {
 fn copy_pattern_to_clipboard(app: &App) {
     println!("Copying pattern to clipboard...");
     println!("Patternlänge? ");
-    let pattern_len_str = read_stdin_str();
+    let pattern_len_str = sdl_input_string();
     println!("Patternanfang? ");
-    let pattern_start_str = read_stdin_str();
+    let pattern_start_str = sdl_input_string();
     println!("Patternende? ");
-    let pattern_end_str = read_stdin_str();
+    let pattern_end_str = sdl_input_string();
     println!(
         "Patternlänge: {} Patternanfang: {} Patternende: {}",
         pattern_len_str, pattern_start_str, pattern_end_str
@@ -1702,7 +1755,7 @@ fn handle_key(
         }
         Keycode::Num3 => {
             println!("Geben Sie die Anzahl der Harmonien ein: ");
-            app.notessetcount = read_stdin_i32();
+            app.notessetcount = sdl_input_i32();
             app.notesset.clear();
             app.notessetx.clear();
             app.notesset.resize(app.notessetcount.max(0) as usize, Vec::new());
@@ -1717,9 +1770,9 @@ fn handle_key(
                 let (mx, _my) = mouse_xy();
                 let px = mx;
                 println!("Geben Sie die Frequenzspanne in Halbtönen ein: ");
-                let fd = read_stdin_f32();
+                let fd = sdl_input_f32();
                 println!("Geben Sie den Frequenzspannenteiler ein: ");
-                let fdx = read_stdin_f32();
+                let fdx = sdl_input_f32();
                 let df = fd / fdx;
                 let mut df2 = 60.0f32;
                 for i in 1..=(fdx as i32) {
@@ -1768,7 +1821,7 @@ fn handle_key(
         }
         Keycode::R => {
             println!(" BPM?");
-            app.fixedBpm2 = read_stdin_f32();
+            app.fixedBpm2 = sdl_input_f32();
             app.fixedBpm = app.fixedBpm2;
             app.calc_bpm();
             osc::t7000(
@@ -1851,6 +1904,7 @@ fn handle_key(
             if let Some((iw, ih, img)) = load_image_to_rgba("frame4save.bmp") {
                 scale_rgba_into(w, h, second, iw, ih, &img);
             }
+            *secondsave = second.clone();
             second_view.present(second, w, h);
             app.bpmo3 = true;
         }
@@ -1941,6 +1995,7 @@ fn frame_logic(
     if app.isRightMouseButtonHeld {
         fill_buf(second, Color::RGB(app.rr as u8, app.gg as u8, app.bb as u8));
         fill_buf(third, Color::RGB(app.rr as u8, app.gg as u8, app.bb as u8));
+        *secondsave = second.clone();
         second_view.present(second, w, h);
         third_view.present(third, w, h);
     }
@@ -1998,6 +2053,7 @@ fn frame_logic(
             i += 1;
         }
         set_px(second, w, 0, 0, Color::RGB(1, 1, 1));
+        *secondsave = second.clone();
         second_view.present(second, w, h);
         main_view.present(main_buffer, w, h);
     }
@@ -2333,9 +2389,15 @@ fn main() {
     let frames_dir = resolve_frames_dir(&args);
     let filenames = read_filenames(&frames_dir);
 
-    println!("Bildbreite in pixel? ");
-    println!("Bildhoehe in pixel? ");
-    let (xw, yh) = read_two_i32();
+    let (xw, yh) = match resolve_size(&args) {
+        Some(size) => size,
+        None => {
+            println!("Bildbreite in pixel? ");
+            println!("Bildhoehe in pixel? ");
+            read_two_i32()
+        }
+    };
+    println!("Fenstergröße: {xw}x{yh}");
 
     let mut app = App::new(xw, yh);
     app.frames_dir = frames_dir;
@@ -2360,9 +2422,20 @@ fn main() {
     let mut third = vec![0u8; (xw * yh) as usize * 4];
     let mut secondsave = vec![0u8; (xw * yh) as usize * 4];
 
-    let mut main_view = make_view(&video, "Picture", xw, yh, 3840 - xw, 0);
-    let mut second_view = make_view(&video, "Selected color", xw, yh, 3840 - xw, 480);
-    let mut third_view = make_view(&video, "Selected color", xw, yh, 3840 - xw, 960);
+    let screen_w = std::env::var("RRN5_SCREEN_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| video.display_bounds(0).ok().map(|r| r.width() as i32))
+        .unwrap_or(3840);
+    let screen_h = std::env::var("RRN5_SCREEN_HEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| video.display_bounds(0).ok().map(|r| r.height() as i32))
+        .unwrap_or(2160);
+    let pos = view_positions(screen_w, screen_h, xw, yh);
+    let mut main_view = make_view(&video, "Picture", xw, yh, pos[0].0, pos[0].1);
+    let mut second_view = make_view(&video, "Selected color", xw, yh, pos[1].0, pos[1].1);
+    let mut third_view = make_view(&video, "Selected color", xw, yh, pos[2].0, pos[2].1);
 
     if let Some((iw, ih, img)) = load_image_to_rgba("frame.bmp") {
         scale_rgba_into(xw, yh, &mut main_buffer, iw, ih, &img);
@@ -2510,6 +2583,47 @@ mod tests {
             preview_note_vol(2, 0, 100, 100, 100, 200, -250, (0, 0, 0)).0,
             0
         );
+    }
+
+    #[test]
+    fn input_char_maps_digits_and_decimal() {
+        assert_eq!(input_char(Keycode::Num7), Some('7'));
+        assert_eq!(input_char(Keycode::Num0), Some('0'));
+        assert_eq!(input_char(Keycode::Period), Some('.'));
+        assert_eq!(input_char(Keycode::KpDecimal), Some('.'));
+        assert_eq!(input_char(Keycode::Return), None);
+        assert_eq!(input_char(Keycode::A), None);
+    }
+
+    #[test]
+    fn parse_size_accepts_any_resolution() {
+        assert_eq!(parse_size("500x240"), Some((500, 240)));
+        assert_eq!(parse_size("1000x480"), Some((1000, 480)));
+        assert_eq!(parse_size("0x10"), Some((1, 10)));
+        assert_eq!(parse_size("320X200"), Some((320, 200)));
+        assert_eq!(parse_size("abc"), None);
+        assert_eq!(parse_size("500"), None);
+    }
+
+    #[test]
+    fn view_positions_match_cpp_on_large_screens() {
+        assert_eq!(
+            view_positions(3840, 2160, 384, 384),
+            [(3456, 0), (3456, 480), (3456, 960)]
+        );
+        assert_eq!(
+            view_positions(2880, 1800, 960, 384),
+            [(1920, 0), (1920, 480), (1920, 960)]
+        );
+    }
+
+    #[test]
+    fn view_positions_stay_visible_on_small_screens() {
+        let p = view_positions(1440, 900, 700, 300);
+        assert_eq!(p[0], (740, 0));
+        assert!(p[1].1 + 300 <= 900, "{p:?}");
+        assert!(p[2].1 + 300 <= 900, "{p:?}");
+        assert!(p[1].1 >= 300, "{p:?}");
     }
 
     #[test]

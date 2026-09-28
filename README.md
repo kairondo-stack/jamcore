@@ -8,7 +8,7 @@ Rust-Ports der C++-Originale aus `~/Documents/cde` plus Live-Modul-Renderer.
 |---|---|
 | `it_live` | IT/Modul-Renderer (libopenmpt): `--dump`, `--wav` (offline) oder Live-Audio (cpal, `--device NAME`, `--seconds N`) mit taktkompatiblen Order-Wechseln |
 | `rrn5` | Bild/Farb-Werkzeug: Farbmischmengen aus Bildern zu Noten, OSC an Renoise (7000/7001/7002), Clipboard-Export, MyImageShm lesen/schreiben, Bildverzeichnis per `--dir`/`FRAMES_DIR` |
-| `pattern_recorder` | Rhythmus-Aufnahme, CSV speichern/laden, Graph-Fenster, Renoise-PatternClipboard-Export/-Import, Schism-Export, OSC (`RENOISE_OSC_PORT`, Default 7005) |
+| `pattern_recorder` | Rhythmus-Aufnahme, CSV speichern/laden, Graph-Fenster, Renoise-PatternClipboard-Export/-Import, Schism-Export, Mikrofon-BPM (T+L live, T+M messen, T+Enter übernehmen), OSC (`RENOISE_OSC_PORT`, Default 7005) |
 | `imgsh` | Bildbetrachter, schreibt Bilder in `MyImageShm` (von rrn5 mitgenutzt) |
 | `bundle_udp` | OSC-Relay 7000/7005 → Ziele (`OSC_TARGETS`, Hostnamen erlaubt; Lauschports via `OSC_LISTEN_PORTS`) |
 

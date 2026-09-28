@@ -93,4 +93,10 @@ assert_contains "$TMP/pr_sinus.log" "Anfangsindex \(0 bis"
 lines=$(wc -l <"$WORK_E/pattern 0.csv")
 [ "$lines" -ge 2 ] || fail "Interpolations-CSV zu kurz: $lines"
 
+log "Phase F: Mikrofon-BPM (Dummy-Treiber = Stille -> keine klaren Beats)"
+WORK_F="$(run_pr mic "T,M,Quit")"
+wait_for 20 grep -q "Mic-BPM" "$TMP/pr_mic.log" || fail "Mic-Messung fehlt: $(tail -5 "$TMP/pr_mic.log")"
+assert_contains "$TMP/pr_mic.log" "Mikrofon-Messung läuft"
+[ -d "$WORK_F" ] || fail "Arbeitsverzeichnis fehlt"
+
 log "OK"

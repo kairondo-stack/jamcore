@@ -5,6 +5,15 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
+/// Transiente Empfangsfehler (z.B. EINTR nach Suspend/Resume) dürfen den
+/// Relay nicht beenden.
+fn is_transient_recv_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
 /// Lauschports aus "7000,7005" parsen (Default bleibt 7000,7005).
 fn parse_ports(spec: &str) -> Result<Vec<u16>, String> {
     let mut out = Vec::new();
@@ -60,8 +69,11 @@ fn relay(listen_port: u16, targets: Vec<SocketAddr>) -> io::Result<()> {
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {}
-            Err(e) => return Err(e),
+            Err(e) if is_transient_recv_error(&e) => {}
+            Err(e) => {
+                eprintln!("[{listen_port}] Empfangsfehler (weiter): {e}");
+                thread::sleep(Duration::from_millis(100));
+            }
         }
     }
 }
@@ -128,6 +140,15 @@ fn main() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_errors_do_not_kill_relay() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_transient_recv_error(&Error::from(ErrorKind::Interrupted)));
+        assert!(is_transient_recv_error(&Error::from(ErrorKind::WouldBlock)));
+        assert!(is_transient_recv_error(&Error::from(ErrorKind::TimedOut)));
+        assert!(!is_transient_recv_error(&Error::from(ErrorKind::PermissionDenied)));
+    }
 
     #[test]
     fn parse_ports_accepts_lists_and_rejects_garbage() {
