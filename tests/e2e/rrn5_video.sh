@@ -65,7 +65,7 @@ python3 "$DIR/osc_listen.py" 7200 "$TMP/rrn5_live_osc.jsonl" 10 &
 APP_PIDS+=("$!")
 sleep 0.5
 printf '32 24\n' | DISPLAY="$DISPLAY" RRN5_OSC_BASE_PORT=7200 \
-  E2E_KEYS="wait:400,mousedown:16:12,wait:300,mouseup,wait:200,6,wait:2000,2,wait:1500,Quit" \
+  E2E_KEYS="wait:300,b,wait:200,mousedown:16:12,wait:300,mouseup,wait:200,6,3,wait:2000,2,wait:1500,Quit" \
   "$ROOT/rrn5/target/debug/rrn5" --dir "$FIXTURES" \
   --video "$TMP/testvideo.avi" --shm off >"$TMP/rrn5_live.log" 2>&1 &
 p3=$!
@@ -73,6 +73,7 @@ APP_PIDS+=("$p3")
 wait_for 8 grep -q "Live-Scan an" "$TMP/rrn5_live.log" || fail "Live-Scan nicht gestartet: $(tail -3 "$TMP/rrn5_live.log")"
 wait_for 8 test -s "$TMP/rrn5_live_osc.jsonl" || fail "keine OSC-Noten beim Live-Scan"
 assert_contains "$TMP/rrn5_live_osc.jsonl" "trigger/note_on"
+wait_for 8 grep -q "Palette aktiv" "$TMP/rrn5_live.log" || fail "Palette nicht aktiv"
 wait_for 8 grep -q "Sweep beendet" "$TMP/rrn5_live.log" || fail "kein Sweep-Abschluss im Log"
 wait_for 8 grep -q "taktsynchron" "$TMP/rrn5_live.log" || fail "Taktmodus nicht aktiv"
 wait "$p3" 2>/dev/null || fail "Live-Scan-Lauf Exit != 0"

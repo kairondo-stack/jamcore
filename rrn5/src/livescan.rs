@@ -37,12 +37,15 @@ pub fn pixel_matches(r: u8, g: u8, b: u8, f: &ScanFilter) -> bool {
 }
 
 /// Scannt Spalte `x` im RGBA-Frame; Rückgabe (y, r, g, b) je Treffer.
+/// Mit `palette` wird gegen die gemalten Farben (2. Fenster) gematcht,
+/// sonst gegen die Einzelfarbe im Filter.
 pub fn scan_column(
     frame: &[u8],
     w: i32,
     h: i32,
     x: i32,
     f: &ScanFilter,
+    palette: Option<&std::collections::HashSet<u32>>,
 ) -> Vec<(i32, u8, u8, u8)> {
     let mut out = Vec::new();
     if w <= 0 || h <= 0 || x < 0 || x >= w {
@@ -54,11 +57,71 @@ pub fn scan_column(
             break;
         }
         let (r, g, b) = (frame[idx], frame[idx + 1], frame[idx + 2]);
-        if pixel_matches(r, g, b, f) {
+        let hit = match palette {
+            Some(p) => palette_match(r, g, b, p),
+            None => pixel_matches(r, g, b, f),
+        };
+        if hit {
             out.push((y, r, g, b));
         }
     }
     out
+}
+
+/// Farbquantisierung für die Palette (5 Bit je Kanal, Toleranz ±7).
+pub fn quantize(r: u8, g: u8, b: u8) -> u32 {
+    (((r as u32) >> 3) << 10) | (((g as u32) >> 3) << 5) | ((b as u32) >> 3)
+}
+
+/// Sammelt die im Puffer gemalten Farben (ohne Hintergrund/Schwarz-Marker).
+pub fn build_palette(
+    buf: &[u8],
+    pixels: usize,
+    bg: (u8, u8, u8),
+) -> std::collections::HashSet<u32> {
+    let bgq = quantize(bg.0, bg.1, bg.2);
+    let mut set = std::collections::HashSet::new();
+    for i in 0..pixels {
+        let idx = i * 4;
+        if idx + 2 >= buf.len() {
+            break;
+        }
+        let (r, g, b) = (buf[idx], buf[idx + 1], buf[idx + 2]);
+        if r == 255 && g == 0 && b == 0 {
+            continue;
+        }
+        let q = quantize(r, g, b);
+        if q != bgq {
+            set.insert(q);
+        }
+    }
+    set
+}
+
+/// Trifft eine Farbe die Palette? Geprüft werden die eigene und die
+/// Nachbar-Quantisierungsstufen (±1, entspricht ca. ±8 je Kanal), damit
+/// Farben an Bucket-Grenzen nicht durchfallen.
+pub fn palette_match(r: u8, g: u8, b: u8, palette: &std::collections::HashSet<u32>) -> bool {
+    let qr = (r as i32) >> 3;
+    let qg = (g as i32) >> 3;
+    let qb = (b as i32) >> 3;
+    for dr in -1..=1 {
+        for dg in -1..=1 {
+            for db in -1..=1 {
+                let nr = qr + dr;
+                let ng = qg + dg;
+                let nb = qb + db;
+                if !(0..32).contains(&nr) || !(0..32).contains(&ng) || !(0..32).contains(&nb) {
+                    continue;
+                }
+                let q = ((nr as u32) << 10) | ((ng as u32) << 5) | (nb as u32);
+                if palette.contains(&q) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Nächste Spalte mit Schrittweite und Umlauf in [left, right).
@@ -137,13 +200,36 @@ mod tests {
             (100, 100, 100, 255), // y=2 x=1 außerhalb
         ];
         let data = frame(w, h, &px);
-        assert_eq!(scan_column(&data, w, h, 0, &filter()), vec![(0, 200, 40, 120)]);
         assert_eq!(
-            scan_column(&data, w, h, 1, &filter()),
+            scan_column(&data, w, h, 0, &filter(), None),
+            vec![(0, 200, 40, 120)]
+        );
+        assert_eq!(
+            scan_column(&data, w, h, 1, &filter(), None),
             vec![(1, 205, 45, 115)]
         );
-        assert!(scan_column(&data, w, h, 2, &filter()).is_empty());
-        assert!(scan_column(&[], w, h, 0, &filter()).is_empty());
+        assert!(scan_column(&data, w, h, 2, &filter(), None).is_empty());
+        assert!(scan_column(&[], w, h, 0, &filter(), None).is_empty());
+    }
+
+    #[test]
+    fn palette_matches_painted_colors_with_tolerance() {
+        // "Gemaltes" Bild: Hintergrund (0,0,0), gemalt (200,40,120)
+        let buf = frame(2, 1, &[(0, 0, 0, 255), (200, 40, 120, 255)]);
+        let pal = build_palette(&buf, 2, (0, 0, 0));
+        assert_eq!(pal.len(), 1, "nur die gemalte Farbe");
+        assert!(palette_match(200, 40, 120, &pal));
+        assert!(palette_match(205, 45, 115, &pal), "innerhalb ±7");
+        assert!(!palette_match(220, 40, 120, &pal), "außerhalb");
+        assert!(!palette_match(0, 0, 0, &pal), "Hintergrund");
+
+        let data = frame(2, 1, &[(205, 45, 115, 255), (10, 10, 10, 255)]);
+        let hits = scan_column(&data, 2, 1, 1, &filter(), None);
+        assert!(hits.is_empty(), "Einzelfarbe-Filter trifft hier nicht");
+        let hits = scan_column(&data, 2, 1, 1, &filter(), Some(&pal));
+        assert!(hits.is_empty(), "x=1 ist dunkel");
+        let hits = scan_column(&data, 2, 1, 0, &filter(), Some(&pal));
+        assert_eq!(hits, vec![(0, 205, 45, 115)], "Palette trifft ±7");
     }
 
     #[test]

@@ -397,6 +397,8 @@ struct App {
     live_next_col: Instant,
     live_notes_this_sweep: u32,
     live_drawn_this_sweep: u32,
+    live_palette_on: bool,
+    live_palette: Option<std::collections::HashSet<u32>>,
     max_notes_per_sec: u32,
     live_verbose: bool,
     surfacesh: bool,
@@ -522,6 +524,8 @@ impl App {
             live_next_col: now,
             live_notes_this_sweep: 0,
             live_drawn_this_sweep: 0,
+            live_palette_on: false,
+            live_palette: None,
             max_notes_per_sec: std::env::var("RRN5_MAX_NOTES_PER_SEC")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -633,7 +637,7 @@ impl App {
 
     /// Eine Spalte des aktuellen Kamera-/Videoframes scannen und abspielen.
     /// Taktsynchron: ein Sweep dauert einen Beat; freilaufend: kontinuierlich.
-    fn live_scan_step(&mut self, frame: &[u8], third: &mut [u8]) -> bool {
+    fn live_scan_step(&mut self, frame: &[u8], third: &mut [u8], second: &[u8]) -> bool {
         if !self.live_scan {
             return false;
         }
@@ -686,8 +690,26 @@ impl App {
             if x == left {
                 // Sweep-Anzeige im dritten Fenster neu aufsetzen (wie `o`)
                 fill_buf(third, Color::RGB(self.rr as u8, self.gg as u8, self.bb as u8));
+                if self.live_palette_on {
+                    let pal = livescan::build_palette(
+                        second,
+                        (w * h) as usize,
+                        (self.rr as u8, self.gg as u8, self.bb as u8),
+                    );
+                    if pal.is_empty() {
+                        self.live_palette = None;
+                    } else {
+                        if self.live_palette.as_ref().map(|p| p.len()) != Some(pal.len()) {
+                            println!("Live-Scan: Palette aktiv ({} Farben)", pal.len());
+                        }
+                        self.live_palette = Some(pal);
+                    }
+                } else {
+                    self.live_palette = None;
+                }
             }
-            let hits = livescan::scan_column(frame, w, h, x, &filter);
+            let hits =
+                livescan::scan_column(frame, w, h, x, &filter, self.live_palette.as_ref());
             for (y, r, g, b) in hits {
                 let (note, vol) = self.event_note_volume(x, y, r, g, b);
                 if !self.is_note_in_chordpatt(note, x, y, h) {
@@ -1949,12 +1971,21 @@ fn handle_key(
             }
         }
         Keycode::Num3 => {
-            println!("Geben Sie die Anzahl der Harmonien ein: ");
-            app.notessetcount = sdl_input_i32();
-            app.notesset.clear();
-            app.notessetx.clear();
-            app.notesset.resize(app.notessetcount.max(0) as usize, Vec::new());
-            app.notessetx.resize(app.notessetcount.max(0) as usize, Vec::new());
+            if app.live_scan {
+                app.live_palette_on = !app.live_palette_on;
+                app.live_palette = None;
+                println!(
+                    "Live-Scan: Palette {} (gemalte Farben aus dem 2. Fenster)",
+                    if app.live_palette_on { "an" } else { "aus" }
+                );
+            } else {
+                println!("Geben Sie die Anzahl der Harmonien ein: ");
+                app.notessetcount = sdl_input_i32();
+                app.notesset.clear();
+                app.notessetx.clear();
+                app.notesset.resize(app.notessetcount.max(0) as usize, Vec::new());
+                app.notessetx.resize(app.notessetcount.max(0) as usize, Vec::new());
+            }
         }
         Keycode::Num4 => {
             app.harmonics = !app.harmonics;
@@ -2248,7 +2279,7 @@ fn frame_logic(
                 }
             }
         }
-        if app.live_scan_step(main_buffer, third) {
+        if app.live_scan_step(main_buffer, third, second) {
             third_view.present(third, w, h);
         }
     }

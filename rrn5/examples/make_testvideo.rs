@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (w, h, fps, frames) = (64, 48, 10.0, 10);
     let mut writer = VideoWriter::new(
         &path,
-        opencv::videoio::VideoWriter::fourcc('M', 'J', 'P', 'G')?,
+        opencv::videoio::VideoWriter::fourcc('F', 'F', 'V', '1')?,
         fps,
         opencv::core::Size::new(w, h),
         true,
@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             h,
             w,
             opencv::core::CV_8UC3,
-            opencv::core::Scalar::new(((i * 25) % 256) as f64, 40.0, 200.0, 0.0),
+            opencv::core::Scalar::new((25 + (i * 20) % 200) as f64, 40.0, 200.0, 0.0),
         )?;
         writer.write(&mat)?;
         let _ = &mut mat;
