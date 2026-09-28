@@ -240,6 +240,21 @@ Alle Schritte umgesetzt; Gesamtlauf grün (`tests/e2e/run_all.sh`, Exit 0):
 Builds aller Crates, E2E: it_live, it_live_live, bundle_udp, smoke_xvfb,
 shm_pipeline, rrn5_e2e, pattern_recorder_e2e, pattern_recorder_flows.
 
+### Live-Scan für Kamera/Video (rrn5)
+
+- `livescan.rs`: Spaltenfilter wie Taste `l` (Hintergrund, Schwarz-Marker
+  (255,0,0), Farbbereich um die Linksklick-Auswahl), Spaltenvorschub mit
+  Umlauf, optionale Notenbremse — reine Funktionen mit Unit-Tests.
+- Tasten: `6` Live-Scan an/aus, `1` freilaufend, `2` taktsynchron
+  (ein Sweep pro Beat, Fallback 0,5 s wenn BPM 0 ist).
+- **Pro Spalte live scannen**: Jede Spalte wird im Moment des Abspielens im
+  aktuellen Frame gescannt → Rauch/Grau bewegt sich mit; Pause während der
+  Pixelauswahl (Maustaste). OSC-Note/Volume wie `o` (noteadjust-abhängig),
+  Dichte über Fensterbreite/`iadd`, optional `RRN5_MAX_NOTES_PER_SEC`.
+- rrn5-OSC-Basisports konfigurierbar (`RRN5_OSC_BASE_PORT`, Default 7000),
+  damit Tests parallel zu einem laufenden Relay auf 7000-7002 möglich sind.
+- E2E: Live-Scan sendet OSC, „Sweep beendet“ erscheint, Taktmodus aktiv.
+
 ### Kamera/Video in rrn5 (OpenCV)
 
 - `rrn5/src/video.rs`: `VideoSource` (Kamera-Index oder Videodatei, Video geloopt),

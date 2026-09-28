@@ -6,6 +6,7 @@
 //     wirklich gebraucht wird.
 //   - Eingaben (BPM, Harmonien usw.) über stdin statt SDL-Tasteneingabe.
 //   - OSC-Empfang (Port 7010) entfällt (in rrn5.cpp auskommentiert).
+mod livescan;
 mod osc;
 mod shared;
 mod video;
@@ -389,6 +390,15 @@ struct App {
     video_path: Option<String>,
     shm_mode: video::ShmMode,
     shm_last: Instant,
+    live_scan: bool,
+    live_beat: bool,
+    live_x: i32,
+    live_last_note: Instant,
+    live_sweep_started: Instant,
+    live_notes_this_sweep: u32,
+    live_frame: Option<(i32, i32, Vec<u8>)>,
+    max_notes_per_sec: u32,
+    live_verbose: bool,
     surfacesh: bool,
     sendbpm: bool,
     leftset: bool,
@@ -505,6 +515,20 @@ impl App {
             video_path: None,
             shm_mode: video::ShmMode::Throttle,
             shm_last: now,
+            live_scan: false,
+            live_beat: false,
+            live_x: 0,
+            live_last_note: now,
+            live_sweep_started: now,
+            live_notes_this_sweep: 0,
+            live_frame: None,
+            max_notes_per_sec: std::env::var("RRN5_MAX_NOTES_PER_SEC")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
+            live_verbose: std::env::var("RRN5_LIVE_VERBOSE")
+                .map(|v| v == "1")
+                .unwrap_or(false),
             surfacesh: false,
             sendbpm: true,
             leftset: false,
@@ -573,6 +597,113 @@ impl App {
     fn send_bpm(&mut self) {
         self.calc_bpm();
         osc::send_bpm(self.fixedBpm2, self.fixedBpmTeiler);
+    }
+
+    /// Note/Volume eines Farbpixels je noteadjust (wie im bpmo-Block).
+    fn event_note_volume(&self, x: i32, y: i32, r: u8, g: u8, b: u8) -> (i32, i32) {
+        let w = self.xw.max(1);
+        let h = self.yh.max(1);
+        match self.noteadjust {
+            0 => color_to_note_value_and_volume(r, g, b, self.noteScale, self.noteScaleadd),
+            2 => (
+                (y * self.noteScale / h) + self.noteScaleadd,
+                127 - (x * 127 / w),
+            ),
+            3 => (self.noteScale - (y * self.noteScale / h) + self.noteScaleadd, x * 127 / w),
+            4 => (
+                self.noteScale - (y * self.noteScale / h) + self.noteScaleadd,
+                127 - (x * 127 / w),
+            ),
+            5 => ((x * self.noteScale / w) + self.noteScaleadd, x * 127 / w),
+            6 => (
+                (x * self.noteScale / w) + self.noteScaleadd,
+                127 - (x * 127 / w),
+            ),
+            7 => (
+                self.noteScale - (x * self.noteScale / w) + self.noteScaleadd,
+                x * 127 / w,
+            ),
+            8 => (
+                self.noteScale - (x * self.noteScale / w) + self.noteScaleadd,
+                127 - (x * 127 / w),
+            ),
+            _ => (self.noteScale - (y * self.noteScale / h) + self.noteScaleadd, 127),
+        }
+    }
+
+    /// Eine Spalte des aktuellen Kamera-/Videoframes scannen und abspielen.
+    /// Taktsynchron: ein Sweep dauert einen Beat; freilaufend: kontinuierlich.
+    fn live_scan_step(&mut self) {
+        if !self.live_scan {
+            return;
+        }
+        let (fw, fh, x, left, right) = match self.live_frame.as_ref() {
+            Some((fw, fh, _)) => {
+                let left = self.leftrand.clamp(0, *fw);
+                let right = (*fw - self.rightrand).max(left);
+                ( *fw, *fh, self.live_x, left, right)
+            }
+            None => return,
+        };
+        if right <= left {
+            return;
+        }
+        let x = x.clamp(left, right - 1);
+        let filter = livescan::ScanFilter {
+            bg: (self.rr as u8, self.gg as u8, self.bb as u8),
+            sel: (self.selectedR, self.selectedG, self.selectedB),
+            range: (self.rrange, self.grange, self.brange),
+        };
+        let hits = {
+            let Some((_, _, frame)) = self.live_frame.as_ref() else {
+                return;
+            };
+            livescan::scan_column(frame, fw, fh, x, &filter)
+        };
+        for (y, r, g, b) in hits {
+            let (note, vol) = self.event_note_volume(x, y, r, g, b);
+            if !self.is_note_in_chordpatt(note, x, y, fh) {
+                continue;
+            }
+            if self.renoisenote
+                && livescan::note_allowed(self.live_last_note.elapsed(), self.max_notes_per_sec)
+            {
+                self.live_last_note = Instant::now();
+                if self.renoiseswitch {
+                    osc::note_on(7000, note, vol);
+                    osc::trigger_midi(7002, vol);
+                } else {
+                    osc::note_on(7001, note, vol);
+                }
+                self.live_notes_this_sweep += 1;
+                if self.live_verbose {
+                    println!("live x={x} y={y} note={note} vol={vol}");
+                }
+            }
+        }
+        let step = self.iadd.max(1);
+        let next = livescan::next_column(x, left, right, step);
+        if next == left {
+            println!(
+                "Live-Scan: Sweep beendet, {} Noten ({} Modus)",
+                self.live_notes_this_sweep,
+                if self.live_beat { "Takt" } else { "frei" }
+            );
+            self.live_notes_this_sweep = 0;
+            if self.live_beat {
+                let beat_ns = if self.secPerBeat.is_finite() && self.secPerBeat > 0.0 {
+                    (self.secPerBeat * 1.0e9) as u64
+                } else {
+                    500_000_000
+                };
+                let elapsed = self.live_sweep_started.elapsed().as_nanos() as u64;
+                if elapsed < beat_ns {
+                    sleep_ns((beat_ns - elapsed) as i64);
+                }
+                self.live_sweep_started = Instant::now();
+            }
+        }
+        self.live_x = next;
     }
 
     fn is_note_in_chord(&self, note: i32, x: i32) -> bool {
@@ -1873,6 +2004,28 @@ fn handle_key(
             app.shm_mode = video::next_shm_mode(app.shm_mode);
             println!("SHM-Modus: {}", app.shm_mode.as_str());
         }
+        Keycode::Num6 => {
+            app.live_scan = !app.live_scan;
+            if app.live_scan {
+                app.live_x = app.leftrand.max(0);
+                app.live_sweep_started = Instant::now();
+                println!(
+                    "Live-Scan an ({}); Spalten via Fensterbreite/iadd, Dichte via RRN5_MAX_NOTES_PER_SEC",
+                    if app.live_beat { "taktsynchron" } else { "freilaufend" }
+                );
+            } else {
+                println!("Live-Scan aus");
+            }
+        }
+        Keycode::Num1 => {
+            app.live_beat = false;
+            println!("Live-Scan: freilaufend");
+        }
+        Keycode::Num2 => {
+            app.live_beat = true;
+            app.live_sweep_started = Instant::now();
+            println!("Live-Scan: taktsynchron");
+        }
         Keycode::Greater => {
             app.noteValueadd -= 1;
             println!("{}", app.noteValueadd);
@@ -2051,11 +2204,12 @@ fn frame_logic(
     let h = app.yh;
 
     // Kamera/Video: laufend anzeigen; während der Pixelauswahl (linke/mittlere
-    // Maustaste) steht das Bild.
-    if let Some(src) = app.video.as_mut() {
-        let freeze = app.isLeftMouseButtonHeld || app.isMiddleMouseButtonHeld;
-        if !freeze {
+    // Maustaste) steht das Bild und der Live-Scan pausiert.
+    let freeze = app.isLeftMouseButtonHeld || app.isMiddleMouseButtonHeld;
+    if !freeze {
+        if let Some(src) = app.video.as_mut() {
             if let Some((fw, fh, rgba)) = src.next_frame_rgba() {
+                app.live_frame = Some((fw, fh, rgba.clone()));
                 scale_rgba_into(w, h, main_buffer, fw, fh, &rgba);
                 main_view.present(main_buffer, w, h);
                 let publish = match app.shm_mode {
@@ -2071,6 +2225,7 @@ fn frame_logic(
                 }
             }
         }
+        app.live_scan_step();
     }
 
     if app.isRightMouseButtonHeld {

@@ -3,6 +3,25 @@
 use rosc::{encoder, OscMessage, OscPacket, OscType};
 use std::net::UdpSocket;
 
+/// Basisport (Default 7000); 7001/7002 sind Basis+1/+2.
+pub fn base_port() -> u16 {
+    std::env::var("RRN5_OSC_BASE_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p > 0)
+        .unwrap_or(7000)
+}
+
+/// Bekannte Ports auf die Basis legen (7000→base, 7001→base+1, 7002→base+2).
+pub fn mapped_port(port: u16, base: u16) -> u16 {
+    match port {
+        7000 => base,
+        7001 => base.saturating_add(1),
+        7002 => base.saturating_add(2),
+        other => other,
+    }
+}
+
 fn send(port: u16, addr: &str, args: Vec<OscType>) {
     let msg = OscMessage {
         addr: addr.to_string(),
@@ -16,7 +35,7 @@ fn send(port: u16, addr: &str, args: Vec<OscType>) {
         }
     };
     if let Ok(sock) = UdpSocket::bind(("127.0.0.1", 0)) {
-        let _ = sock.send_to(&data, ("127.0.0.1", port));
+        let _ = sock.send_to(&data, ("127.0.0.1", mapped_port(port, base_port())));
     }
 }
 
@@ -30,6 +49,22 @@ pub fn t7001(addr: &str, args: Vec<OscType>) {
 
 pub fn t7002(addr: &str, args: Vec<OscType>) {
     send(7002, addr, args);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mapped_port_offsets_known_ports() {
+        assert_eq!(mapped_port(7000, 7000), 7000);
+        assert_eq!(mapped_port(7001, 7000), 7001);
+        assert_eq!(mapped_port(7002, 7000), 7002);
+        assert_eq!(mapped_port(7000, 7200), 7200);
+        assert_eq!(mapped_port(7001, 7200), 7201);
+        assert_eq!(mapped_port(7002, 7200), 7202);
+        assert_eq!(mapped_port(9999, 7200), 9999);
+    }
 }
 
 /// /renoise/song/bpm "f" bpm  (an 7000 und 7001, wobei 7001 mit Teiler multipliziert)
