@@ -85,6 +85,32 @@ assert len(sweeps) >= 3, f"nur {len(sweeps)} Sweeps (Dauerloop?)"
 assert max(int(d) for _, d in sweeps) >= 1, "nichts im 3. Fenster gezeichnet"
 PY
 
+log "Takte-Maske: nur Spalten mit iialpha != 0 spielen/zeichnen"
+MASK_WORK="$TMP/rrn5_mask"
+rm -rf "$MASK_WORK"
+mkdir -p "$MASK_WORK"
+for i in $(seq 0 31); do
+  if [ "$i" -lt 16 ]; then echo "$i;0;1.0;0"; else echo "$i;0;0.0;0"; fi
+done >"$MASK_WORK/KeyEventRender.txt"
+rm -f /dev/shm/MyImageShm
+(
+  cd "$MASK_WORK" || exit 1
+  printf '32 24\n' | DISPLAY="$DISPLAY" E2E_KEYS="wait:300,mousedown:16:12,wait:300,mouseup,wait:200,space,wait:300,6,1,3,wait:5000,Quit" \
+    "$ROOT/rrn5/target/debug/rrn5" --dir "$FIXTURES" \
+    --video "$TMP/testvideo.avi" --shm off >"$TMP/rrn5_mask.log" 2>&1
+) &
+p4=$!
+APP_PIDS+=("$p4")
+wait_for 8 grep -q "Takte-Maske aktiv (16 Spalten)" "$TMP/rrn5_mask.log" || fail "Takte-Maske nicht geladen: $(tail -3 "$TMP/rrn5_mask.log")"
+wait_for 8 grep -q "gezeichnet" "$TMP/rrn5_mask.log" || fail "kein masked Sweep"
+wait "$p4" 2>/dev/null || fail "Masken-Lauf Exit != 0"
+python3 - "$TMP/rrn5_mask.log" <<'PY' || fail "Maske zeichnet/spielt nichts"
+import re, sys
+sweeps = re.findall(r"Sweep beendet, (\d+) Noten, (\d+) gezeichnet", open(sys.argv[1]).read())
+assert sweeps, "keine Sweeps"
+assert max(int(d) for _, d in sweeps) >= 1, "nichts gezeichnet"
+PY
+
 log "Fehlende Videodatei -> klare Meldung, App läuft weiter"
 printf '200 150\n' | E2E_KEYS=Quit \
   "$ROOT/rrn5/target/debug/rrn5" --dir "$FIXTURES" --video "$TMP/fehlt.avi" \

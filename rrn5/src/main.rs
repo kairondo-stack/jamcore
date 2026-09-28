@@ -71,6 +71,7 @@ fn push_test_keys(spec: &str) {
             continue;
         }
         let (k, _s) = match name.to_ascii_lowercase().as_str() {
+            "space" => (K::Space, S::Space),
             "tab" => (K::Tab, S::Tab),
             "right" => (K::Right, S::Right),
             "left" => (K::Left, S::Left),
@@ -591,9 +592,16 @@ impl App {
 
     fn calc_bpm_base(&mut self, base_bpm: f32) {
         self.Bpm = bpm_from(base_bpm, self.bpmmal, self.fixedfaktor2);
+        if !self.Bpm.is_finite() || self.Bpm <= 0.0 {
+            self.secPerBeat = 0.0;
+            self.timePerPixel = 0.0;
+            self.timePerPixelns = 0;
+            println!("BPM ungültig ({}) – Zeitraster aus", self.Bpm);
+            return;
+        }
         self.pixelsPerBeat = (self.xw - self.leftrand - self.rightrand) as f32 * self.yh as f32;
         self.secPerBeat = 60.0f32 / self.Bpm;
-        self.timePerPixel = self.secPerBeat / self.pixelsPerBeat;
+        self.timePerPixel = self.secPerBeat / self.pixelsPerBeat.max(1.0);
         self.timePerPixelns = (self.timePerPixel * 1.0e9) as i64;
         println!("{} {}", self.Bpm, self.timePerPixelns);
     }
@@ -674,6 +682,11 @@ impl App {
         .clamp(1_000_000, 2_000_000_000) as u64;
         let budget = Duration::from_nanos(budget_ns);
         let start = Instant::now();
+        let alphas: Vec<f32> = if self.biialpha {
+            self.keyEventsxyes.iter().map(|k| k.iialpha).collect()
+        } else {
+            Vec::new()
+        };
         let filter = livescan::ScanFilter {
             bg: (self.rr as u8, self.gg as u8, self.bb as u8),
             sel: (self.selectedR, self.selectedG, self.selectedB),
@@ -708,32 +721,47 @@ impl App {
                     self.live_palette = None;
                 }
             }
-            let hits =
-                livescan::scan_column(frame, w, h, x, &filter, self.live_palette.as_ref());
-            for (y, r, g, b) in hits {
-                let (note, vol) = self.event_note_volume(x, y, r, g, b);
-                if !self.is_note_in_chordpatt(note, x, y, h) {
-                    continue;
-                }
-                set_px(third, w, x, y, Color::RGB(r, g, b));
-                self.live_drawn_this_sweep += 1;
-                drew = true;
-                if self.renoisenote
-                    && livescan::note_allowed(
-                        self.live_last_note.elapsed(),
-                        self.max_notes_per_sec,
-                    )
-                {
-                    self.live_last_note = Instant::now();
-                    if self.renoiseswitch {
-                        osc::note_on(7000, note, vol);
-                        osc::trigger_midi(7002, vol);
-                    } else {
-                        osc::note_on(7001, note, vol);
+            // Takte-Maske (biialpha): nur Spalten mit iialpha≠0 kommen durch,
+            // Amplitude skaliert Farbe und Volume.
+            let alpha = if self.biialpha {
+                livescan::mask_alpha(&alphas, x)
+            } else {
+                1.0
+            };
+            if alpha > 0.0 {
+                let hits =
+                    livescan::scan_column(frame, w, h, x, &filter, self.live_palette.as_ref());
+                for (y, r, g, b) in hits {
+                    let (note, vol) = self.event_note_volume(x, y, r, g, b);
+                    if !self.is_note_in_chordpatt(note, x, y, h) {
+                        continue;
                     }
-                    self.live_notes_this_sweep += 1;
-                    if self.live_verbose {
-                        println!("live x={x} y={y} note={note} vol={vol}");
+                    let (dr, dg, db) = livescan::scale_rgb(r, g, b, alpha);
+                    set_px(third, w, x, y, Color::RGB(dr, dg, db));
+                    self.live_drawn_this_sweep += 1;
+                    drew = true;
+                    let vol = if self.biialpha {
+                        (vol as f32 * alpha).clamp(0.0, 127.0) as i32
+                    } else {
+                        vol
+                    };
+                    if self.renoisenote
+                        && livescan::note_allowed(
+                            self.live_last_note.elapsed(),
+                            self.max_notes_per_sec,
+                        )
+                    {
+                        self.live_last_note = Instant::now();
+                        if self.renoiseswitch {
+                            osc::note_on(7000, note, vol);
+                            osc::trigger_midi(7002, vol);
+                        } else {
+                            osc::note_on(7001, note, vol);
+                        }
+                        self.live_notes_this_sweep += 1;
+                        if self.live_verbose {
+                            println!("live x={x} y={y} note={note} vol={vol}");
+                        }
                     }
                 }
             }
@@ -2065,6 +2093,14 @@ fn handle_key(
             app.live_scan = !app.live_scan;
             if app.live_scan {
                 app.live_x = app.leftrand.max(0);
+                if app.biialpha {
+                    let active = app
+                        .keyEventsxyes
+                        .iter()
+                        .filter(|k| k.iialpha != 0.0)
+                        .count();
+                    println!("Live-Scan: Takte-Maske aktiv ({active} Spalten)");
+                }
                 println!(
                     "Live-Scan an ({}); Spalten via Fensterbreite/iadd, Dichte via RRN5_MAX_NOTES_PER_SEC",
                     if app.live_beat { "taktsynchron" } else { "freilaufend" }

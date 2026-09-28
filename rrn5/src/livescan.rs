@@ -153,6 +153,21 @@ pub fn column_interval_ns(h: i32, time_per_pixel_ns: i64) -> i64 {
     (h.max(1) as i64).saturating_mul(time_per_pixel_ns.max(1))
 }
 
+/// Takte-Maske: iialpha der Spalte (0.0 = Spalte wird übersprungen).
+pub fn mask_alpha(alphas: &[f32], x: i32) -> f32 {
+    alphas.get(x as usize).copied().unwrap_or(0.0)
+}
+
+/// Farbe mit der Masken-Amplitude skalieren.
+pub fn scale_rgb(r: u8, g: u8, b: u8, alpha: f32) -> (u8, u8, u8) {
+    let a = alpha.clamp(0.0, 1.0);
+    (
+        (r as f32 * a) as u8,
+        (g as f32 * a) as u8,
+        (b as f32 * a) as u8,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +261,23 @@ mod tests {
     fn column_interval_matches_pixel_distance() {
         assert_eq!(column_interval_ns(240, 4_000), 960_000);
         assert_eq!(column_interval_ns(0, 0), 1);
+    }
+
+    #[test]
+    fn mask_alpha_gates_columns() {
+        let alphas = [0.0f32, 0.5, 1.0];
+        assert_eq!(mask_alpha(&alphas, 0), 0.0);
+        assert_eq!(mask_alpha(&alphas, 1), 0.5);
+        assert_eq!(mask_alpha(&alphas, 2), 1.0);
+        assert_eq!(mask_alpha(&alphas, 9), 0.0);
+    }
+
+    #[test]
+    fn scale_rgb_applies_amplitude() {
+        assert_eq!(scale_rgb(200, 40, 100, 0.0), (0, 0, 0));
+        assert_eq!(scale_rgb(200, 40, 100, 0.5), (100, 20, 50));
+        assert_eq!(scale_rgb(200, 40, 100, 1.0), (200, 40, 100));
+        assert_eq!(scale_rgb(200, 40, 100, 2.0), (200, 40, 100));
     }
 
     #[test]
