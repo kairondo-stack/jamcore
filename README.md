@@ -7,7 +7,7 @@ Rust-Ports der C++-Originale aus `~/Documents/cde` plus Live-Modul-Renderer.
 | Crate | Zweck |
 |---|---|
 | `it_live` | IT/Modul-Renderer (libopenmpt): `--dump`, `--wav` (offline) oder Live-Audio (cpal, `--device NAME`, `--seconds N`) mit taktkompatiblen Order-Wechseln |
-| `rrn5` | Bild/Farb-Werkzeug: Farbmischmengen aus Bildern zu Noten, OSC an Renoise (Basis 7000, `RRN5_OSC_BASE_PORT`), Clipboard-Export, MyImageShm lesen/schreiben, Bildverzeichnis per `--dir`/`FRAMES_DIR`, Kamera (`Z`) / Videodatei (`--video`, OpenCV), Standbild bei Pixelauswahl, `--shm every|throttle|off` (`8`), Live-Scan (`6`, `1` frei/`2` taktsynchron, `RRN5_MAX_NOTES_PER_SEC`) |
+| `rrn5` | Bild/Farb-Werkzeug: Farbmischmengen aus Bildern zu Noten, OSC an Renoise (Basis 7000, `RRN5_OSC_BASE_PORT`), Clipboard-Export, MyImageShm lesen/schreiben, Bildverzeichnis per `--dir`/`FRAMES_DIR`, Kamera (`Z`) / Videodatei (`--video`, OpenCV), Standbild bei Pixelauswahl, `--shm every|throttle|off` (`8`), Live-Scan (`6`, `1` frei/`2` taktsynchron, `3` Palette aus dem 2. Fenster, `RRN5_MAX_NOTES_PER_SEC`) |
 | `pattern_recorder` | Rhythmus-Aufnahme, CSV speichern/laden, Graph-Fenster, Renoise-PatternClipboard-Export/-Import, Schism-Export, Mikrofon-BPM (T+L live, T+M messen, T+Enter übernehmen), OSC (`RENOISE_OSC_PORT`, Default 7005) |
 | `imgsh` | Bildbetrachter, schreibt Bilder in `MyImageShm` (von rrn5 mitgenutzt) |
 | `bundle_udp` | OSC-Relay 7000/7005 → Ziele (`OSC_TARGETS`, Hostnamen erlaubt; Lauschports via `OSC_LISTEN_PORTS`) |
