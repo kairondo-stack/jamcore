@@ -394,9 +394,8 @@ struct App {
     live_beat: bool,
     live_x: i32,
     live_last_note: Instant,
-    live_sweep_started: Instant,
+    live_next_col: Instant,
     live_notes_this_sweep: u32,
-    live_frame: Option<(i32, i32, Vec<u8>)>,
     max_notes_per_sec: u32,
     live_verbose: bool,
     surfacesh: bool,
@@ -519,9 +518,8 @@ impl App {
             live_beat: false,
             live_x: 0,
             live_last_note: now,
-            live_sweep_started: now,
+            live_next_col: now,
             live_notes_this_sweep: 0,
-            live_frame: None,
             max_notes_per_sec: std::env::var("RRN5_MAX_NOTES_PER_SEC")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -633,77 +631,92 @@ impl App {
 
     /// Eine Spalte des aktuellen Kamera-/Videoframes scannen und abspielen.
     /// Taktsynchron: ein Sweep dauert einen Beat; freilaufend: kontinuierlich.
-    fn live_scan_step(&mut self) {
+    fn live_scan_step(&mut self, frame: &[u8]) {
         if !self.live_scan {
             return;
         }
-        let (fw, fh, x, left, right) = match self.live_frame.as_ref() {
-            Some((fw, fh, _)) => {
-                let left = self.leftrand.clamp(0, *fw);
-                let right = (*fw - self.rightrand).max(left);
-                ( *fw, *fh, self.live_x, left, right)
-            }
-            None => return,
-        };
+        let w = self.xw.max(1);
+        let h = self.yh.max(1);
+        if frame.len() < (w * h * 4) as usize {
+            return;
+        }
+        let left = self.leftrand.clamp(0, w);
+        let right = (w - self.rightrand).max(left);
         if right <= left {
             return;
         }
-        let x = x.clamp(left, right - 1);
+        let columns = (right - left).max(1) as i64;
+        let mut column_ns = if self.timePerPixelns > 0 {
+            livescan::column_interval_ns(h, self.timePerPixelns)
+        } else {
+            (500_000_000 / columns).max(1)
+        };
+        if self.live_beat {
+            let beat_ns = if self.secPerBeat.is_finite() && self.secPerBeat > 0.0 {
+                (self.secPerBeat * 1.0e9) as i64
+            } else {
+                500_000_000
+            };
+            column_ns = (beat_ns / columns).max(1);
+        }
+        let budget_ns = if self.live_beat {
+            column_ns.saturating_mul(columns)
+        } else {
+            15_000_000
+        }
+        .clamp(1_000_000, 2_000_000_000) as u64;
+        let budget = Duration::from_nanos(budget_ns);
+        let start = Instant::now();
         let filter = livescan::ScanFilter {
             bg: (self.rr as u8, self.gg as u8, self.bb as u8),
             sel: (self.selectedR, self.selectedG, self.selectedB),
             range: (self.rrange, self.grange, self.brange),
         };
-        let hits = {
-            let Some((_, _, frame)) = self.live_frame.as_ref() else {
-                return;
-            };
-            livescan::scan_column(frame, fw, fh, x, &filter)
-        };
-        for (y, r, g, b) in hits {
-            let (note, vol) = self.event_note_volume(x, y, r, g, b);
-            if !self.is_note_in_chordpatt(note, x, y, fh) {
+        let step = self.iadd.max(1);
+        while start.elapsed() < budget {
+            let now = Instant::now();
+            if now < self.live_next_col {
+                sleep_ns(self.live_next_col.saturating_duration_since(now).as_nanos() as i64);
                 continue;
             }
-            if self.renoisenote
-                && livescan::note_allowed(self.live_last_note.elapsed(), self.max_notes_per_sec)
-            {
-                self.live_last_note = Instant::now();
-                if self.renoiseswitch {
-                    osc::note_on(7000, note, vol);
-                    osc::trigger_midi(7002, vol);
-                } else {
-                    osc::note_on(7001, note, vol);
+            let x = self.live_x.clamp(left, right - 1);
+            let hits = livescan::scan_column(frame, w, h, x, &filter);
+            for (y, r, g, b) in hits {
+                let (note, vol) = self.event_note_volume(x, y, r, g, b);
+                if !self.is_note_in_chordpatt(note, x, y, h) {
+                    continue;
                 }
-                self.live_notes_this_sweep += 1;
-                if self.live_verbose {
-                    println!("live x={x} y={y} note={note} vol={vol}");
+                if self.renoisenote
+                    && livescan::note_allowed(
+                        self.live_last_note.elapsed(),
+                        self.max_notes_per_sec,
+                    )
+                {
+                    self.live_last_note = Instant::now();
+                    if self.renoiseswitch {
+                        osc::note_on(7000, note, vol);
+                        osc::trigger_midi(7002, vol);
+                    } else {
+                        osc::note_on(7001, note, vol);
+                    }
+                    self.live_notes_this_sweep += 1;
+                    if self.live_verbose {
+                        println!("live x={x} y={y} note={note} vol={vol}");
+                    }
                 }
             }
-        }
-        let step = self.iadd.max(1);
-        let next = livescan::next_column(x, left, right, step);
-        if next == left {
-            println!(
-                "Live-Scan: Sweep beendet, {} Noten ({} Modus)",
-                self.live_notes_this_sweep,
-                if self.live_beat { "Takt" } else { "frei" }
-            );
-            self.live_notes_this_sweep = 0;
-            if self.live_beat {
-                let beat_ns = if self.secPerBeat.is_finite() && self.secPerBeat > 0.0 {
-                    (self.secPerBeat * 1.0e9) as u64
-                } else {
-                    500_000_000
-                };
-                let elapsed = self.live_sweep_started.elapsed().as_nanos() as u64;
-                if elapsed < beat_ns {
-                    sleep_ns((beat_ns - elapsed) as i64);
-                }
-                self.live_sweep_started = Instant::now();
+            let next = livescan::next_column(x, left, right, step);
+            if next == left {
+                println!(
+                    "Live-Scan: Sweep beendet, {} Noten ({} Modus)",
+                    self.live_notes_this_sweep,
+                    if self.live_beat { "Takt" } else { "frei" }
+                );
+                self.live_notes_this_sweep = 0;
             }
+            self.live_x = next;
+            self.live_next_col += Duration::from_nanos(column_ns as u64);
         }
-        self.live_x = next;
     }
 
     fn is_note_in_chord(&self, note: i32, x: i32) -> bool {
@@ -2008,7 +2021,6 @@ fn handle_key(
             app.live_scan = !app.live_scan;
             if app.live_scan {
                 app.live_x = app.leftrand.max(0);
-                app.live_sweep_started = Instant::now();
                 println!(
                     "Live-Scan an ({}); Spalten via Fensterbreite/iadd, Dichte via RRN5_MAX_NOTES_PER_SEC",
                     if app.live_beat { "taktsynchron" } else { "freilaufend" }
@@ -2023,7 +2035,6 @@ fn handle_key(
         }
         Keycode::Num2 => {
             app.live_beat = true;
-            app.live_sweep_started = Instant::now();
             println!("Live-Scan: taktsynchron");
         }
         Keycode::Greater => {
@@ -2209,7 +2220,6 @@ fn frame_logic(
     if !freeze {
         if let Some(src) = app.video.as_mut() {
             if let Some((fw, fh, rgba)) = src.next_frame_rgba() {
-                app.live_frame = Some((fw, fh, rgba.clone()));
                 scale_rgba_into(w, h, main_buffer, fw, fh, &rgba);
                 main_view.present(main_buffer, w, h);
                 let publish = match app.shm_mode {
@@ -2225,7 +2235,7 @@ fn frame_logic(
                 }
             }
         }
-        app.live_scan_step();
+        app.live_scan_step(main_buffer);
     }
 
     if app.isRightMouseButtonHeld {

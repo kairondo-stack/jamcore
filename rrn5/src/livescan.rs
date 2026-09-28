@@ -84,6 +84,12 @@ pub fn note_allowed(elapsed: Duration, max_per_sec: u32) -> bool {
     elapsed.as_secs_f64() >= 1.0 / max_per_sec as f64
 }
 
+/// Taktdauer pro Spalte: eine Spalte entspricht `h` Pixeln; damit dauert ein
+/// voller Durchlauf (alle Spalten) genau einen Beat wie bei `o`.
+pub fn column_interval_ns(h: i32, time_per_pixel_ns: i64) -> i64 {
+    (h.max(1) as i64).saturating_mul(time_per_pixel_ns.max(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,6 +154,12 @@ mod tests {
         assert_eq!(next_column(0, 0, 5, 2), 2);
         assert_eq!(next_column(5, 0, 5, 1), 0);
         assert_eq!(next_column(0, 0, 0, 1), 0);
+    }
+
+    #[test]
+    fn column_interval_matches_pixel_distance() {
+        assert_eq!(column_interval_ns(240, 4_000), 960_000);
+        assert_eq!(column_interval_ns(0, 0), 1);
     }
 
     #[test]
