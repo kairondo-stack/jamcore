@@ -413,6 +413,8 @@ struct App {
     video: Option<video::VideoSource>,
     video_is_camera: bool,
     video_path: Option<String>,
+    video_fps: f32,
+    video_next: Instant,
     shm_mode: video::ShmMode,
     shm_last: Instant,
     live_scan: bool,
@@ -540,6 +542,12 @@ impl App {
             video: None,
             video_is_camera: false,
             video_path: None,
+            video_fps: std::env::var("RRN5_VIDEO_FPS")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| *v >= 1.0)
+                .unwrap_or(20.0),
+            video_next: now,
             shm_mode: video::ShmMode::Throttle,
             shm_last: now,
             live_scan: false,
@@ -2516,22 +2524,28 @@ fn frame_logic(
     // Maustaste) steht das Bild und der Live-Scan pausiert.
     let freeze = app.isLeftMouseButtonHeld || app.isMiddleMouseButtonHeld;
     if !freeze {
-        if let Some(src) = app.video.as_mut() {
-            if let Some((fw, fh, rgba)) = src.next_frame_rgba() {
-                scale_rgba_into(w, h, main_buffer, fw, fh, &rgba);
-                main_view.present(main_buffer, w, h);
-                let publish = match app.shm_mode {
-                    video::ShmMode::Every => true,
-                    video::ShmMode::Throttle => app.shm_last.elapsed().as_millis() >= 200,
-                    video::ShmMode::Off => false,
-                };
-                if publish {
-                    app.shm_last = Instant::now();
-                    if let Err(e) = editor.write_image(fw, fh, &rgba) {
-                        eprintln!("MyImageShm: {e}");
+        // Bildrate begrenzen (Kamera/Video), sonst dekodiert ein Videofile
+        // mit maximaler Geschwindigkeit und heizt die CPU auf.
+        let now = Instant::now();
+        if now >= app.video_next {
+            if let Some(src) = app.video.as_mut() {
+                if let Some((fw, fh, rgba)) = src.next_frame_rgba() {
+                    scale_rgba_into(w, h, main_buffer, fw, fh, &rgba);
+                    main_view.present(main_buffer, w, h);
+                    let publish = match app.shm_mode {
+                        video::ShmMode::Every => true,
+                        video::ShmMode::Throttle => app.shm_last.elapsed().as_millis() >= 200,
+                        video::ShmMode::Off => false,
+                    };
+                    if publish {
+                        app.shm_last = Instant::now();
+                        if let Err(e) = editor.write_image(fw, fh, &rgba) {
+                            eprintln!("MyImageShm: {e}");
+                        }
                     }
                 }
             }
+            app.video_next = now + Duration::from_secs_f32(1.0 / app.video_fps.max(1.0));
         }
         if app.live_scan_step(main_buffer, third, second) {
             third_view.present(third, w, h);

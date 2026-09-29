@@ -3630,15 +3630,7 @@ impl PatternRecorder {
         }
     }
 
-    fn display(&self, renderer: &mut Canvas<Window>, ttf: &Sdl2TtfContext) {
-        let font_path = "./sagan.ttf";
-        let font = match ttf.load_font(font_path, 10) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to load font: {}", e);
-                return;
-            }
-        };
+    fn display(&self, renderer: &mut Canvas<Window>, font: &sdl2::ttf::Font) {
         let text_color = Color::RGB(255, 255, 255);
         let texture_creator = renderer.texture_creator();
         let bpm_text = format!("BPM: {}", self.sd().bpm);
@@ -3737,8 +3729,20 @@ fn main() -> Result<(), String> {
     let mut lbeats = false;
     let mut playpatanz: i32 = 0;
 
+    let font = match ttf_context.load_font("./sagan.ttf", 10) {
+        Ok(f) => Some(f),
+        Err(e) => {
+            eprintln!("Failed to load font: {e}");
+            None
+        }
+    };
+
+    let mut dirty = true;
+    let mut last_render = Instant::now();
     loop {
+        let mut had_event = false;
         if let Some(event) = poll_event_compat() {
+            had_event = true;
             match event {
                 Event::Quit { .. } => break,
                 Event::KeyUp {
@@ -4614,10 +4618,26 @@ fn main() -> Result<(), String> {
             save = !save;
         }
 
-        renderer.set_draw_color(Color::RGB(0, 0, 0));
-        let _ = renderer.clear();
-        recorder.display(&mut renderer, &ttf_context);
-        renderer.present();
+        if had_event {
+            dirty = true;
+        }
+        if last_render.elapsed().as_secs_f32() >= 1.0 {
+            dirty = true;
+            last_render = Instant::now();
+        }
+        if dirty {
+            renderer.set_draw_color(Color::RGB(0, 0, 0));
+            let _ = renderer.clear();
+            if let Some(font) = font.as_ref() {
+                recorder.display(&mut renderer, font);
+            }
+            renderer.present();
+            dirty = false;
+        }
+
+        if !had_event {
+            std::thread::sleep(Duration::from_millis(16));
+        }
     }
 
     Ok(())
