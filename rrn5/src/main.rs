@@ -7,6 +7,7 @@
 //   - Eingaben (BPM, Harmonien usw.) über stdin statt SDL-Tasteneingabe.
 //   - OSC-Empfang (Port 7010) entfällt (in rrn5.cpp auskommentiert).
 mod livescan;
+mod quint;
 mod osc;
 mod shared;
 mod video;
@@ -16,6 +17,7 @@ use shared::SharedMemoryEditor;
 use sdl2::event::{Event, EventType};
 use sdl2::keyboard::{Keycode, Mod, Scancode};
 use sdl2::pixels::{Color, PixelFormatEnum};
+use sdl2::rect::Point;
 use sdl2::render::{Canvas, Texture, TextureCreator};
 use sdl2::video::Window;
 use std::time::{Duration, Instant};
@@ -41,6 +43,13 @@ fn push_test_keys(spec: &str) {
                 raw.type_ = sdl2::sys::SDL_EventType::SDL_QUIT as u32;
                 sdl2::sys::SDL_PushEvent(&mut raw);
             }
+            continue;
+        }
+        if let Some(rest) = name.strip_prefix("mousemove:") {
+            let mut parts = rest.split(':');
+            let x: i32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let y: i32 = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            warp_pointer(x, y);
             continue;
         }
         if let Some(rest) = name.strip_prefix("mousedown:") {
@@ -134,6 +143,21 @@ fn mouse_xy() -> (i32, i32) {
     let mut y = 0;
     unsafe { sdl2::sys::SDL_GetMouseState(&mut x, &mut y) };
     (x, y)
+}
+
+/// Zeiger per X11 bewegen (für den E2E-Hook; SDL_WarpMouseGlobal ist unter
+/// Xvfb wirkungslos).
+fn warp_pointer(x: i32, y: i32) {
+    unsafe {
+        let dpy = x11::xlib::XOpenDisplay(std::ptr::null());
+        if dpy.is_null() {
+            return;
+        }
+        let root = x11::xlib::XDefaultRootWindow(dpy);
+        x11::xlib::XWarpPointer(dpy, 0, root, 0, 0, 0, 0, x, y);
+        x11::xlib::XFlush(dpy);
+        x11::xlib::XCloseDisplay(dpy);
+    }
 }
 
 const QUINTENZIRKEL: [i32; 12] = [60, 67, 62, 69, 64, 71, 66, 61, 68, 63, 70, 65];
@@ -976,6 +1000,199 @@ fn sdl_input_f32() -> f32 {
 
 fn sdl_input_i32() -> i32 {
     sdl_input_string().trim().parse().unwrap_or(0)
+}
+
+/// 5,1: Frequenzspanne und -teiler je Harmonie (Maus-x als Bandgrenze).
+fn harmony_span_flow(app: &mut App) {
+    for c in 0..app.notessetcount.max(0) as usize {
+        println!("notessetcount {} von {}", c, app.notessetcount);
+        let (mx, _my) = mouse_xy();
+        let px = mx;
+        println!("Geben Sie die Frequenzspanne in Halbtönen ein: ");
+        let fd = sdl_input_f32();
+        println!("Geben Sie den Frequenzspannenteiler ein: ");
+        let fdx = sdl_input_f32();
+        let df = fd / fdx;
+        let mut df2 = 60.0f32;
+        for i in 1..=(fdx as i32) {
+            df2 = df * i as f32;
+            app.notesset[c].push(df2 as i32);
+            app.notessetx[c].push(px);
+        }
+        println!("{} {} {}", app.notesset.len(), app.notessetx.len(), px);
+        let mut line = String::new();
+        for j in 0..app.notesset[c].len().saturating_sub(1) {
+            line.push_str(&format!("{} ", app.notesset[c][j]));
+        }
+        println!("{}", line);
+    }
+}
+
+/// 5,2: Interaktiver Quintenzirkel — erst Klick ins Bild (x-Grenze), dann
+/// Noten im Kreis anklicken; Enter schließt die Harmonie ab, Esc/0 bricht ab.
+fn quintenzirkel_flow(app: &mut App) {
+    if app.notessetcount <= 0 {
+        println!("Keine Harmonien (erst Taste 3)");
+        return;
+    }
+    let sdl = match sdl2::init() {
+        Ok(s) => s,
+        Err(e) => {
+            println!("SDL init: {e}");
+            return;
+        }
+    };
+    let video = match sdl.video() {
+        Ok(v) => v,
+        Err(e) => {
+            println!("Video: {e}");
+            return;
+        }
+    };
+    let (win_w, win_h) = (480i32, 480i32);
+    let (win_x, win_y) = (500i32, 120i32);
+    let window = match video
+        .window("Interaktiver Quintenzirkel", win_w as u32, win_h as u32)
+        .position(win_x, win_y)
+        .build()
+    {
+        Ok(w) => w,
+        Err(e) => {
+            println!("Fenster: {e}");
+            return;
+        }
+    };
+    let mut canvas = match window.into_canvas().accelerated().build() {
+        Ok(c) => c,
+        Err(e) => {
+            println!("Renderer: {e}");
+            return;
+        }
+    };
+    let cx = win_w as f32 / 2.0;
+    let cy = win_h as f32 / 2.0;
+    let r_out = 220.0f32;
+    let r_in = 120.0f32;
+    let mut aborted = false;
+
+    for c in 0..app.notessetcount.max(0) as usize {
+        println!("Harmonie {c}: Klick ins Bild setzt die x-Grenze");
+        let mut x = 0i32;
+        loop {
+            if let Some(ev) = poll_event_compat() {
+                match ev {
+                    Event::MouseButtonDown {
+                        mouse_btn: sdl2::mouse::MouseButton::Left,
+                        ..
+                    } => {
+                        x = mouse_xy().0;
+                        break;
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Escape) | Some(Keycode::Num0),
+                        ..
+                    }
+                    | Event::Quit { .. } => {
+                        aborted = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if aborted {
+            break;
+        }
+
+        let mut selected: Vec<usize> = Vec::new();
+        let mut confirmed = false;
+        loop {
+            let _ = canvas.set_draw_color(Color::RGB(0, 0, 0));
+            canvas.clear();
+            for i in 0..12usize {
+                let (a0, a1) = quint::segment_angles(i);
+                let sel = selected.contains(&i);
+                let _ = canvas.set_draw_color(if sel {
+                    Color::RGB(0, 200, 255)
+                } else {
+                    Color::RGB(70, 70, 70)
+                });
+                let steps = 24;
+                for s in 0..=steps {
+                    let a = a0 + (a1 - a0) * s as f32 / steps as f32;
+                    let (si, ci) = a.sin_cos();
+                    let _ = canvas.draw_line(
+                        Point::new((cx + r_in * ci) as i32, (cy + r_in * si) as i32),
+                        Point::new((cx + r_out * ci) as i32, (cy + r_out * si) as i32),
+                    );
+                }
+            }
+            canvas.present();
+
+            if let Some(ev) = poll_event_compat() {
+                match ev {
+                    Event::MouseButtonDown {
+                        mouse_btn: sdl2::mouse::MouseButton::Left,
+                        x,
+                        y,
+                        ..
+                    } => {
+                        // Event-Koordinaten sind (bei echten Klicks) relativ zum
+                        // Zirkelfenster.
+                        let rx = x as f32 - cx;
+                        let ry = y as f32 - cy;
+                        if let Some(i) = quint::segment_index_at(rx, ry, r_in, r_out) {
+                            if let Some(pos) = selected.iter().position(|&v| v == i) {
+                                selected.remove(pos);
+                            } else {
+                                selected.push(i);
+                                let note = quint::CIRCLE[i] + app.noteValueadd;
+                                if app.renoisenote {
+                                    if app.renoiseswitch {
+                                        osc::note_on(7000, note, 127);
+                                        osc::trigger_midi(7002, 127);
+                                    } else {
+                                        osc::note_on(7001, note, 127);
+                                    }
+                                }
+                                println!(
+                                    "Quintenzirkel: Note {} (Klasse {})",
+                                    quint::CIRCLE[i],
+                                    quint::CIRCLE[i] % 12
+                                );
+                            }
+                        }
+                    }
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Return),
+                        ..
+                    } => confirmed = true,
+                    Event::KeyDown {
+                        keycode: Some(Keycode::Escape) | Some(Keycode::Num0),
+                        ..
+                    }
+                    | Event::Quit { .. } => aborted = true,
+                    _ => {}
+                }
+            }
+            if confirmed || aborted {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if aborted {
+            break;
+        }
+        let classes = quint::note_classes(&selected);
+        app.notesset[c].clear();
+        app.notessetx[c].clear();
+        for class in &classes {
+            app.notesset[c].push(*class);
+            app.notessetx[c].push(x);
+        }
+        println!("Harmonie {c}: x={x} notesset={classes:?}");
+    }
 }
 
 /// "500x240" parsen und auf maximal 500x240 begrenzen (min. 1x1).
@@ -2019,27 +2236,28 @@ fn handle_key(
             app.harmonics = !app.harmonics;
         }
         Keycode::Num5 => {
-            for c in 0..app.notessetcount.max(0) as usize {
-                println!("notessetcount {} von {}", c, app.notessetcount);
-                let (mx, _my) = mouse_xy();
-                let px = mx;
-                println!("Geben Sie die Frequenzspanne in Halbtönen ein: ");
-                let fd = sdl_input_f32();
-                println!("Geben Sie den Frequenzspannenteiler ein: ");
-                let fdx = sdl_input_f32();
-                let df = fd / fdx;
-                let mut df2 = 60.0f32;
-                for i in 1..=(fdx as i32) {
-                    df2 = df * i as f32;
-                    app.notesset[c].push(df2 as i32);
-                    app.notessetx[c].push(px);
+            println!("5: 1 = Frequenzspanne/Teiler (wie bisher), 2 = Interaktiver Quintenzirkel");
+            let choice = loop {
+                if let Some(ev) = poll_event_compat() {
+                    if let Event::KeyDown {
+                        keycode: Some(kc),
+                        ..
+                    } = ev
+                    {
+                        if kc == Keycode::Num1 || kc == Keycode::Num2 {
+                            break Some(kc);
+                        }
+                        if kc == Keycode::Escape || kc == Keycode::Num0 {
+                            break None;
+                        }
+                    }
                 }
-                println!("{} {} {}", app.notesset.len(), app.notessetx.len(), px);
-                let mut line = String::new();
-                for j in 0..app.notesset[c].len().saturating_sub(1) {
-                    line.push_str(&format!("{} ", app.notesset[c][j]));
-                }
-                println!("{}", line);
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            match choice {
+                Some(Keycode::Num2) => quintenzirkel_flow(app),
+                Some(_) => harmony_span_flow(app),
+                None => println!("Harmonie-Eingabe abgebrochen"),
             }
         }
         Keycode::Num7 => {

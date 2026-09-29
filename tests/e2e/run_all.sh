@@ -15,7 +15,7 @@ echo "== Builds"
 (cd "$ROOT" && cargo build -q --manifest-path bundle_udp/Cargo.toml)
 (cd "$ROOT" && cargo build -q --manifest-path imgsh/Cargo.toml)
 
-for script in it_live it_live_live bundle_udp smoke_xvfb shm_pipeline rrn5_e2e rrn5_video pattern_recorder_e2e pattern_recorder_flows; do
+for script in it_live it_live_live bundle_udp smoke_xvfb shm_pipeline rrn5_e2e rrn5_video rrn5_quint pattern_recorder_e2e pattern_recorder_flows; do
   echo "== E2E: $script"
   bash "$DIR/$script.sh"
 done
