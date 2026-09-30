@@ -13,6 +13,8 @@ pkgs.mkShell {
     alsa-lib
     clang
     llvmPackages.libclang
+    cmake
+    ninja
     opencv
     SDL2
     SDL2_ttf

@@ -143,6 +143,18 @@ Zusätzlich:
 - Rollback: Fallback `ableton-link-rs` oder eigenes OSC-Clock-Modul (alter Plan).
 - Lizenzhinweis: Link-SDK ist GPLv2+ (kommerzielle Option) — für Privatprojekt ok.
 
+**Ergebnis Desktop-Spike (2026-09-30): bestanden.**
+- `rusty_link` 0.4.9 vendort das komplette Link-SDK (GPLv2) und baut es per
+  CMake aus dem Quelltext (Nix: `cmake`, `ninja`, `clang`, `libclang` ergänzt).
+- Zwei Prozesse über Loopback-Multicast: Master setzt 100 BPM, zweiter Prozess
+  (Start 140 BPM) übernimmt innerhalb < 1 s (`peers=1, tempo=100.00`).
+- Phase: für Sample-genaue Sync im Audio-Callback `capture_audio_session_state`
+  nutzen (LinkHut-Muster), nicht den App-State-Poll.
+- **Android-TODO:** NDK-Build steht aus (braucht Android-SDK/NDK, S2). SDK ist
+  quelloffen und Android-fähig; voraussichtlich kleine Anpassung nötig, damit
+  die C++-Runtime verlinkt wird (Android: `c++_shared` statt `stdc++`) —
+  Workaround über `build.rs` in `jamcore` (target_os="android").
+
 ### S9: Session/Jam-Modul (Risiko: mittel)
 - Ziel: Tempo/Phase über Link teilen; Noten live, Patterns senden.
 - Dateien: `core/src/session.rs` (Link-Session, Enable/Disable, Quanten),
