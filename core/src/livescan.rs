@@ -1,8 +1,24 @@
 //! Live-Scan für Kamera/Video: Frame-Spalten filtern und als Noten-Events
 //! abspielen (Filter wie Taste `l`, Abspielverhalten wie Taste `o`).
 
-use crate::is_color_in_range;
 use std::time::Duration;
+
+/// Farbbereich-Prüfung (wie `is_color_in_range` in rrn5).
+fn is_color_in_range(
+    r1: u8,
+    g1: u8,
+    b1: u8,
+    r2: u8,
+    g2: u8,
+    b2: u8,
+    rr: i32,
+    gg: i32,
+    bb: i32,
+) -> bool {
+    (r1 as i32 >= r2 as i32 - rr && r1 as i32 <= r2 as i32 + rr)
+        && (g1 as i32 >= g2 as i32 - gg && g1 as i32 <= g2 as i32 + gg)
+        && (b1 as i32 >= b2 as i32 - bb && b1 as i32 <= b2 as i32 + bb)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScanFilter {

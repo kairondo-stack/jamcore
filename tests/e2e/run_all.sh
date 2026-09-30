@@ -6,6 +6,7 @@ ROOT="$(cd "$DIR/../.." && pwd)"
 
 echo "== Unit-Tests"
 (cd "$ROOT" && cargo test -q)
+(cd "$ROOT" && cargo test -q --manifest-path core/Cargo.toml)
 (cd "$ROOT" && cargo test -q --manifest-path pattern_recorder/Cargo.toml)
 (cd "$ROOT" && cargo test -q --manifest-path rrn5/Cargo.toml)
 (cd "$ROOT" && cargo test -q --manifest-path bundle_udp/Cargo.toml)

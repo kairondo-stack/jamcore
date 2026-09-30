@@ -1,4 +1,3 @@
-mod micbpm;
 mod notes;
 mod osc;
 mod shared;
@@ -2374,7 +2373,7 @@ impl PatternRecorder {
 
     fn mic_estimate(&self) -> Option<(f32, f32)> {
         let buf = self.mic_buffer.lock().ok()?;
-        let mut est = micbpm::BpmEstimator::new(44100);
+        let mut est = jamcore::micbpm::BpmEstimator::new(44100);
         est.push(&buf);
         est.estimate()
     }

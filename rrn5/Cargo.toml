@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+jamcore = { path = "../core" }
 opencv = { version = "0.101", default-features = false, features = ["videoio"] }
 sdl2 = { version = "0.37", features = ["unsafe_textures"] }
 image = "0.25"

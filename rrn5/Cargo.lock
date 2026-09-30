@@ -466,6 +466,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "jamcore"
+version = "0.1.0"
+
+[[package]]
 name = "jobserver"
 version = "0.1.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1072,6 +1076,7 @@ name = "rrn5"
 version = "0.1.0"
 dependencies = [
  "image",
+ "jamcore",
  "opencv",
  "rosc",
  "sdl2",

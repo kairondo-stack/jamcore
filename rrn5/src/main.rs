@@ -6,8 +6,6 @@
 //     wirklich gebraucht wird.
 //   - Eingaben (BPM, Harmonien usw.) über stdin statt SDL-Tasteneingabe.
 //   - OSC-Empfang (Port 7010) entfällt (in rrn5.cpp auskommentiert).
-mod livescan;
-mod quint;
 mod osc;
 mod shared;
 mod video;
@@ -694,7 +692,7 @@ impl App {
         let mut drew = false;
         let columns = (right - left).max(1) as i64;
         let mut column_ns = if self.timePerPixelns > 0 {
-            livescan::column_interval_ns(h, self.timePerPixelns)
+            jamcore::livescan::column_interval_ns(h, self.timePerPixelns)
         } else {
             (500_000_000 / columns).max(1)
         };
@@ -719,7 +717,7 @@ impl App {
         } else {
             Vec::new()
         };
-        let filter = livescan::ScanFilter {
+        let filter = jamcore::livescan::ScanFilter {
             bg: (self.rr as u8, self.gg as u8, self.bb as u8),
             sel: (self.selectedR, self.selectedG, self.selectedB),
             range: (self.rrange, self.grange, self.brange),
@@ -736,7 +734,7 @@ impl App {
                 // Sweep-Anzeige im dritten Fenster neu aufsetzen (wie `o`)
                 fill_buf(third, Color::RGB(self.rr as u8, self.gg as u8, self.bb as u8));
                 if self.live_palette_on {
-                    let pal = livescan::build_palette(
+                    let pal = jamcore::livescan::build_palette(
                         second,
                         (w * h) as usize,
                         (self.rr as u8, self.gg as u8, self.bb as u8),
@@ -756,19 +754,19 @@ impl App {
             // Takte-Maske (biialpha): nur Spalten mit iialpha≠0 kommen durch,
             // Amplitude skaliert Farbe und Volume.
             let alpha = if self.biialpha {
-                livescan::mask_alpha(&alphas, x)
+                jamcore::livescan::mask_alpha(&alphas, x)
             } else {
                 1.0
             };
             if alpha > 0.0 {
                 let hits =
-                    livescan::scan_column(frame, w, h, x, &filter, self.live_palette.as_ref());
+                    jamcore::livescan::scan_column(frame, w, h, x, &filter, self.live_palette.as_ref());
                 for (y, r, g, b) in hits {
                     let (note, vol) = self.event_note_volume(x, y, r, g, b);
                     if !self.is_note_in_chordpatt(note, x, y, h) {
                         continue;
                     }
-                    let (dr, dg, db) = livescan::scale_rgb(r, g, b, alpha);
+                    let (dr, dg, db) = jamcore::livescan::scale_rgb(r, g, b, alpha);
                     set_px(third, w, x, y, Color::RGB(dr, dg, db));
                     self.live_drawn_this_sweep += 1;
                     drew = true;
@@ -778,7 +776,7 @@ impl App {
                         vol
                     };
                     if self.renoisenote
-                        && livescan::note_allowed(
+                        && jamcore::livescan::note_allowed(
                             self.live_last_note.elapsed(),
                             self.max_notes_per_sec,
                         )
@@ -797,7 +795,7 @@ impl App {
                     }
                 }
             }
-            let next = livescan::next_column(x, left, right, step);
+            let next = jamcore::livescan::next_column(x, left, right, step);
             if next == left {
                 println!(
                     "Live-Scan: Sweep beendet, {} Noten, {} gezeichnet ({} Modus)",
@@ -1119,7 +1117,7 @@ fn quintenzirkel_flow(app: &mut App) {
             let _ = canvas.set_draw_color(Color::RGB(0, 0, 0));
             canvas.clear();
             for i in 0..12usize {
-                let (a0, a1) = quint::segment_angles(i);
+                let (a0, a1) = jamcore::quint::segment_angles(i);
                 let sel = selected.contains(&i);
                 let _ = canvas.set_draw_color(if sel {
                     Color::RGB(0, 200, 255)
@@ -1150,12 +1148,12 @@ fn quintenzirkel_flow(app: &mut App) {
                         // Zirkelfenster.
                         let rx = x as f32 - cx;
                         let ry = y as f32 - cy;
-                        if let Some(i) = quint::segment_index_at(rx, ry, r_in, r_out) {
+                        if let Some(i) = jamcore::quint::segment_index_at(rx, ry, r_in, r_out) {
                             if let Some(pos) = selected.iter().position(|&v| v == i) {
                                 selected.remove(pos);
                             } else {
                                 selected.push(i);
-                                let note = quint::CIRCLE[i] + app.noteValueadd;
+                                let note = jamcore::quint::CIRCLE[i] + app.noteValueadd;
                                 if app.renoisenote {
                                     if app.renoiseswitch {
                                         osc::note_on(7000, note, 127);
@@ -1166,8 +1164,8 @@ fn quintenzirkel_flow(app: &mut App) {
                                 }
                                 println!(
                                     "Quintenzirkel: Note {} (Klasse {})",
-                                    quint::CIRCLE[i],
-                                    quint::CIRCLE[i] % 12
+                                    jamcore::quint::CIRCLE[i],
+                                    jamcore::quint::CIRCLE[i] % 12
                                 );
                             }
                         }
@@ -1192,7 +1190,7 @@ fn quintenzirkel_flow(app: &mut App) {
         if aborted {
             break;
         }
-        let classes = quint::note_classes(&selected);
+        let classes = jamcore::quint::note_classes(&selected);
         app.notesset[c].clear();
         app.notessetx[c].clear();
         for class in &classes {
