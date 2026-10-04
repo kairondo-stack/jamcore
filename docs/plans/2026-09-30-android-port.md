@@ -68,14 +68,43 @@ Zusätzlich:
 - Test/Verify: `nix-shell --run "bash tests/e2e/run_all.sh"` → Exit 0 (Unit + E2E unverändert).
 - Rollback: Revert des Commits; Desktop-Crates unverändert funktionsfähig.
 
-### S2: Android-Gerüst + APK-Pipeline (Risiko: mittel)
+### S2: Android-Gerüst + APK-Pipeline (Risiko: mittel) — **erledigt, auf Gerät verifiziert**
 - Ziel: Leere egui-App auf Gerät startbar.
-- Dateien: `android/Cargo.toml`, `android/src/lib.rs`, `android/AndroidManifest.xml`,
-  Gradle-Wrapper, `shell.nix`-Erweiterung (Android SDK/NDK, `cargo-ndk`).
-- Test/Verify: `nix-shell --run "cd android && ./gradlew assembleDebug"` →
-  `app-debug.apk`; `adb install -r app-debug.apk`; `adb shell am start …` →
-  `adb logcat -d | grep android_app` zeigt „UI gestartet“.
+- Dateien: `android/Cargo.toml`, `android/src/{lib,insets}.rs`, `android/settings.gradle`,
+  `android/build.gradle`, `android/gradle.properties`, `android/app/build.gradle`,
+  `android/app/src/main/AndroidManifest.xml`, `android/build-apk.sh`,
+  `shell.nix`-Erweiterung (Android SDK/NDK, `cargo-ndk`, gradle, jdk17, rustup).
+- Test/Verify: `nix-shell --run "bash android/build-apk.sh --install"` →
+  `app-debug.apk` (arm64-v8a, debug); `adb install -r` → `Success`;
+  `adb shell am start -n org.jamcore.app/android.app.NativeActivity` →
+  logcat `jamandroid: android_main gestartet`; Screenshot zeigt UI unter der
+  Statusleiste; `adb shell input tap` → `jamandroid: button gedrueckt`.
+  Gerät: Pixel 10 Pro, Android 17, 1080x2410.
 - Abhängig: S1.
+- Ergbnisse/Fallen (beim Umsetzen aufgetreten):
+  - `androidsdk` (Komplett-SDK mit Emulator/System-Images) ist auf diesem Rechner
+    nicht baubar (Download-Timeouts). `shell.nix` nutzt jetzt
+    `composeAndroidPackages` mit `platform-tools` + `build-tools 34.0.0` +
+    `platforms 34`; `ANDROID_HOME`/`ANDROID_NDK_ROOT` zeigen auf
+    `<paket>/libexec/android-sdk` bzw. `<ndk>/libexec/android-sdk/ndk-bundle`.
+  - eframe 0.36: `App::update` gibt es nicht mehr (Pflichtmethode ist `App::ui`),
+    `TopBottomPanel` ist zu `egui::Panel::top` verschmolzen, und `accesskit`
+    verträgt sich nicht mit `android-native-activity` →
+    `eframe = { default-features = false, features = ["android-native-activity",
+    "default_fonts", "glow", "wayland", "x11"] }`.
+  - AAPT2 aus dem Gradle-Maven-Cache startet unter NixOS nicht (stub-ld).
+    `build-apk.sh` setzt deshalb
+    `-Pandroid.aapt2FromMavenOverride=$ANDROID_HOME/build-tools/34.0.0/aapt2`.
+  - Android 15+ ist Edge-to-Edge, egui liefert auf Android keine Safe-Area
+    (`get_safe_area_insets` ist iOS-only). `android/src/insets.rs` fragt die
+    Insets per JNI ab (`getRootWindowInsets().getInsets(Type.systemBars())`),
+    mit Fallback über die Ressource `status_bar_height`; Umrechnung px → egui-Punkte
+    über `pixels_per_point`.
+  - JNI-Fehler auf Android: `WindowInsets$Type.systemBars()` ist eine Methode,
+    kein Feld; nach jedem JNI-Fehler muss die Ausnahme mit `exception_clear()`
+    entfernt werden, sonst bricht CheckJNI den nächsten Aufruf ab.
+  - Android-Toolchain: `rustup`-stable + `target add aarch64-linux-android`,
+    cargo-ndk baut die `.so`; `gradle` baut das APK (kein Wrapper-JAR im Repo).
 
 ### S3: Modul-Player (libopenmpt + oboe) (Risiko: hoch)
 - Ziel: `.it/.xm/.mod` abspielen, Live-Audio wie `it_live`.

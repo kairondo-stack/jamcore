@@ -4,4 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-rusty_link = "0.4"
+rusty_link = { version = "0.4", optional = true }
+
+[features]
+link = ["dep:rusty_link"]
+
+[[example]]
+name = "link_probe"
+required-features = ["link"]

@@ -7,3 +7,11 @@ frame4save.bmp
 output.ppm
 snapshot.tga
 savesurf.bmp
+
+# Android
+android/target/
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/app/src/main/jniLibs/
