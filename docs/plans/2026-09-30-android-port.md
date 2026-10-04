@@ -106,15 +106,54 @@ Zusätzlich:
   - Android-Toolchain: `rustup`-stable + `target add aarch64-linux-android`,
     cargo-ndk baut die `.so`; `gradle` baut das APK (kein Wrapper-JAR im Repo).
 
-### S3: Modul-Player (libopenmpt + oboe) (Risiko: hoch)
+### S3: Modul-Player (libopenmpt + AudioTrack) (Risiko: hoch) — **erledigt, auf Gerät verifiziert**
 - Ziel: `.it/.xm/.mod` abspielen, Live-Audio wie `it_live`.
-- Dateien: `core/src/openmpt.rs` (NDK-Build via CMake), `android/src/player.rs`
-  (oboe-Callback mit `openmpt_module_read_stereo`), Dateiauswahl (SAF).
-- Test: Unit (core unverändert) + Gerät: 3-s-Datei rendern/abspielen, Log
-  „Live-Wiedergabe beendet“; RMS im Callback > 0 (Log).
+- Dateien: `core/src/openmpt.rs` (gemeinsame FFI + Wrapper, von Desktop und
+  Android genutzt), `core/build.rs` (libopenmpt 0.8.7 per ndk-build für arm64),
+  `android/build.rs` (C++-Runtime ans Linkzeilen-Ende), `android/src/player.rs`
+  (AudioTrack via JNI), `android/src/{jniutil,paths}.rs`, `android/src/lib.rs`
+  (Player-Seite), `android/build-apk.sh`, `src/main.rs`/`Cargo.toml` (Desktop auf
+  jamcore umgestellt).
+- Test/Verify: `bash android/build-apk.sh --install` → `Success`; logcat
+  `Modul … geladen (18 Kanäle, 26 Orders)`, `AudioTrack 44100 Hz stereo PCM16`,
+  `Wiedergabe startet`; Bildschirm: `Peak: 0.064  Position: 0.2 s  Order/Row: 0/6
+  Frames: 10240`, Status `spielt: 40nix_uwu_light.xm`; Audio-HAL aktiv
+  (`AHal::Cs35l43Codec: [PCM Source] = 9`, `is_any_active_track_on_sink: true`).
+  Desktop: `tests/e2e/run_all.sh` → `== ALLES OK` (10 Skripte), 74 Unit-Tests.
 - Abhängig: S2.
 - Rollback: Player-Screen deaktivieren, Rest der App bleibt.
-
+- Erfahrungen/Fallen (wichtig für spätere Schritte):
+  - **Android 17 (Pixel 10 Pro) hat die Legacy-APIs abgeschnitten:** `libaaudio.so`
+    ist nur ein Shim ohne C++-Symbole, `AAudio_createStreamBuilder` ist eine
+    8-Byte-Funktion und liefert `nullptr`; die `SL_IID_*`-Symbole von
+    `libOpenSLES.so` sind für Apps unbrauchbar (statt der ID kommt Müll aus der
+    Stringtabelle, `GetInterface` gibt `nullptr`); `AudioTrack.write(float[],…)`
+    existiert nicht mehr. Funktioniert hat: **AudioTrack + `write(byte[],…)` mit
+    PCM 16-Bit**. Auch Oboe hätte nicht geholfen, weil es dieselbe C-API nutzt.
+  - **libopenmpt per NDK statt CMake:** der Git-Baum hat kein `CMakeLists.txt`
+    (das liegt nur im Release-Tarball von lib.openmpt.org, der nicht erreichbar
+    war). Offizieller Weg ist `build/android_ndk/Android.mk` + `ndk-build`; das
+    Hilfsprojekt muss in einem Pfad ohne Leerzeichen liegen (unser Projektordner
+    enthält eins), das Ergebnis wird nach `target/openmpt/<Version>-<abi>-<ndk>`
+    kopiert. `APP_ABI`/`APP_PLATFORM`/`APP_STL` müssen per eigener
+    `Application.mk` gesetzt werden, `ndk-build` ignoriert die Env-Varianten.
+  - **Link-Reihenfolge:** `libc++_shared.so` muss per `cargo:rustc-link-arg` ans
+    *Ende* der Linkzeile (ein `-l` aus einem abhängigen Crate landet davor und
+    lässt offene Symbole). Der Suchpfad muss das **versionierte** API-Verzeichnis
+    (`sysroot/usr/lib/<triple>/26`) sein — im unversionierten liegen auch `.a`,
+    und `-lc`/`-lz` lösen sonst statisch auf (eigenes `getauxval` → SIGSEGV beim
+    Laden). `libc++_shared.so` muss zusätzlich ins `jniLibs` kopiert werden.
+  - **Echter FFI-Bug gefunden (auch Desktop betroffen):** `openmpt_module_read_stereo`
+    ist die **int16**-Variante; für f32-Puffer braucht es
+    `openmpt_module_read_float_stereo`. Ebenso hat `openmpt_module_get_metadata`
+    zwei Argumente (`mod`, `key`) — mit einem Argument las der Desktop Müll.
+    Vorheriger WAV-RMS (9789) war consequently Unsinn, echter Wert: 778.
+  - egui repaintet nur bei Eingaben; für Live-Werte `request_repaint_after`
+    nötig, sonst stehen Peak/Position eingefroren.
+  - Noch offen: blockierendes Laden (Dateilesen + `Mod::from_bytes` + `join()`
+    im egui-Thread friert die UI kurz ein), `/sdcard/Download` braucht auf
+    Android 13+ eine Berechtigung (App-eigener Ordner funktioniert immer),
+    Dateiauswahl per SAF fehlt (MVP: Ordner-Scan).
 ### S4: OSC + Relay-Service (Risiko: mittel)
 - Ziel: Noten/BPM an Renoise senden; Relay-Ports als Service.
 - Dateien: `core/src/osc.rs` (bereits vorhanden), `android/src/relay.rs`,

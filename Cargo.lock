@@ -270,6 +270,7 @@ name = "it_live"
 version = "0.1.0"
 dependencies = [
  "cpal",
+ "jamcore",
  "libc",
 ]
 
@@ -281,6 +282,10 @@ checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
 dependencies = [
  "either",
 ]
+
+[[package]]
+name = "jamcore"
+version = "0.1.0"
 
 [[package]]
 name = "jni"

@@ -1,6 +1,5 @@
-mod openmpt;
-
-use openmpt::Mod;
+use jamcore::openmpt;
+use jamcore::openmpt::Mod;
 use std::os::raw::c_int;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -161,7 +160,7 @@ fn live_playback(m: &Mod, device_name: Option<String>, seconds: Option<f64>) -> 
                         break;
                     }
                     let n = unsafe {
-                        openmpt::openmpt_module_read_stereo(
+                        openmpt::openmpt_module_read_float_stereo(
                             m,
                             sample_rate,
                             chunk.min(avail),
@@ -271,7 +270,7 @@ fn render_variation(m: &Mod, out_path: &str) {
 
     while written < total_frames {
         let n = unsafe {
-            openmpt::openmpt_module_read_stereo(
+            openmpt::openmpt_module_read_float_stereo(
                 m.ptr,
                 SAMPLE_RATE,
                 chunk,

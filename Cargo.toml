@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 libc = "0.2"
 cpal = "0.15"
+jamcore = { path = "core" }
 
 [features]
 default = []
