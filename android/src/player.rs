@@ -8,7 +8,7 @@
 
 use std::os::raw::c_int;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use jamcore::openmpt::Mod;
@@ -30,6 +30,11 @@ struct Shared {
     frames: AtomicU64,
     finished: AtomicBool,
     running: AtomicBool,
+    /// Zeile und Zeilen-pro-Beat des aktuellen Patterns. Der Render-Thread
+    /// schreibt sie, die UI liest sie — so muss die Oberfläche den Mutex des
+    /// Audio-Threads nicht anreifen.
+    row: AtomicI32,
+    rows_per_beat: AtomicI32,
 }
 
 pub struct Player {
@@ -70,6 +75,8 @@ impl Player {
             frames: AtomicU64::new(0),
             finished: AtomicBool::new(false),
             running: AtomicBool::new(true),
+            row: AtomicI32::new(0),
+            rows_per_beat: AtomicI32::new(4),
         });
 
         let worker_shared = Arc::clone(&shared);
@@ -79,12 +86,7 @@ impl Player {
         let worker = std::thread::Builder::new()
             .name("jam-audio".to_string())
             .spawn(move || {
-                render_loop(
-                    &worker_vm,
-                    &worker_track,
-                    &worker_array,
-                    &worker_shared,
-                );
+                render_loop(&worker_vm, &worker_track, &worker_array, &worker_shared);
             })
             .map_err(|e| format!("Audio-Thread: {e}"))?;
 
@@ -134,6 +136,19 @@ impl Player {
         self.shared.finished.load(Ordering::Relaxed)
     }
 
+    /// Aktuelle Modulzeile als Schritt im 16er-Raster (`steps_per_beat` = 4
+    /// heisst Sechzehntel). Die Phase beginnt bei der aktuellen Zeile, es wird
+    /// also nicht auf den Taktanfang gefangen. Bei anderen Werten für
+    /// `rows_per_beat` (z.B. Halbzeilen) sind nicht alle 16 Schritte erreichbar.
+    ///
+    /// Liest nur Atomics, damit die Oberfläche den Mutex des Audio-Threads
+    /// nicht anreifen muss.
+    pub fn grid_step(&self, steps_per_beat: i32) -> u16 {
+        let rows_per_beat = self.shared.rows_per_beat.load(Ordering::Relaxed).max(1);
+        let delta = self.shared.row.load(Ordering::Relaxed).rem_euclid(4096);
+        (delta * steps_per_beat / rows_per_beat).rem_euclid(16) as u16
+    }
+
     pub fn stop(&mut self) {
         if !self.shared.running.swap(false, Ordering::SeqCst) {
             return;
@@ -159,7 +174,9 @@ fn create_track(
 ) -> Result<(jni::objects::GlobalRef, jni::objects::GlobalRef), String> {
     use jni::objects::JValue;
 
-    let mut env = vm.attach_current_thread().map_err(|e| format!("attach: {e}"))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("attach: {e}"))?;
     let class = env
         .find_class("android/media/AudioTrack")
         .map_err(|e| format!("AudioTrack-Klasse: {e}"))?;
@@ -194,9 +211,7 @@ fn create_track(
         .new_global_ref(&array)
         .map_err(|e| format!("global array: {e}"))?;
 
-    info!(
-        "jamandroid: AudioTrack {sample_rate} Hz stereo PCM16, Puffer {bytes} Byte"
-    );
+    info!("jamandroid: AudioTrack {sample_rate} Hz stereo PCM16, Puffer {bytes} Byte");
     Ok((track, array))
 }
 
@@ -216,7 +231,14 @@ fn render_loop(
 
     while shared.running.load(Ordering::Relaxed) {
         let read = match shared.module.lock() {
-            Ok(m) => m.read_stereo(shared.sample_rate, &mut left, &mut right),
+            Ok(m) => {
+                let pattern = m.current_pattern();
+                shared.row.store(m.current_row(), Ordering::Relaxed);
+                shared
+                    .rows_per_beat
+                    .store(m.rows_per_beat(pattern).max(1), Ordering::Relaxed);
+                m.read_stereo(shared.sample_rate, &mut left, &mut right)
+            }
             Err(_) => break,
         };
         let mut peak = 0.0f32;

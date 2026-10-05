@@ -196,14 +196,55 @@ Zusätzlich:
   ±2 BPM; Übernehmen sendet OSC-BPM.
 - Abhängig: S2, S4.
 
-### S6: Rhythmus-Screen (pattern_recorder-MVP) (Risiko: mittel)
-- Ziel: Aufnahme per Note-Pads (injizieren die bisherigen Key-Aktionen),
-  Play/Loop, CSV export/import (Share/SAF), Clipboard-XML via Teilen.
-- Dateien: `android/src/rhythm.rs`, Portierung der Zustandslogik aus
-  `pattern_recorder` (nur benötigte Pfade), `core`-Helfer.
-- Test: Unit: `record_key_action`, CSV-Roundtrip, XML-Builder (bereits in core);
-  Gerät: aufnehmen → CSV teilen → Datei prüfen (adb pull).
-- Abhängig: S2.
+### S6: Rhythmus-Screen (pattern_recorder-MVP) (Risiko: mittel) — **geräteseitig fertig und verifiziert**
+- Ziel: Noten-Raster (Spalte = Schritt, Zeile = Ton), Takt aus Modulzeile oder
+  eigener Uhr, bei jedem Tipp sofort OSC, CSV und Clipboard-XML für Renoise.
+- Dateien: `core/src/grid.rs` (Pattern-Raster + 24 Unit-Tests), `android/src/rhythm.rs`
+  (Screen), `android/src/player.rs` (`grid_step`), `android/src/lib.rs` (Tab „Rhythmus“).
+- API (`jamcore::grid`): `Pattern::{new,with_steps,insert,toggle,has_at,clear,to_csv,from_csv,
+  to_renoise_xml,from_renoise_xml,timestamp,step_from_timestamp}`, `Note`, `note_name`,
+  `pitch_from_note_name`. Zeitachse wie Desktop-Recorder und Renoise-Clipboard: ein Zyklus
+  0.0–1.0, ein Schritt `1/steps_per_cycle`.
+- Gerätetest (Pixel 10 Pro, `40nix_uwu_light.xm`):
+  - Raster in zwei Blöcken à 8 Schritten (16 Spalten passen nicht in 317 pt Breite),
+    4 Tonzeilen C-2/C-3/C-4/C-5, Zellen 22 pt
+  - Follow an: Playhead wanderte von Schritt 4 auf 9 und läuft mit der Modulzeile mit
+    (logcat `Follow = true`, `rms ... row=59` → `row=113`)
+  - 5 Taps in 5 verschiedenen Spalten → CSV `0 / 0.125 / 0.25 / 0.375 / 0.9375`
+    (Schritte 1, 3, 5, 7, 16) — Spalte ist Schritt
+  - CSV auf dem Gerät: `0,0,60,0` … identisch zum Desktop-Format
+    `timestamp,instrument,pitch,glide` (`pattern_recorder/src/main.rs:281`)
+  - XML auf dem Gerät: `<Note>C-4</Note><Instrument>00</Instrument>` (Hex mit Padding, weil
+    der Desktop mit `from_str_radix(_,16)` liest)
+  - logcat je Tipp: `Note C-4 vel 100 -> 127.0.0.1:7003`
+- Tests: `cargo test --manifest-path core/Cargo.toml` → **44 grün** (24 in `grid.rs`),
+  `cargo fmt --check` sauber, `tests/e2e/run_all.sh` → `== ALLES OK`, Desktop-Build Exit 0
+  mit nur den zwei vorbestehenden Warnungen. Code-Review eines Subagenten abgearbeitet
+  (NaN-Timestamp, Runden am Patternende, Notennamen mit Kreuz und negativer Oktave,
+  Instrument-Hex, Eigenuhr-Sättigung, Mutex des Audio-Threads).
+- Abhängig: S2, S3 (Takt), S4 (OSC zum Hören).
+- Offen / bewusst so:
+  - **Semantik ist Step-Editor, kein Aufnahme-Modus.** Ein Tipp setzt die angefasste Zelle;
+    der Cursor zeigt nur, wo das Modul ist. „Aufnehmen wie es läuft“ (jeder Tipp auf dem
+    aktuellen Schritt) ist nicht gebaut — offener Punkt für S8/Ablösung.
+  - **Kein Teilen über die System-UI.** CSV und XML landen im externen App-Ordner
+    (`/sdcard/Android/data/org.jamcore.app/files/patterns/`), per `adb pull` erreichbar.
+    Share-Intent und Clipboard brauchen eine Java-Klasse (`hasCode=true` ist vorbereitet).
+  - **Nur eine Note je Schritt** (Raster-Design). Mehrstimmige Pattern-Zeilen des
+    Desktop-Recorders kann das Raster nicht abbilden; Instrument und Glide werden
+    beim CSV-Import gelesen, aber im Raster nicht erzeugt.
+  - **Follow-Phase ist nicht gefangen**: die Skalierung `row * 4 / rows_per_beat` ist bei
+    4 Zeilen pro Beat exakt, bei Halbzeilen (8) sind nur 8 der 16 Schritte erreichbar.
+    Die UI liest dafür nur Atomics (Render-Thread schreibt Zeile und `rows_per_beat`),
+    damit die Oberfläche den Mutex des Audio-Threads nicht anreift.
+  - **XML-Parser ist zeilenbasiert** (wie der Desktop-Recorder): minifiziertes XML ohne
+    Zeilenumbrüche liefert leer statt einer Fehlermeldung. `Volume`, `Start`, `Length` werden
+    gelesen, aber ignoriert.
+  - **Stolperstelle Desktop**: `pattern_recorder::notes::renoise_note_to_midi` liest die
+    echte Renoise-Notation falsch („C-4“ → Pitch 0, weil es `-4` als Oktave parst) und
+    schreibt selbst „C4“. Die App schreibt die echte Notation; ein von der App
+    exportiertes XML sollte deshalb direkt in **Renoise** eingefügt werden, nicht über
+    den Desktop-Recorder.
 
 ### S7: Bild/Video-Screen (rrn5-MVP, Kamera) (Risiko: hoch)
 - Ziel: Kamera-Vorschau, Farbauswahl per Touch (Finger = Linksklick: einfrieren

@@ -6,6 +6,7 @@ mod jniutil;
 mod osc;
 mod paths;
 mod player;
+mod rhythm;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -28,6 +29,7 @@ enum Tab {
     Ueberblick,
     Player,
     Osc,
+    Rhythmus,
 }
 
 struct JamApp {
@@ -46,6 +48,7 @@ struct JamApp {
     looping: bool,
     player: Option<player::Player>,
     osc: osc::OscPanel,
+    rhythm: rhythm::RhythmPanel,
     last_peak: f32,
     last_report: Instant,
 }
@@ -65,6 +68,7 @@ impl Default for JamApp {
             looping: true,
             player: None,
             osc: osc::OscPanel::default(),
+            rhythm: rhythm::RhythmPanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
         }
@@ -185,6 +189,7 @@ impl eframe::App for JamApp {
                 ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
                 ui.selectable_value(&mut self.tab, Tab::Player, "Player");
                 ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
+                ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
             });
             ui.add_space(4.0);
         });
@@ -204,6 +209,7 @@ impl eframe::App for JamApp {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),
             Tab::Osc => self.view_osc(ui),
+            Tab::Rhythmus => self.view_rhythm(ui),
         }
     }
 }
@@ -211,7 +217,9 @@ impl eframe::App for JamApp {
 impl JamApp {
     fn view_ueberblick(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.label("Schritte: Rhythmus aufnehmen (S6), Bild/Scan (S7), Session (S9), Tagebuch (S10).");
+            ui.label(
+                "Schritte: Rhythmus aufnehmen (S6), Bild/Scan (S7), Session (S9), Tagebuch (S10).",
+            );
             ui.separator();
             ui.label(format!("Module gefunden: {}", self.modules.len()));
             if !self.module_hint.is_empty() {
@@ -228,6 +236,17 @@ impl JamApp {
                 }
             }
         });
+    }
+
+    fn view_rhythm(&mut self, ui: &mut egui::Ui) {
+        let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+        self.rhythm.set_target(&host, &port);
+        if self.rhythm.follow() {
+            if let Some(player) = self.player.as_ref() {
+                self.rhythm.set_follow_step(player.grid_step(4));
+            }
+        }
+        egui::CentralPanel::default().show(ui, |ui| self.rhythm.ui(ui));
     }
 
     fn view_osc(&mut self, ui: &mut egui::Ui) {
@@ -313,10 +332,7 @@ impl JamApp {
                 let modules = self.modules.clone();
                 for (index, path) in modules.iter().enumerate() {
                     let selected = self.selected == Some(index);
-                    if ui
-                        .selectable_label(selected, file_name(path))
-                        .clicked()
-                    {
+                    if ui.selectable_label(selected, file_name(path)).clicked() {
                         self.selected = Some(index);
                         self.play_selected();
                     }
@@ -342,11 +358,7 @@ impl JamApp {
                 let frames = player.frames();
                 ui.label(format!(
                     "Peak: {:.3}   Position: {:.1} s   Order/Row: {}/{}   Frames: {}",
-                    self.last_peak,
-                    pos,
-                    order,
-                    row,
-                    frames
+                    self.last_peak, pos, order, row, frames
                 ));
                 if self.last_report.elapsed().as_secs_f32() > 2.0 {
                     self.last_report = Instant::now();

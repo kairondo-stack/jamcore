@@ -44,10 +44,20 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 
 - `adb shell input tap <x> <y>`; Screenshot ist 872x1968 skaliert, Gerät
   1080x2410 → x·1.2385, y·1.2246.
-- Tabs: Überblick/Player/OSC liegen bei y≈180 (x: Überblick 265, Player 402, OSC 540).
+- Start: `adb shell am start -n org.jamcore.app/android.app.NativeActivity`
+  (die Activity ist `android.app.NativeActivity`, **kein** `.MainActivity`).
+- Tabs liegen bei Screenshot-y≈148, also Geräte-y≈181. Vier Tabs (x Gerät):
+  Überblick 254, Player 402, OSC 505, Rhythmus 629.
 - `adb logcat -d | grep jamandroid` ist die Quelle der Wahrheit; Bildschirmfotos nur
   zur Kontanz.
-- `adb reverse tcp<port> tcp<port>` für Ports vom Handy zum Laptop.
+- `adb reverse tcp<port> tcp<port>` für TCP. **UDP kann adb reverse nicht** — OSC
+  von Handy zu Laptop braucht beide Geräte im selben Netz (Laptop-IP in der App).
+- Geräte-Seitennachweis ohne Netz: `adb shell "nc -u -l -p 7003 > /data/local/tmp/o.txt"`
+  und danach `cat`/`od -c` — beweist, dass echte Bytes das Handy verlassen.
+- `python3` gibt es in der Nix-Shell **nicht**; für Skripting `perl`, `sed`,
+  `od` benutzen.
+- Log-Präfix: Das Log-Target ist schon der Modulname (`jamandroid::rhythm`), also
+  **kein** `jamandroid::rhythm:` zusätzlich in die Meldung schreiben.
 
 ## Fallen, die schon Zeit gekostet haben
 
@@ -62,6 +72,24 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
   löst `-lc`/`-lz` statisch auf und die App stürzt beim Laden ab.
 - **libopenmpt-FFI**: `openmpt_module_read_float_stereo` (nicht `read_stereo`,
   das ist int16), `openmpt_module_get_metadata(mod, key)` hat zwei Argumente.
+- **Android-Crate nur per `cargo ndk` baubar**: `cargo build --manifest-path
+  android/Cargo.toml` bricht in `ndk-sys` mit „ndk-sys only supports compiling
+  for Android" ab. Für einen Compile-Check immer
+  `bash android/build-apk.sh` (ohne `--install` reicht).
+- **egui 0.36 (eframe 0.36)**: `egui` ist kein direkter Dependency, sondern nur
+  über `use eframe::egui` erreichbar. `allocate_painter` liefert
+  `(Response, Painter)`; `rect_filled(rect, radius, farbe)` und
+  `rect_stroke(rect, radius, stroke, StrokeKind)` brauchen das Rect als erstes
+  Argument; `Rect::grow` und `RichText::tiny` gibt es nicht.
+- **16 Spalten passen nicht aufs Handy**: die Breite ist ~317 pt, deshalb
+  Blöcke à 8 Schritten (Raster in `android/src/rhythm.rs`).
+- **Format-Strings und negative Zahlen**: `format!("-{octave}")` mit `octave = -1`
+  ergibt `"--1"` (das `-` ist Text, der Wert bringt sein eigenes Minus mit).
+  Bei der Oktave einfach `octave.to_string()` verwenden.
+- **Clippy in der Nix-Shell**: nix liefert rustc/cargo 1.97, der rustup-Shim
+  `clippy-driver` ist 1.99 → `E0514 found crate compiled by an incompatible
+  version of rustc`. Workaround: `~/.rustup/toolchains/stable-*/bin` vorn in den
+  PATH und `CARGO_TARGET_DIR=/tmp/opencode/clippy-target`.
 - **Hyprland-Config** `~/.config/hypr/hyprland.lua`: snake_case-Schlüssel
   (`dpms_timeout`, nicht `dpmsTimeout`), kein Git → vorher Backup anlegen.
 - **Stromprofil**: stand wieder auf `balanced` (78 °C, Lüfter laut).
@@ -69,5 +97,5 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 
 ## Zustand
 
-Siehe `docs/plans/2026-09-30-android-port.md` (S1–S3 fertig und auf Gerät
-verifiziert) und `git log`.
+Siehe `docs/plans/2026-09-30-android-port.md` (S1–S4 und S6 fertig und auf
+Gerät verifiziert, S5 offen) und `git log`.

@@ -1,6 +1,8 @@
 //! Hardwarefreie Logik für Desktop und Android:
-//! Mikrofon-BPM, Live-Scan-Filter, Quintenzirkel-Geometrie.
+//! Mikrofon-BPM, Live-Scan-Filter, Quintenzirkel-Geometrie, Pattern-Raster,
+//! OSC-Ausgang.
 
+pub mod grid;
 pub mod livescan;
 pub mod micbpm;
 pub mod openmpt;
