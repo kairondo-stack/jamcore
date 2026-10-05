@@ -43,8 +43,12 @@ pub fn status_bar_px(app: &android_activity::AndroidApp) -> Option<InsetsPx> {
     use jni::objects::{JString, JValue};
 
     jniutil::with_env(app, |env, activity| {
-        let resources =
-            jniutil::call_object(env, activity, "getResources", "()Landroid/content/res/Resources;")?;
+        let resources = jniutil::call_object(
+            env,
+            activity,
+            "getResources",
+            "()Landroid/content/res/Resources;",
+        )?;
         let key = JString::from(env.new_string("status_bar_height").ok()?);
         let kind = JString::from(env.new_string("dimen").ok()?);
         let pkg = JString::from(env.new_string("android").ok()?);

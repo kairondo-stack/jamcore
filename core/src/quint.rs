@@ -25,10 +25,7 @@ pub fn segment_index_at(x: f32, y: f32, r_inner: f32, r_outer: f32) -> Option<us
 
 /// Notenklassen (0..11) der ausgewählten Segmente, aufsteigend, ohne Duplikate.
 pub fn note_classes(selected: &[usize]) -> Vec<i32> {
-    let mut v: Vec<i32> = selected
-        .iter()
-        .map(|&i| CIRCLE[i % 12] % 12)
-        .collect();
+    let mut v: Vec<i32> = selected.iter().map(|&i| CIRCLE[i % 12] % 12).collect();
     v.sort_unstable();
     v.dedup();
     v

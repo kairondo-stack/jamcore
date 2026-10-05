@@ -89,10 +89,9 @@ impl OscPanel {
     }
 
     pub fn pattern_follow(&mut self, on: bool) {
-        self.send(
-            if on { "Follow an" } else { "Follow aus" },
-            |r| r.pattern_follow(7000, on),
-        );
+        self.send(if on { "Follow an" } else { "Follow aus" }, |r| {
+            r.pattern_follow(7000, on)
+        });
     }
 
     #[allow(dead_code)]

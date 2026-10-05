@@ -176,7 +176,9 @@ mod tests {
     fn port_7001_is_mapped_to_base_plus_one() {
         let (port, sock) = receiver();
         let out = OscOut::new("127.0.0.1", port - 1).expect("out");
-        let used = out.send(7001, "/renoise/transport/start", vec![]).expect("send");
+        let used = out
+            .send(7001, "/renoise/transport/start", vec![])
+            .expect("send");
         assert_eq!(used, port);
         let mut buf = [0u8; 256];
         let (n, _) = sock.recv_from(&mut buf).expect("recv");

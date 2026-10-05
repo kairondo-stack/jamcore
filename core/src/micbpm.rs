@@ -11,8 +11,7 @@ pub fn detect_onsets(samples: &[f32], sample_rate: u32, hop: usize) -> Vec<f32> 
     let mut energies: Vec<f32> = Vec::new();
     let mut pos = 0;
     while pos + frame <= samples.len() {
-        let e: f32 = samples[pos..pos + frame].iter().map(|s| s * s).sum::<f32>()
-            / frame as f32;
+        let e: f32 = samples[pos..pos + frame].iter().map(|s| s * s).sum::<f32>() / frame as f32;
         energies.push(e);
         pos += hop;
     }

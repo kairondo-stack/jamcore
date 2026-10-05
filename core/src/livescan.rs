@@ -40,15 +40,7 @@ pub fn pixel_matches(r: u8, g: u8, b: u8, f: &ScanFilter) -> bool {
         return false;
     }
     is_color_in_range(
-        r,
-        g,
-        b,
-        f.sel.0,
-        f.sel.1,
-        f.sel.2,
-        f.range.0,
-        f.range.1,
-        f.range.2,
+        r, g, b, f.sel.0, f.sel.1, f.sel.2, f.range.0, f.range.1, f.range.2,
     )
 }
 
@@ -223,11 +215,11 @@ mod tests {
         let w = 2;
         let h = 3;
         let px = [
-            (200, 40, 120, 255), // y=0 Treffer
-            (0, 0, 0, 255),      // y=0 x=1 Hintergrund
-            (0, 0, 0, 255),      // y=1 x=0 Hintergrund
-            (205, 45, 115, 255), // y=1 x=1 Treffer
-            (255, 0, 0, 255),    // y=2 x=0 Marker
+            (200, 40, 120, 255),  // y=0 Treffer
+            (0, 0, 0, 255),       // y=0 x=1 Hintergrund
+            (0, 0, 0, 255),       // y=1 x=0 Hintergrund
+            (205, 45, 115, 255),  // y=1 x=1 Treffer
+            (255, 0, 0, 255),     // y=2 x=0 Marker
             (100, 100, 100, 255), // y=2 x=1 außerhalb
         ];
         let data = frame(w, h, &px);
