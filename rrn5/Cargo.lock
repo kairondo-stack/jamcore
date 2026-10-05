@@ -468,6 +468,9 @@ dependencies = [
 [[package]]
 name = "jamcore"
 version = "0.1.0"
+dependencies = [
+ "rosc",
+]
 
 [[package]]
 name = "jobserver"

@@ -4,4 +4,5 @@
 pub mod livescan;
 pub mod micbpm;
 pub mod openmpt;
+pub mod osc;
 pub mod quint;

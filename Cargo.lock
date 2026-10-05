@@ -76,6 +76,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "bytes"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -286,6 +292,9 @@ dependencies = [
 [[package]]
 name = "jamcore"
 version = "0.1.0"
+dependencies = [
+ "rosc",
+]
 
 [[package]]
 name = "jni"
@@ -578,6 +587,16 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "rosc"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2aca3e6d1ffaf6cf03d478224517690393ac55fca32f63711fa152692bff4ff"
+dependencies = [
+ "byteorder",
+ "nom",
+]
 
 [[package]]
 name = "rustc-hash"

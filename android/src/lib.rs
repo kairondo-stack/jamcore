@@ -3,6 +3,7 @@
 
 mod insets;
 mod jniutil;
+mod osc;
 mod paths;
 mod player;
 
@@ -26,6 +27,7 @@ use eframe::egui;
 enum Tab {
     Ueberblick,
     Player,
+    Osc,
 }
 
 struct JamApp {
@@ -43,6 +45,7 @@ struct JamApp {
     selected: Option<usize>,
     looping: bool,
     player: Option<player::Player>,
+    osc: osc::OscPanel,
     last_peak: f32,
     last_report: Instant,
 }
@@ -61,6 +64,7 @@ impl Default for JamApp {
             selected: None,
             looping: true,
             player: None,
+            osc: osc::OscPanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
         }
@@ -180,6 +184,7 @@ impl eframe::App for JamApp {
                 ui.heading("JamCore");
                 ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
                 ui.selectable_value(&mut self.tab, Tab::Player, "Player");
+                ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
             });
             ui.add_space(4.0);
         });
@@ -198,6 +203,7 @@ impl eframe::App for JamApp {
         match self.tab {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),
+            Tab::Osc => self.view_osc(ui),
         }
     }
 }
@@ -221,6 +227,66 @@ impl JamApp {
                     self.scan_modules();
                 }
             }
+        });
+    }
+
+    fn view_osc(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.label("Ziel (Renoise oder bundle_udp auf dem Laptop):");
+            ui.horizontal(|ui| {
+                ui.label("Host");
+                ui.text_edit_singleline(&mut self.osc.host);
+                ui.label("Port");
+                ui.text_edit_singleline(&mut self.osc.port);
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Verbinden").clicked() {
+                    self.osc.connect();
+                }
+                if ui.button("Trennen").clicked() {
+                    self.osc.disconnect();
+                }
+            });
+            ui.separator();
+
+            ui.label("Noten (Renoise /renoise/trigger/note_on):");
+            ui.horizontal(|ui| {
+                for note in [48, 60, 64, 67, 72] {
+                    let label = format!("{note}");
+                    if ui.button(&label).clicked() {
+                        self.osc.note(note);
+                    }
+                }
+            });
+
+            ui.label("Transport und Tempo:");
+            ui.horizontal(|ui| {
+                if ui.button("Start").clicked() {
+                    self.osc.start();
+                }
+                if ui.button("Stop").clicked() {
+                    self.osc.stop();
+                }
+                if ui.button("BPM 128").clicked() {
+                    self.osc.bpm(128.0);
+                }
+                if ui.button("Follow an").clicked() {
+                    self.osc.pattern_follow(true);
+                }
+                if ui.button("Follow aus").clicked() {
+                    self.osc.pattern_follow(false);
+                }
+            });
+
+            ui.separator();
+            if !self.osc.last.is_empty() {
+                ui.label(format!("Letztes: {}", self.osc.last));
+            }
+            if !self.osc.error.is_empty() {
+                ui.colored_label(egui::Color32::LIGHT_RED, &self.osc.error);
+            }
+            ui.label("Handy und Laptop im selben Netz: hier die Laptop-IP eintagen.");
+            ui.label("adb reverse kann nur TCP, OSC laeuft ueber UDP.");
         });
     }
 

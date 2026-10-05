@@ -154,13 +154,40 @@ Zusätzlich:
     im egui-Thread friert die UI kurz ein), `/sdcard/Download` braucht auf
     Android 13+ eine Berechtigung (App-eigener Ordner funktioniert immer),
     Dateiauswahl per SAF fehlt (MVP: Ordner-Scan).
-### S4: OSC + Relay-Service (Risiko: mittel)
-- Ziel: Noten/BPM an Renoise senden; Relay-Ports als Service.
-- Dateien: `core/src/osc.rs` (bereits vorhanden), `android/src/relay.rs`,
-  Manifest-Eintrag `foregroundServiceType="dataSync"`, Notification.
-- Test: Gerät sendet an Laptop-Listener (`tests/e2e/osc_listen.py 7003`),
-  Erwartung: JSONL enthält `/renoise/trigger/note_on`.
+### S4: OSC an Renoise/Relay (Risiko: mittel) — **geräteseitig fertig und verifiziert**
+- Ziel: Noten/Transport/BPM vom Handy an Renoise oder an das Relay (`bundle_udp`).
+- Dateien: `core/src/osc.rs` (gemeinsamer OSC-Ausgang `OscOut`/`Renoise`, 5
+  Unit-Tests mit echten Loopback-Sockets), `android/src/osc.rs` (`OscPanel`),
+  `android/src/lib.rs` (Tab „OSC“), `core/Cargo.toml` + `android/Cargo.toml`
+  (`rosc = "0.9"`).
+- API: `/renoise/trigger/note_on` (-1 -1 note volume), `/renoise/song/bpm`,
+  `/renoise/transport/{start,stop}`, `/renoise/song/edit/pattern_follow`;
+  Ports 7000/7001/7002 → Basis +0/+1/+2 (wie im C++-Original).
+- Test/Verify:
+  - `cargo test --manifest-path core/Cargo.toml` → 20 passed (5 OSC-Tests:
+    Port-Mapping, Adress-Decode, Float-Argument als big-endian f32, Port-Mapping
+    7001 → base+1, ungültiger Host)
+  - Gerät: App starten, Tab „OSC“, Host `127.0.0.1`, Port `7003` → Tipp auf
+    „60“ liefert im logcat `OSC Note 60 -> Port 7003`
+  - **Paket-Nachweis auf dem Gerät:** `adb shell "nc -u -l -p 7003 > /data/local/tmp/osc_hex.txt"`
+    ergab nach dem Tipp 52 Byte `/renoise/trigger/note_on,iiii … 0x64` (Velocity 100)
+  - Desktop: `tests/e2e/run_all.sh` → `== ALLES OK`, keine neuen Warnungen
 - Abhängig: S2.
+- Offen / nächste Schritte:
+  - **Weg zum Laptop ist ungetestet:** `adb reverse` unterstützt nur TCP, OSC läuft
+    über UDP; das Handy war beim Test nur im 5G-Netz (kein WLAN). Für den echten
+    Betrieb braucht es beide Geräte im selben Netz (Laptop-IP in der App eintragen)
+    oder einen TCP→UDP-Tunnel. Derselbe Test wird beim nächsten Geräteversuch
+    mit `osc_listen.py 7003` auf dem Laptop und der Laptop-IP in der App wiederholt.
+  - **Vordergrund-Dienst ist nicht umgesetzt:** die App hat keinen Java-Code
+    (`hasCode=false` → kein dex), ein echter `foregroundService` mit Notification
+    braucht eine Java-Klasse und `foregroundServiceType="dataSync"`. Bewusst
+    offen gelassen (Plan-Schritt), weil ein NativeActivity-Hintergrunddienst erst
+    mit Java-Unterbau sinnvoll ist.
+  - `rrn5/src/osc.rs` und `pattern_recorder/src/osc.rs` haben noch eigene
+    env-gesteuerte Kopien; Umstellung auf `jamcore::osc` ist ein späterer
+    Aufräumschritt (Desktop bleibt bewusst unangetastet, damit die E2E-Suite grün
+    bleibt).
 
 ### S5: Mikrofon-BPM (Risiko: mittel)
 - Ziel: `T+M`/`T+L` als Touch: „Messen“ / „Live“, Anzeige + Übernehmen.

@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+rosc = "0.9"
 rusty_link = { version = "0.4", optional = true }
 
 [features]
