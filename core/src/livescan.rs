@@ -295,3 +295,93 @@ mod tests {
         assert!(note_allowed(Duration::from_millis(50), 20));
     }
 }
+
+/// Ton und Lautstärke eines Farbtreffers je Zuordnungsmodus
+/// (Portierung von `event_note_volume` aus dem Desktop-rrn5):
+///
+/// - 0: Note aus der Zeile (oben hoch), Lautstärke 127
+/// - 2: Note aus y, Lautstärke fällt nach rechts
+/// - 3: Note aus y (umgekehrt), Lautstärke steigt nach rechts
+/// - 5: Note aus x, Lautstärke steigt nach rechts
+/// - 6: Note aus x, Lautstärke fällt nach rechts
+///
+/// `note_scale` ist der Tonumfang, `add` der Grundton.
+pub fn note_volume(
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    modus: u8,
+    note_scale: i32,
+    add: i32,
+) -> (i32, i32) {
+    let w = w.max(1);
+    let h = h.max(1);
+    let scale = note_scale.max(1);
+    let aus_y = |umgekehrt: bool| {
+        let anteil = if umgekehrt {
+            y * scale / h
+        } else {
+            scale - y * scale / h
+        };
+        (anteil + add).clamp(0, 127)
+    };
+    let aus_x = |umgekehrt: bool| {
+        let anteil = if umgekehrt {
+            scale - x * scale / w
+        } else {
+            x * scale / w
+        };
+        (anteil + add).clamp(0, 127)
+    };
+    match modus {
+        2 => (aus_y(true), (127 - x * 127 / w).clamp(0, 127)),
+        3 => (aus_y(false), (x * 127 / w).clamp(0, 127)),
+        5 | 7 => (aus_x(false), (x * 127 / w).clamp(0, 127)),
+        6 | 8 => (aus_x(true), (127 - x * 127 / w).clamp(0, 127)),
+        _ => (aus_y(false), 127),
+    }
+}
+
+#[cfg(test)]
+mod tests_note_volume {
+    use super::*;
+
+    #[test]
+    fn modus_null_nimmt_die_zeile() {
+        // Standard-Modus: oben hohe Note, unten tiefe, Lautstärke voll.
+        assert_eq!(note_volume(0, 0, 100, 100, 0, 36, 36), (72, 127));
+        assert_eq!(note_volume(50, 50, 100, 100, 0, 36, 36), (54, 127));
+        assert_eq!(note_volume(0, 100, 100, 100, 0, 36, 36), (36, 127));
+    }
+
+    #[test]
+    fn modus_zwei_und_drei_drehen_die_richtung() {
+        // Modus 2: Note steigt mit y (unten hoch), Lautstaerke faellt nach rechts.
+        assert_eq!(note_volume(0, 0, 100, 100, 2, 36, 36).0, 36);
+        assert_eq!(note_volume(0, 100, 100, 100, 2, 36, 36).0, 72);
+        assert_eq!(note_volume(0, 0, 100, 100, 2, 36, 36).1, 127);
+        assert!(note_volume(100, 0, 100, 100, 2, 36, 36).1 < 10);
+        // Modus 3: umgekehrt.
+        assert_eq!(note_volume(0, 0, 100, 100, 3, 36, 36).0, 72);
+        assert_eq!(note_volume(0, 100, 100, 100, 3, 36, 36).0, 36);
+        assert_eq!(note_volume(100, 0, 100, 100, 3, 36, 36).1, 127);
+    }
+
+    #[test]
+    fn modus_fuenf_und_sechs_nehmen_die_spalte() {
+        assert_eq!(note_volume(0, 0, 100, 100, 5, 36, 36).0, 36);
+        assert_eq!(note_volume(100, 0, 100, 100, 5, 36, 36).0, 72);
+        assert_eq!(note_volume(0, 0, 100, 100, 6, 36, 36).0, 72);
+        assert_eq!(note_volume(100, 0, 100, 100, 6, 36, 36).1, 0);
+    }
+
+    #[test]
+    fn werte_bleiben_im_bereich() {
+        for modus in 0..9u8 {
+            let (n, v) = note_volume(999, 999, 1, 1, modus, 120, 100);
+            assert!((0..=127).contains(&n), "Note {n}");
+            assert!((0..=127).contains(&v), "Volume {v}");
+        }
+    }
+}
