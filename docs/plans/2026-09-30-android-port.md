@@ -306,8 +306,13 @@ Zusätzlich:
     keine Crashs. **Falle:** `find_class` findet App-Klassen aus angehängten
     Threads nicht (Bootstrap-ClassLoader) – die Klasse über
     `activity.getClassLoader().loadClass("org.jamcore.app.CameraBridge")` holen.
-  - **S7c** (offen): Vorschau in egui: Frame-Doppelpuffer, `ColorImage` →
-    TextureHandle, Bild-Tab mit Vorschau; `camera::letztes_bild` ist dafür schon da.
+  - **S7c erledigt (2026-10-06):** Bild-Tab mit Vorschau: Textur wird nur bei
+    neuem Zählerstand geladen (`ColorImage::from_rgba_unmultiplied`), ~20
+    Bilder/s Repaint, Seite skaliert auf die verfügbare Breite. Gerätetest:
+    Status `Frame 122 (640x480)`, farbkorrektes Bild (Laptop/Tisch) — die
+    YUV-Konvertierung stimmt auf echter Hardware. Die Tab-Leiste ist jetzt
+    seitlich wischbar (sechs Tabs). Offen für S7d/S7e: Auswahl, Malen,
+    Live-Scan, Quintenzirkel, OSC.
   - **S7d** Touch: Finger einfrieren, Ziehen malen, Quintenzirkel-Scheibe.
   - **S7e** Live-Scan mit `livescan` (frei/Takt/Palette) + OSC-Notenausgabe;
     Gerätetest: Log `Sweep beendet, N Noten, N gezeichnet`.

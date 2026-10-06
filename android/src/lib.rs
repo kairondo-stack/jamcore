@@ -2,6 +2,7 @@
 //! Weitere Module (Rhythmus, Bild/Scan, Session, Tagebuch) folgen in S4+.
 
 mod camera;
+mod image;
 mod insets;
 mod jniutil;
 mod mic;
@@ -33,6 +34,7 @@ enum Tab {
     Osc,
     Rhythmus,
     Tempo,
+    Bild,
 }
 
 struct JamApp {
@@ -53,6 +55,7 @@ struct JamApp {
     osc: osc::OscPanel,
     rhythm: rhythm::RhythmPanel,
     mic: mic::MicPanel,
+    bild: image::ImagePanel,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -78,6 +81,7 @@ impl Default for JamApp {
             osc: osc::OscPanel::default(),
             rhythm: rhythm::RhythmPanel::default(),
             mic: mic::MicPanel::default(),
+            bild: image::ImagePanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -237,11 +241,20 @@ impl eframe::App for JamApp {
             ui.add_space(top);
             ui.horizontal(|ui| {
                 ui.heading("JamCore");
-                ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
-                ui.selectable_value(&mut self.tab, Tab::Player, "Player");
-                ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
-                ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
-                ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
+                // Sechs Tabs passen nicht mehr nebeneinander; die Leiste
+                // laesst sich seitlich wischen.
+                egui::ScrollArea::horizontal()
+                    .id_salt("tabs")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
+                            ui.selectable_value(&mut self.tab, Tab::Player, "Player");
+                            ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
+                            ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
+                            ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
+                            ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
+                        });
+                    });
             });
             ui.add_space(4.0);
         });
@@ -263,6 +276,7 @@ impl eframe::App for JamApp {
             Tab::Osc => self.view_osc(ui),
             Tab::Rhythmus => self.view_rhythm(ui),
             Tab::Tempo => self.view_mic(ui),
+            Tab::Bild => self.view_bild(ui),
         }
     }
 }
@@ -314,6 +328,10 @@ impl JamApp {
                 }
             }
         });
+    }
+
+    fn view_bild(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| self.bild.ui(ui));
     }
 
     fn view_mic(&mut self, ui: &mut egui::Ui) {
