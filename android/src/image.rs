@@ -30,7 +30,10 @@ pub struct ImagePanel {
     sel: Option<(u8, u8, u8)>,
     /// Hintergrundfarbe, die der Scan überspringt.
     bg: (u8, u8, u8),
-    toleranz: i32,
+    /// Toleranz je Kanal (wie rrange/grange/brange im Desktop).
+    toleranz: (i32, i32, i32),
+    /// Sweep-Schrittweite (iadd im Desktop).
+    schritt: i32,
     treffer: u64,
     status: String,
     /// noteadjust-Modus des Scans (0 = Zeile, 2/3 = y, 5/6 = x).
@@ -71,7 +74,8 @@ impl ImagePanel {
             eingefroren: None,
             sel: None,
             bg: (0, 0, 0),
-            toleranz: TOLERANZ_STANDARD,
+            toleranz: (TOLERANZ_STANDARD, TOLERANZ_STANDARD, TOLERANZ_STANDARD),
+            schritt: 2,
             treffer: 0,
             status: "Kamera starten, dann ins Bild tippen (halten = einfrieren).".to_string(),
             note_modus: 0,
@@ -247,7 +251,7 @@ impl ImagePanel {
         let filter = ScanFilter {
             bg: self.bg,
             sel,
-            range: (self.toleranz, self.toleranz, self.toleranz),
+            range: self.toleranz,
         };
         let mut treffer = 0u64;
         for i in 0..w * h {
@@ -283,7 +287,7 @@ impl ImagePanel {
             return;
         };
         let (wi, hi) = (w as i32, h as i32);
-        let schritt = 2;
+        let schritt = self.schritt.max(1);
         let schritte = ((wi + schritt - 1) / schritt).max(1) as i64;
         let spalten_ns: i64 = if self.scan_takt {
             // Ein voller Sweep dauert einen Beat; die Spaltenzahl richtet
@@ -297,7 +301,7 @@ impl ImagePanel {
         let filter = ScanFilter {
             bg: self.bg,
             sel,
-            range: (self.toleranz, self.toleranz, self.toleranz),
+            range: self.toleranz,
         };
         let mut noten: Vec<i32> = Vec::new();
         while start.elapsed() < budget {
@@ -406,6 +410,8 @@ impl ImagePanel {
             }
             ui.label("Noten/s");
             ui.add(egui::Slider::new(&mut self.scan_max_noten, 1..=30));
+            ui.label("Schritt");
+            ui.add(egui::Slider::new(&mut self.schritt, 1..=4));
             if self.scan_takt {
                 ui.label("BPM");
                 ui.add(egui::Slider::new(&mut self.scan_bpm, 60.0..=180.0));
@@ -507,7 +513,7 @@ impl ImagePanel {
                                     farbe.0, farbe.1, farbe.2, self.treffer
                                 );
                                 log::info!(
-                                    "bild: Auswahl RGB({}, {}, {}), {} Pixel (Toleranz {})",
+                                    "bild: Auswahl RGB({}, {}, {}), {} Pixel (Toleranz {:?})",
                                     farbe.0,
                                     farbe.1,
                                     farbe.2,
@@ -548,19 +554,39 @@ impl ImagePanel {
             }
         });
         ui.horizontal(|ui| {
-            ui.label("Toleranz");
-            let geaendert = ui
-                .add(egui::Slider::new(&mut self.toleranz, 0..=80))
-                .changed();
-            if geaendert && self.sel.is_some() {
-                let ctx = ui.ctx().clone();
-                self.markieren(&ctx);
+            // Hauptregler setzt alle drei Kanaele; darunter fein je Kanal
+            // (wie rrange/grange/brange im Desktop-rrn5).
+            let mut tol = self.toleranz.0.max(self.toleranz.1).max(self.toleranz.2);
+            if ui
+                .add(egui::Slider::new(&mut tol, 0..=80).text("Toleranz"))
+                .changed()
+            {
+                self.toleranz = (tol, tol, tol);
+                if self.sel.is_some() {
+                    let ctx = ui.ctx().clone();
+                    self.markieren(&ctx);
+                }
             }
             ui.label("Hintergrund (übersprungen):");
             let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
             let (r, g, b) = self.bg;
             ui.painter()
                 .rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
+        });
+        ui.horizontal(|ui| {
+            let mut geaendert = false;
+            for (name, wert) in [
+                ("R", &mut self.toleranz.0),
+                ("G", &mut self.toleranz.1),
+                ("B", &mut self.toleranz.2),
+            ] {
+                ui.label(name);
+                geaendert |= ui.add(egui::Slider::new(wert, 0..=80)).changed();
+            }
+            if geaendert && self.sel.is_some() {
+                let ctx = ui.ctx().clone();
+                self.markieren(&ctx);
+            }
         });
     }
 }
