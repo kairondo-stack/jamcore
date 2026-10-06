@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, Grid, RichText, Sense};
 use jamcore::grid::{note_name, Note, Pattern, STEPS_PER_CYCLE as STEP_COUNT};
 use jamcore::osc::{OscOut, Renoise, DEFAULT_BASE_PORT};
+use jamcore::transformation;
 use log::info;
 
 const ROWS: [i32; 4] = [36, 48, 60, 72];
@@ -43,6 +44,9 @@ pub struct RhythmPanel {
     transport_mit: bool,
     /// Aufnahme: Pad-Tipps landen auf dem laufenden Render-Schritt.
     aufnahme: bool,
+    /// Skalenfilter fuer gesetzte Toene (0 = aus).
+    skala: usize,
+    grundton: i32,
 }
 
 impl Default for RhythmPanel {
@@ -71,6 +75,8 @@ impl RhythmPanel {
             render_bpm: DEFAULT_BPM,
             transport_mit: false,
             aufnahme: false,
+            skala: 0,
+            grundton: 60,
         }
     }
 
@@ -227,7 +233,45 @@ impl RhythmPanel {
         }
     }
 
+    /// Stufen der gewaehlten Tonleiter (None = kein Filter).
+    fn skala_stufen(&self) -> Option<&'static [i32]> {
+        match self.skala {
+            1 => Some(&transformation::MOLL),
+            2 => Some(&transformation::DUR),
+            3 => Some(&transformation::PENTATONIK_MOLL),
+            4 => Some(&transformation::PENTATONIK_DUR),
+            _ => None,
+        }
+    }
+
+    /// Rundet einen Ton auf die gewaehlte Skala (ohne Filter unveraendert).
+    fn skaliere_pitch(&self, pitch: i32) -> i32 {
+        match self.skala_stufen() {
+            Some(stufen) => {
+                let toene = transformation::skala_toene(self.grundton, stufen, 4);
+                transformation::auf_skala(pitch, &toene)
+            }
+            None => pitch,
+        }
+    }
+
+    /// Wendet eine Transformation auf den aktuellen Slot an.
+    fn noten_transformieren(&mut self, f: impl FnOnce(&[Note]) -> Vec<Note>) {
+        let neu = f(self.pattern().notes());
+        let slot = self.slot;
+        self.slots[slot].clear();
+        for note in neu {
+            self.slots[slot].insert(note);
+        }
+        self.status = format!(
+            "Pattern {}: {} Noten",
+            self.slot + 1,
+            self.pattern().notes().len()
+        );
+    }
+
     fn toggle_pad(&mut self, step: u16, pitch: i32) {
+        let pitch = self.skaliere_pitch(pitch);
         // Aufnahme: der Tipp landet auf dem gerade laufenden Schritt (wie
         // die Recorder-Tasten im Desktop), nicht auf der angefassten Zelle.
         if self.aufnahme && self.render_laeuft {
@@ -441,6 +485,42 @@ impl RhythmPanel {
                 .small()
                 .color(Color32::GRAY),
             );
+        });
+        ui.horizontal_wrapped(|ui| {
+            // Transformationen wie im Desktop-Recorder.
+            if ui.button("-12").clicked() {
+                self.noten_transformieren(|n| transformation::transponieren(n, -12));
+            }
+            if ui.button("+12").clicked() {
+                self.noten_transformieren(|n| transformation::transponieren(n, 12));
+            }
+            if ui.button("Umkehren").clicked() {
+                self.noten_transformieren(transformation::umkehren);
+            }
+            if ui.button("Q2").clicked() {
+                self.noten_transformieren(|n| transformation::quantisieren(n, 2));
+            }
+            if ui.button("Q4").clicked() {
+                self.noten_transformieren(|n| transformation::quantisieren(n, 4));
+            }
+            if ui.button("Glide").clicked() {
+                let an = !self.pattern().notes().iter().all(|n| n.glide);
+                self.noten_transformieren(|n| transformation::glide_setzen(n, an));
+            }
+            let skala_name = [
+                "Skala: aus",
+                "Skala: Moll",
+                "Skala: Dur",
+                "Skala: Pent-moll",
+                "Skala: Pent-dur",
+            ][self.skala.min(4)];
+            if ui.button(skala_name).clicked() {
+                self.skala = (self.skala + 1) % 5;
+            }
+            if self.skala > 0 {
+                ui.label(format!("Grundton {}", note_name(self.grundton)));
+                ui.add(egui::Slider::new(&mut self.grundton, 48..=72));
+            }
         });
 
         // 16 Spalten passen nicht nebeneinander auf die Handy-Breite, deshalb
