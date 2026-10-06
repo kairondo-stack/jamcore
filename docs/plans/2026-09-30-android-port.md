@@ -445,7 +445,38 @@ Zusätzlich:
 - Abhängig: S2, S5, S6 (MVP).
 - Rollback: eigenes Modul, keine Auswirkung auf Jam/Player.
 
-### S11: Kombi-Layout & Feinschliff
+### S11: Desktop-Parität (Zwischenstand 2026-10-06) — **Kern erledigt, auf Gerät verifiziert**
+Anlass: Nutzer-Hinweis, dass rrn5 und pattern_recorder am Handy noch nicht
+vollständig seien. Abgearbeitet:
+- **Rendern** (Taste `o`): Raster in Schleife im 16tel-Takt, OSC + **lokaler
+  Klang** (AudioTrack-Sinus), optional Renoise-Transport, eigenes BPM;
+  Playhead zeigt die Abspielposition. Gerätetest: „Rendern läuft
+  (2 Noten, 128 BPM)", Logstart/-stopp.
+- **Aufnahme-Modus**: Pad-Tipp landet live auf dem laufenden Schritt
+  (Gerätetest: bei durchgehend Spalte 1 getippt stehen die Noten auf
+  Schritt 8 und 15).
+- **Acht Pattern-Slots** wie der Desktop (`pattern N.csv`/`pattern N.xml`,
+  Zählung ab 0). Gerätetest: `pattern 0.csv` und `pattern 1.csv` getrennt.
+- **Transformationen**: ±12, Umkehren, Q2/Q4, Glide, **Skalenfilter**
+  (Moll/Dur/beide Pentatoniken + Grundton) — `jamcore::transformation`
+  (zehn Tests). Gerätetest: +12 (36→48, 72→84), Umkehren (0→15, 8→7).
+- **noteadjust-Modi** im Scan (Note aus Zeile/Spalte, Lautstärke aus x) über
+  `jamcore::livescan::note_volume` (vier Tests). Gerätetest: „Zeile" gemischt
+  (72/61/62), „Spalte" monoton (47→53→59→65→71).
+- **BPM-Tap** als Kern (`transformation::bpm_aus_taps`, Ausreißerfilter);
+  Knopf im Tempo-Tab noch offen.
+- Nebenbei: `adb wireless` eingerichtet (Pairing + mDNS), Projekt-Backup als
+  `git bundle` erstellt.
+
+Rest für die Parität:
+- rrn5: **Palette-Modus** + **Malen** (zweiter Puffer, Alpha, Radierer),
+  Farbbereiche je Kanal, Schrittweite `iadd`, Takt-Masken (`biialpha`).
+- pattern_recorder: **Presenter/Renderer-Ansicht** (Taste `J`: BPM,
+  Notenliste, farbige Zeitachse), BPM-Tap-Knopf, `remove_duplicates`,
+  Schism-Export, Notenlänge/Instrument-Eingabe.
+- Offen bleibt das Kombi-Layout:
+
+### S11b: Kombi-Layout & Feinschliff (offen)
 - Ziel: Mehrere Module gleichzeitig sichtbar (Split-View/Panels):
   Kamera+Scan | Rhythmus | Session | Diary; Tablet/Querformat-Layouts.
 - Dateien: `android/src/layout.rs`.
