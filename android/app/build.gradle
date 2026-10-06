@@ -23,9 +23,21 @@ android {
         }
     }
 
+    // Release-Signatur: Keystore liegt in android/release.keystore (nicht im
+    // Git; bitte sichern!). Passwort ist ein Projekt-Passwort.
+    signingConfigs {
+        release {
+            storeFile file('../release.keystore')
+            storePassword 'jamcore-release'
+            keyAlias 'jamcore'
+            keyPassword 'jamcore-release'
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.release
         }
     }
 

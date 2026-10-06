@@ -1,47 +1,54 @@
-# Default Project — Tracker/Renoise-Werkzeuge
+# JamCore
 
-Rust-Ports der C++-Originale aus `~/Documents/cde` plus Live-Modul-Renderer.
+Werkzeuge für Jam-Sessions: Desktop-Tools in Rust und eine Android-App
+(Rust-Kern + NativeActivity, kleine Java-Brücken für Kamera, Video und
+Mikrofon). Module abspielen, Tempo messen oder tippen, Rhythmen ins Raster
+spielen (Rendern/Aufnahme), Kamera-Farbscan mit Live-Scan und Palette,
+Quintenzirkel, Takt-Maske mit Wischprofilen, Tagebuch, OSC zu Renoise und
+Ableton-Link-Synchronisation.
 
-## Crates
+## Aufbau
 
-| Crate | Zweck |
+| Verzeichnis | Inhalt |
 |---|---|
-| `it_live` | IT/Modul-Renderer (libopenmpt): `--dump`, `--wav` (offline) oder Live-Audio (cpal, `--device NAME`, `--seconds N`) mit taktkompatiblen Order-Wechseln |
-| `rrn5` | Bild/Farb-Werkzeug: Farbmischmengen aus Bildern zu Noten, OSC an Renoise (Basis 7000, `RRN5_OSC_BASE_PORT`), Clipboard-Export, MyImageShm lesen/schreiben, Bildverzeichnis per `--dir`/`FRAMES_DIR`, Kamera (`Z`) / Videodatei (`--video`, OpenCV), Standbild bei Pixelauswahl, `--shm every|throttle|off` (`8`), Live-Scan (`6`, `1` frei/`2` taktsynchron, `3` Palette aus dem 2. Fenster, `RRN5_MAX_NOTES_PER_SEC`), Harmonien (`3` Anzahl, `5,1` Spanne/Teiler, `5,2` Interaktiver Quintenzirkel) |
-| `pattern_recorder` | Rhythmus-Aufnahme, CSV speichern/laden, Graph-Fenster, Renoise-PatternClipboard-Export/-Import, Schism-Export, Mikrofon-BPM (T+L live, T+M messen, T+Enter übernehmen), OSC (`RENOISE_OSC_PORT`, Default 7005) |
-| `imgsh` | Bildbetrachter, schreibt Bilder in `MyImageShm` (von rrn5 mitgenutzt) |
-| `bundle_udp` | OSC-Relay 7000/7005 → Ziele (`OSC_TARGETS`, Hostnamen erlaubt; Lauschports via `OSC_LISTEN_PORTS`) |
+| `core/` | Hardwarefreie Logik (Raster, YUV, Scan, Tempo, Session, Maske, Tagebuch); `cargo test --manifest-path core/Cargo.toml` |
+| `src/`, `rrn5/`, `pattern_recorder/`, `imgsh/`, `bundle_udp/` | Desktop-Werkzeuge |
+| `android/` | Android-App (`cargo ndk` + Gradle); Java-Brücken in `android/app/src/main/java/org/jamcore/app/` |
+| `docs/plans/` | Plan und Stand (S1–S12) |
+| `tests/e2e/` | Desktop-End-to-End-Skripte (`bash tests/e2e/run_all.sh`) |
 
-## Build & Tests
+## Bauen (NixOS, alles in der Nix-Shell)
 
 ```sh
-nix-shell --run "cargo build"                                # alle Crates
-nix-shell --run "cargo test --manifest-path pattern_recorder/Cargo.toml"
-nix-shell --run "cargo test --manifest-path rrn5/Cargo.toml"
-nix-shell --run "bash tests/e2e/run_all.sh"                  # Unit-Tests + 8 E2E-Skripte
+nix-shell
+TMPDIR=/tmp/opencode RUSTC_WRAPPER= cargo test --manifest-path core/Cargo.toml
+TMPDIR=/tmp/opencode RUSTC_WRAPPER= bash tests/e2e/run_all.sh
 ```
 
-`shell.nix` liefert Rust, SDL2, libopenmpt, alsa-lib, xclip/xsel, xdotool und python3.
+Android (arm64-v8a, installiert und startet):
 
-## E2E
-
-Unter `tests/e2e/` liegen Skripte, die unter `Xvfb` echte Prozesse starten und
-Artefakte prüfen (WAV-Signal, Shared Memory, OSC-Mitschnitt, CSV/XML/Clipboard,
-Live-Audio auf einem ALSA-Null-Device). Für die Tastatur-/Maussteuerung der
-SDL-Apps gibt es den Test-Hook `E2E_KEYS` (wird nur bei gesetzter
-Umgebungsvariable aktiv):
-
-```
-E2E_KEYS="Tab,Right,Quit"                    # Tasten
-E2E_KEYS="G,0,Return,5,Return,click:100:250,F,V,0,Quit"
-E2E_KEYS="R,1,wait:150,1,wait:150,0"         # wait:<ms> für Timing
+```sh
+bash android/build-apk.sh --install
 ```
 
-## Workflow (Kurz)
+Release (signiert, Keystore siehe unten):
 
-1. Rhythmus in `pattern_recorder` aufnehmen (`R`, `1`, Ziffern, `0`), mit
-   `J`+`1-8` in ein Pattern legen, `S`+`1-8` als `pattern N.csv` speichern.
-2. `rrn5` lädt Bildverzeichnis (`--dir`), Farbmischmengen per Maus, Noten per
-   OSC an Renoise oder als PatternClipboard-XML ins Clipboard (`g`).
-3. `pattern_recorder` importiert Renoise-Clipboard (`Z`) und exportiert nach
-   Renoise (`S`, `Down`, `Left`) oder Schism (`S`, `Down`, `Right`).
+```sh
+cd android && gradle --no-daemon assembleRelease
+# APK: android/app/build/outputs/apk/release/app-release.apk
+```
+
+## Release-Keystore
+
+`android/release.keystore` (Alias `jamcore`, Passwort `jamcore-release`) ist
+**nicht** im Git und muss getrennt gesichert werden — ohne ihn lassen sich
+keine Updates derselben App installieren. Das Debug-APK nutzt den
+Standard-Debug-Keystore; Release und Debug haben verschiedene Signaturen
+(vor dem Wechsel die App deinstallieren; App-Daten liegen unter
+`/sdcard/Android/data/org.jamcore.app/files/`).
+
+## Arbeitsweise
+
+Vor Fehlersuche, neuen Features und Fertigmeldungen gelten die Regeln in
+`AGENTS.md` (Skills, Subagenten, Verifikation auf dem Gerät). Der aktuelle
+Stand steht in `docs/plans/2026-09-30-android-port.md`.

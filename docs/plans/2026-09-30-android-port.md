@@ -493,9 +493,18 @@ Rest für die Parität:
 - Offen: Querformat/Tablet-Layout (zwei Bereiche nebeneinander), eigenes
   `layout.rs` (die Bereiche liegen derzeit in `lib.rs`).
 
-### S12: Verpackung/Release
-- Ziel: Icon, Version, Signatur, README (Build via Nix), Release-APK.
-- Verify: `./gradlew assembleRelease` + Installation auf frischem Gerät.
+### S12: Verpackung/Release — **erledigt (2026-10-06)**
+- Icon: Regenbogen-Ring (Quintenzirkel-Motiv) in fuenf mipmap-Groessen,
+  erzeugt mit einem kleinen Rust-Programm (PNG ohne Bibliotheken); im
+  Manifest als `/ic_launcher`.
+- Version 0.1 (versionCode 1); Release signiert mit `android/release.keystore`
+  (Alias `jamcore`, **nicht im Git** — getrennt sichern!), `assembleRelease`
+  laeuft, APK 22 MB.
+- Auf dem Pixel 10 Pro: Debug deinstalliert, Release installiert
+  (`apksigner verify`: CN=JamCore), App gestartet (Link-Logs), Icon im
+  Launcher sichtbar; danach zurueck auf Debug und die App-Daten (13 Dateien,
+  inkl. Demo-Video und Tagebuch) aus dem Backup wieder eingespielt.
+- `README.md` mit Aufbau, Nix-Befehlen, Release-Schritten und Keystore-Hinweis.
 
 ## Teststrategie
 

@@ -13,7 +13,8 @@
     <application
         android:label="JamCore"
         android:hasCode="true"
-        android:allowBackup="true">
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher">
         <activity
             android:name="android.app.NativeActivity"
             android:exported="true"
