@@ -10,7 +10,9 @@
 
 use eframe::egui::{self, Color32, TextureOptions};
 
-use jamcore::livescan::{next_column, note_allowed, pixel_matches, scan_column, ScanFilter};
+use jamcore::livescan::{
+    next_column, note_allowed, note_volume, pixel_matches, scan_column, ScanFilter,
+};
 use jamcore::osc::{OscOut, Renoise};
 
 use crate::camera;
@@ -31,6 +33,8 @@ pub struct ImagePanel {
     toleranz: i32,
     treffer: u64,
     status: String,
+    /// noteadjust-Modus des Scans (0 = Zeile, 2/3 = y, 5/6 = x).
+    note_modus: u8,
     /// Live-Scan (S7e): Sweep ueber die Spalten, Treffer als OSC-Noten.
     scan_an: bool,
     scan_takt: bool,
@@ -70,6 +74,7 @@ impl ImagePanel {
             toleranz: TOLERANZ_STANDARD,
             treffer: 0,
             status: "Kamera starten, dann ins Bild tippen (halten = einfrieren).".to_string(),
+            note_modus: 0,
             scan_an: false,
             scan_takt: false,
             scan_bpm: 120.0,
@@ -317,8 +322,10 @@ impl ImagePanel {
                         puffer[idx + 1] = *g;
                         puffer[idx + 2] = *b;
                         puffer[idx + 3] = 255;
-                        // Note aus der Zeile: oben hoch, unten tief.
-                        noten.push(72 - (*y * 36 / hi.max(1)));
+                        // Note/Lautstaerke nach dem gewaehlten Zuordnungsmodus
+                        // (wie noteadjust im Desktop-rrn5).
+                        let (note, _vol) = note_volume(x, *y, wi, hi, self.note_modus, 36, 36);
+                        noten.push(note);
                         self.sweep_gezeichnet += 1;
                     }
                 }
@@ -384,6 +391,18 @@ impl ImagePanel {
                 .clicked()
             {
                 self.scan_takt = !self.scan_takt;
+            }
+            let modi: [u8; 5] = [0, 2, 3, 5, 6];
+            let namen = [
+                "Note: Zeile",
+                "Note: y, Vol rechts leise",
+                "Note: y umgekehrt",
+                "Note: Spalte",
+                "Note: x umgekehrt",
+            ];
+            let idx = modi.iter().position(|m| *m == self.note_modus).unwrap_or(0);
+            if ui.button(namen[idx]).clicked() {
+                self.note_modus = modi[(idx + 1) % modi.len()];
             }
             ui.label("Noten/s");
             ui.add(egui::Slider::new(&mut self.scan_max_noten, 1..=30));
