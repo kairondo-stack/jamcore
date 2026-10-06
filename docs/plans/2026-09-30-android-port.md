@@ -463,17 +463,23 @@ vollständig seien. Abgearbeitet:
 - **noteadjust-Modi** im Scan (Note aus Zeile/Spalte, Lautstärke aus x) über
   `jamcore::livescan::note_volume` (vier Tests). Gerätetest: „Zeile" gemischt
   (72/61/62), „Spalte" monoton (47→53→59→65→71).
-- **BPM-Tap** als Kern (`transformation::bpm_aus_taps`, Ausreißerfilter);
-  Knopf im Tempo-Tab noch offen.
+- **BPM-Tap**: `transformation::bpm_aus_taps` (Ausreißerfilter) plus
+  Knopf im Tempo-Tab (Gerätetest: 78 BPM bei 0,77 s Tippabstand).
+- **Presenter-Ansicht** (Taste J): Umschalter mit großem Tempo, Notenliste
+  und Zeitachse (x = Schritt, y = Tonhöhe, Playhead).
+- **Farbbereiche je Kanal** (R/G/B) + **Schrittweite** (`iadd`, 1..4) im
+  Bild-Tab (Gerätetest: R von 24 auf 0 senkt die Treffer 37105 → 1404).
+- **Malen/Merken + Palette-Scan**: Trefferfarben landen in einem Merker,
+  der Scan matcht wahlweise gegen die Palette (Gerätetest: 487 Farben,
+  Sweep-Log).
 - Nebenbei: `adb wireless` eingerichtet (Pairing + mDNS), Projekt-Backup als
   `git bundle` erstellt.
 
 Rest für die Parität:
-- rrn5: **Palette-Modus** + **Malen** (zweiter Puffer, Alpha, Radierer),
-  Farbbereiche je Kanal, Schrittweite `iadd`, Takt-Masken (`biialpha`).
-- pattern_recorder: **Presenter/Renderer-Ansicht** (Taste `J`: BPM,
-  Notenliste, farbige Zeitachse), BPM-Tap-Knopf, `remove_duplicates`,
-  Schism-Export, Notenlänge/Instrument-Eingabe.
+- Rest: **Takt-Masken** (`biialpha`, rhythmische Spaltenmasken) und
+  Alpha-Skalierung beim Malen, Radierer;
+- pattern_recorder-Rest: `remove_duplicates`, Schism-Export,
+  Notenlänge/Instrument-Eingabe, `remove_and_record`.
 - Offen bleibt das Kombi-Layout:
 
 ### S11b: Kombi-Layout & Feinschliff (offen)
