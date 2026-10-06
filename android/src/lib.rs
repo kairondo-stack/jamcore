@@ -368,6 +368,12 @@ impl JamApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if let Some(aktion) = self.session.ui(ui, link_aktiv) {
                 match aktion {
+                    session_ui::SessionAktion::LinkNeustart => {
+                        self.link.enable(false);
+                        self.link.enable(true);
+                        self.status = "Link neu gestartet (Interfaces neu gesucht)".to_string();
+                        log::info!("session: Link neu gestartet");
+                    }
                     session_ui::SessionAktion::LinkUmschalten(an) => {
                         self.link.enable(an);
                         self.link_aktiv = an;

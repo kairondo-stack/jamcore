@@ -13,6 +13,10 @@ use jamcore::session::{naechster_beat, wartezeit_bis_beat, SessionZustand};
 pub enum SessionAktion {
     /// Link einschalten (true) oder ausschalten (false).
     LinkUmschalten(bool),
+    /// Link neu starten: Link scannt die Netzwerk-Interfaces nur beim
+    /// Start; nach dem Einschalten eines Hotspots findet er das neue
+    /// Interface sonst nicht (Multicast-Gruppe fehlt auf ap_br_wlan2).
+    LinkNeustart,
 }
 
 pub struct SessionPanel {
@@ -88,6 +92,9 @@ impl SessionPanel {
                 .clicked()
             {
                 aktion = Some(SessionAktion::LinkUmschalten(!link_aktiv));
+            }
+            if ui.button("Link neu starten").clicked() {
+                aktion = Some(SessionAktion::LinkNeustart);
             }
             let _ = ui.checkbox(&mut self.folgen, "Tempo folgen");
             ui.label("Quantum");

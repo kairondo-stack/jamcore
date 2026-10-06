@@ -68,6 +68,11 @@ impl RhythmPanel {
         self.follow
     }
 
+    /// Aktuelles Raster (fuer das Tagebuch und spaetere Exporte).
+    pub fn pattern(&self) -> &Pattern {
+        &self.pattern
+    }
+
     /// Schritt aus dem laufenden Modul (Follow-Modus).
     pub fn set_follow_step(&mut self, step: u16) {
         self.current_step = step % STEP_COUNT;

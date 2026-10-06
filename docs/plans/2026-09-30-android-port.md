@@ -416,12 +416,14 @@ Zusätzlich:
   Manifest, `LinkSupport.java` holt/gibt das Lock, Rust ruft es beim ersten
   Frame (wenn Link an) und beim Umschalten. Gerätetest:
   `WifiService: acquireMulticastLock ... jamcore-link`, Log `MulticastLock aktiv`.
-- Offen: **Peer-Test über Handy-Hotspot scheitert an Android**: Der Laptop
-  erreicht das Handy (Ping auf die Tethering-Bridge `ap_br_wlan2`,
-  10.179.32.50), aber die Gegenrichtung verliert 100 % der Pakete und beide
-  Link-Sessions bleiben `peers=0`. Für echte Peers brauchen Handy und Laptop
-  dasselbe normale WLAN (Desktop↔Desktop geht im Spike nachweislich).
-  Ebenfalls offen: Desktop-Gegenstück `--link on` in `bundle_udp`/rrn5,
+- **Peer-Test bestanden (2026-10-06), Handy-Hotspot als Standardfall:**
+  Zwei Hürden gelöst: Die NixOS-Firewall des Laptops blockte eingehendes UDP
+  (`networking.firewall.allowedUDPPorts = [ 20808 ]` + `allowPing`), und Link
+  sucht Interfaces nur beim Start – nach dem Hotspot-Einschalten hilft der
+  Knopf „Link neu starten“ (Multicast-Gruppe auf `ap_br_wlan2` prüfbar über
+  `/proc/net/igmp`). Ergebnis: Laptop `peers=1 tempo=100.00`, Handy
+  `link tempo=100.00 peers=1` – das Handy folgt dem Laptop-Tempo.
+- Offen: Desktop-Gegenstück `--link on` in `bundle_udp`/rrn5,
   Pacing-Anbindung in `micbpm`, Pattern-Transfer als CSV.
 - Abhängig: S2b, S4.
 - Rollback: Session-Screen deaktivierbar; Einzelbetrieb unverändert.

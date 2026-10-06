@@ -64,11 +64,16 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 - **Android 17 (Pixel 10 Pro)**: AAudio-C-API ist ein Stub (`nullptr`),
   `SL_IID_*` von libOpenSLES unbrauchbar, `AudioTrack.write(float[],…)` fehlt.
   Funktioniert: AudioTrack + `write(byte[],…)`, PCM 16-Bit.
-- **Ableton-Link braucht ein echtes gemeinsames WLAN**: Android-Hotspots
-  (Tethering-Bridge `ap_br_wlan2`) leiten das Link-Multicast nicht weiter –
-  der Laptop erreicht das Handy per Ping, umgekehrt kommt nichts an, beide
-  Sessions bleiben `peers=0`. Mit MulticastLock (`LinkSupport.java`) und einem
-  normalen WLAN funktioniert es. Desktop↔Desktop ist im Spike bewiesen.
+- **Ableton-Link über Handy-Hotspot (gelöst 2026-10-06)**: Zwei Ursachen für
+  `peers=0`: (1) Die NixOS-Firewall des Laptops blockt eingehendes UDP –
+  `networking.firewall.allowedUDPPorts = [ 20808 ]` und `allowPing = true`
+  öffnen Link (der Port deckt auch das Multicast 224.76.78.75:20808 ab).
+  (2) Link sucht Netzwerk-Interfaces nur beim Start: Läuft die App schon,
+  bevor der Hotspot an ist, fehlt die Multicast-Gruppe auf `ap_br_wlan2`
+  (prüfbar mit `cat /proc/net/igmp`, Eintrag `4B4E4CE0` = 224.76.78.75) –
+  der Knopf „Link neu starten“ im Session-Tab behebt das.
+  Mit MulticastLock, Firewall-Ausnahme und Neustart nach Hotspot-Wechsel:
+  `peers=1`, das Tempo wird übernommen.
 - **Camera2 braucht eine Java-Bruecke**: Die Pflicht-Callbacks
   (`CameraDevice.StateCallback`, `CaptureSession.StateCallback`,
   `ImageReader.OnImageAvailableListener`) lassen sich nicht in reinem JNI
