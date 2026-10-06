@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Grid, RichText, Sense};
-use jamcore::grid::{note_name, Pattern, STEPS_PER_CYCLE as STEP_COUNT};
+use jamcore::grid::{note_name, Note, Pattern, STEPS_PER_CYCLE as STEP_COUNT};
 use jamcore::osc::{OscOut, Renoise, DEFAULT_BASE_PORT};
 use log::info;
 
@@ -40,6 +40,8 @@ pub struct RhythmPanel {
     render_thread: Option<std::thread::JoinHandle<()>>,
     render_bpm: f32,
     transport_mit: bool,
+    /// Aufnahme: Pad-Tipps landen auf dem laufenden Render-Schritt.
+    aufnahme: bool,
 }
 
 impl Default for RhythmPanel {
@@ -66,6 +68,7 @@ impl RhythmPanel {
             render_thread: None,
             render_bpm: DEFAULT_BPM,
             transport_mit: false,
+            aufnahme: false,
         }
     }
 
@@ -218,6 +221,28 @@ impl RhythmPanel {
     }
 
     fn toggle_pad(&mut self, step: u16, pitch: i32) {
+        // Aufnahme: der Tipp landet auf dem gerade laufenden Schritt (wie
+        // die Recorder-Tasten im Desktop), nicht auf der angefassten Zelle.
+        if self.aufnahme && self.render_laeuft {
+            let ziel = self.render_schritt.load(Ordering::Relaxed) % STEP_COUNT;
+            if !self.pattern.has_at(ziel, pitch) {
+                self.pattern.insert(Note {
+                    step: ziel,
+                    instrument: 0,
+                    pitch,
+                    glide: false,
+                });
+                self.play(pitch, self.velocity);
+                crate::klang::spielen(pitch);
+                self.status = format!(
+                    "Aufnahme: Schritt {} <- {} ({} Noten)",
+                    ziel + 1,
+                    note_name(pitch),
+                    self.pattern.notes().len()
+                );
+            }
+            return;
+        }
         let added = self.pattern.toggle(step, pitch);
         if added {
             self.play(pitch, self.velocity);
@@ -363,7 +388,7 @@ impl RhythmPanel {
             }
         });
         ui.horizontal(|ui| {
-            // "Rendern" wie Taste o im Desktop-Recorder: Raster abspielen.
+            // "Rendern" wie Taste o im Desktop-Reporder: Raster abspielen.
             if self.render_laeuft {
                 if ui.button("Rendern stoppen").clicked() {
                     self.rendern_stoppen();
@@ -378,7 +403,21 @@ impl RhythmPanel {
             }
             ui.label("BPM");
             ui.add(egui::Slider::new(&mut self.render_bpm, 40.0..=220.0));
+        });
+        ui.horizontal(|ui| {
             ui.checkbox(&mut self.transport_mit, "Transport");
+            ui.checkbox(&mut self.aufnahme, "Aufnahme");
+            ui.label(
+                RichText::new(if self.aufnahme && self.render_laeuft {
+                    "Tipp landet auf dem laufenden Schritt"
+                } else if self.aufnahme {
+                    "Aufnahme wirkt beim Rendern"
+                } else {
+                    ""
+                })
+                .small()
+                .color(Color32::GRAY),
+            );
         });
 
         // 16 Spalten passen nicht nebeneinander auf die Handy-Breite, deshalb
