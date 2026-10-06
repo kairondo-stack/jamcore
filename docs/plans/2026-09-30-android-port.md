@@ -298,11 +298,16 @@ Zusätzlich:
 - Teilschritte:
   - **S7a** `core/src/yuv.rs` (TDD): Planes mit Row-/Pixel-Strides → RGBA;
     Testflächen, Stride-Fälle (Padding, PixelStride 2), Schwarz/Weiß.
-  - **S7b** Java-Brücke + Gradle: Source-Set, `CameraBridge` öffnet Kamera 0
-    (YUV_420_888, 640x480), liefert Frames an eine native Methode; Gerätetest:
-    logcat `frame 640x480`, keine Crashs, CAMERA-Berechtigung.
-  - **S7c** Vorschau in egui: Frame-Doppelpuffer, `ColorImage` → TextureHandle,
-    Bild-Tab mit Vorschau.
+  - **S7b erledigt (2026-10-06):** `android/app/src/main/java/org/jamcore/app/CameraBridge.java`
+    (Camera2, YUV_420_888, 640x480, Gradle kompiliert `src/main/java` automatisch);
+    die native Methode `Java_org_jamcore_app_CameraBridge_nativeFrame` rechnet
+    über `jamcore::yuv` nach RGBA. Gerätetest: Log `start angestossen`,
+    `Vorschau laeuft`, `camera frames=141 size=640x480` (~30 je Sekunde),
+    keine Crashs. **Falle:** `find_class` findet App-Klassen aus angehängten
+    Threads nicht (Bootstrap-ClassLoader) – die Klasse über
+    `activity.getClassLoader().loadClass("org.jamcore.app.CameraBridge")` holen.
+  - **S7c** (offen): Vorschau in egui: Frame-Doppelpuffer, `ColorImage` →
+    TextureHandle, Bild-Tab mit Vorschau; `camera::letztes_bild` ist dafür schon da.
   - **S7d** Touch: Finger einfrieren, Ziehen malen, Quintenzirkel-Scheibe.
   - **S7e** Live-Scan mit `livescan` (frei/Takt/Palette) + OSC-Notenausgabe;
     Gerätetest: Log `Sweep beendet, N Noten, N gezeichnet`.

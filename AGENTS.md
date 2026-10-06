@@ -64,6 +64,15 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 - **Android 17 (Pixel 10 Pro)**: AAudio-C-API ist ein Stub (`nullptr`),
   `SL_IID_*` von libOpenSLES unbrauchbar, `AudioTrack.write(float[],…)` fehlt.
   Funktioniert: AudioTrack + `write(byte[],…)`, PCM 16-Bit.
+- **Camera2 braucht eine Java-Bruecke**: Die Pflicht-Callbacks
+  (`CameraDevice.StateCallback`, `CaptureSession.StateCallback`,
+  `ImageReader.OnImageAvailableListener`) lassen sich nicht in reinem JNI
+  erzeugen. `android/app/src/main/java/org/jamcore/app/CameraBridge.java`
+  haelt Kamera/Session/ImageReader und ruft je Frame die native Methode; Gradle
+  kompiliert `src/main/java` automatisch. **Falle:** `find_class` findet
+  App-Klassen aus per `attach_current_thread` angehaengten Threads nicht
+  (Bootstrap-ClassLoader, „Java exception was thrown") – ueber
+  `activity.getClassLoader().loadClass("org.jamcore.app.CameraBridge")` holen.
 - **AudioRecord-Aufnahme**: Die Konstruktoren sind per Greylist gesperrt —
   fünf Argumente geben „Invalid number or type of arguments", sechs
   `NoSuchMethodError: <init>(IIIIII)V`. Es geht nur über

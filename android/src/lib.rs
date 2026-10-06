@@ -1,6 +1,7 @@
 //! JamCore-Android-App: egui-Oberfläche mit Modul-Player (AudioTrack + libopenmpt).
 //! Weitere Module (Rhythmus, Bild/Scan, Session, Tagebuch) folgen in S4+.
 
+mod camera;
 mod insets;
 mod jniutil;
 mod mic;
@@ -57,6 +58,7 @@ struct JamApp {
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
     link: jamcore::rusty_link::AblLink,
     link_report: Instant,
+    kamera_laeuft: bool,
 }
 
 impl Default for JamApp {
@@ -85,6 +87,7 @@ impl Default for JamApp {
                 link
             },
             link_report: Instant::now(),
+            kamera_laeuft: false,
         }
     }
 }
@@ -200,6 +203,22 @@ impl eframe::App for JamApp {
                 session.beat_at_time(self.link.clock_micros(), 4.0)
             );
             self.link_report = Instant::now();
+            if self.kamera_laeuft {
+                let (frames, breite, hoehe) = camera::stand();
+                if frames > 0 {
+                    log::info!("camera frames={frames} size={breite}x{hoehe}");
+                }
+                // Java meldet asynchrone Fehler (Kamera getrennt, onError)
+                // über status(); ohne diese Abfrage bliebe kamera_laeuft true.
+                let meldung = match self.app() {
+                    Some(app) => camera::java_fehlermeldung(app),
+                    None => String::new(),
+                };
+                if !meldung.is_empty() {
+                    self.status = format!("Kamera: {meldung}");
+                    self.kamera_laeuft = false;
+                }
+            }
         }
         // Ohne Ereignisse zeichnet egui nicht neu; fuer den Spike-Takt (und
         // spaeter fuer Live-Anzeigen) mindestens einmal pro Sekunde.
@@ -256,6 +275,30 @@ impl JamApp {
                  Es folgen: Bild/Scan (S7), Session (S9), Tagebuch (S10).",
             );
             ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Kamera an").clicked() {
+                    let ergebnis = match self.app() {
+                        Some(app) => camera::start(app),
+                        None => Err("keine Activity".to_string()),
+                    };
+                    match ergebnis {
+                        Ok(()) => {
+                            self.kamera_laeuft = true;
+                            self.status = "Kamera startet …".to_string();
+                        }
+                        Err(e) => self.status = format!("Kamera: {e}"),
+                    }
+                }
+                if ui.button("Kamera aus").clicked() {
+                    if let Some(app) = self.app() {
+                        camera::stop(app);
+                    }
+                    self.kamera_laeuft = false;
+                    self.status = "Kamera gestoppt".to_string();
+                }
+                let (frames, breite, hoehe) = camera::stand();
+                ui.label(format!("Kamera: {frames} Frames, {breite}x{hoehe}"));
+            });
             ui.label(format!("Module gefunden: {}", self.modules.len()));
             if !self.module_hint.is_empty() {
                 ui.label(&self.module_hint);
