@@ -319,7 +319,12 @@ Zusätzlich:
     und Hintergrundfarbe sichtbar, „Auswahl löschen“ gibt die Live-Anzeige
     wieder frei. Gerätetest: `bild: Auswahl RGB(47, 45, 40), 108174 Pixel`,
     Markierung im Screenshot deutlich sichtbar.
-  - **S7d-b offen:** Quintenzirkel als Touch-Scheibe (`core::quint`).
+  - **S7d-b erledigt (2026-10-06):** Quintenzirkel als Touch-Scheibe im Tab
+    „Kreis“: zwölf Segmente mit Notennummern, Tippen toggelt und sendet beim
+    Hinzufügen sofort `note_on` (Port 7000 über die OSC-Basis des OSC-Tabs),
+    Statuszeile und „Notenklassen“ zeigen die Harmonie
+    (`core::quint::note_classes`). Gerätetest: `quint: Note 60 (Klasse 0)`,
+    Segment hellblau, Klassen `[0]`; zweites Segment → `[0, 6]`.
   - **S7e** Live-Scan mit `livescan` (frei/Takt/Palette) + OSC-Notenausgabe;
     Gerätetest: Log `Sweep beendet, N Noten, N gezeichnet`.
 - Test: Unit: `yuv`, `livescan`, `quint` (core); Gerät: Kamera auf farbige

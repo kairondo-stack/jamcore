@@ -9,6 +9,7 @@ mod mic;
 mod osc;
 mod paths;
 mod player;
+mod quint;
 mod rhythm;
 
 use std::path::PathBuf;
@@ -35,6 +36,7 @@ enum Tab {
     Rhythmus,
     Tempo,
     Bild,
+    Kreis,
 }
 
 struct JamApp {
@@ -56,6 +58,7 @@ struct JamApp {
     rhythm: rhythm::RhythmPanel,
     mic: mic::MicPanel,
     bild: image::ImagePanel,
+    kreis: quint::QuintPanel,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -82,6 +85,7 @@ impl Default for JamApp {
             rhythm: rhythm::RhythmPanel::default(),
             mic: mic::MicPanel::default(),
             bild: image::ImagePanel::default(),
+            kreis: quint::QuintPanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -253,6 +257,7 @@ impl eframe::App for JamApp {
                             ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
                             ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
                             ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
+                            ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
                         });
                     });
             });
@@ -277,6 +282,7 @@ impl eframe::App for JamApp {
             Tab::Rhythmus => self.view_rhythm(ui),
             Tab::Tempo => self.view_mic(ui),
             Tab::Bild => self.view_bild(ui),
+            Tab::Kreis => self.view_kreis(ui),
         }
     }
 }
@@ -328,6 +334,12 @@ impl JamApp {
                 }
             }
         });
+    }
+
+    fn view_kreis(&mut self, ui: &mut egui::Ui) {
+        let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+        self.kreis.set_target(&host, &port);
+        egui::CentralPanel::default().show(ui, |ui| self.kreis.ui(ui));
     }
 
     fn view_bild(&mut self, ui: &mut egui::Ui) {
