@@ -35,6 +35,44 @@ pub fn current_app() -> Result<android_activity::AndroidApp, String> {
 use eframe::egui;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum KombiTeil {
+    Leer,
+    Bild,
+    Rhythmus,
+    Maske,
+    Tempo,
+    Session,
+    Tagebuch,
+    Kreis,
+}
+
+impl KombiTeil {
+    const ALLE: [KombiTeil; 8] = [
+        KombiTeil::Leer,
+        KombiTeil::Bild,
+        KombiTeil::Rhythmus,
+        KombiTeil::Maske,
+        KombiTeil::Tempo,
+        KombiTeil::Session,
+        KombiTeil::Tagebuch,
+        KombiTeil::Kreis,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            KombiTeil::Leer => "leer",
+            KombiTeil::Bild => "Kamera/Scan",
+            KombiTeil::Rhythmus => "Rhythmus",
+            KombiTeil::Maske => "Takt-Maske",
+            KombiTeil::Tempo => "Tempo",
+            KombiTeil::Session => "Session",
+            KombiTeil::Tagebuch => "Tagebuch",
+            KombiTeil::Kreis => "Kreis",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Ueberblick,
     Player,
@@ -46,6 +84,7 @@ enum Tab {
     Session,
     Tagebuch,
     Maske,
+    Kombi,
 }
 
 struct JamApp {
@@ -71,6 +110,8 @@ struct JamApp {
     session: session_ui::SessionPanel,
     link_aktiv: bool,
     multicast_aktiv: bool,
+    kombi_oben: KombiTeil,
+    kombi_unten: KombiTeil,
     diary: diary::DiaryPanel,
     maske: maske::MaskePanel,
     last_peak: f32,
@@ -103,6 +144,8 @@ impl Default for JamApp {
             session: session_ui::SessionPanel::default(),
             link_aktiv: true,
             multicast_aktiv: false,
+            kombi_oben: KombiTeil::Bild,
+            kombi_unten: KombiTeil::Rhythmus,
             diary: diary::DiaryPanel::default(),
             maske: maske::MaskePanel::default(),
             last_peak: 0.0,
@@ -286,6 +329,7 @@ impl eframe::App for JamApp {
                     ui.selectable_value(&mut self.tab, Tab::Session, "Session");
                     ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
                     ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
+                    ui.selectable_value(&mut self.tab, Tab::Kombi, "Kombi");
                 });
             });
             ui.add_space(4.0);
@@ -313,6 +357,7 @@ impl eframe::App for JamApp {
             Tab::Session => self.view_session(ui),
             Tab::Tagebuch => self.view_tagebuch(ui),
             Tab::Maske => self.view_maske(ui),
+            Tab::Kombi => self.view_kombi(ui),
         }
     }
 }
@@ -370,6 +415,83 @@ impl JamApp {
         egui::CentralPanel::default().show(ui, |ui| self.maske.ui(ui, self.rhythm.pattern_mut()));
     }
 
+    /// Kombi-Ansicht: zwei Module gleichzeitig (oben/unten wählbar).
+    fn view_kombi(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Oben:");
+                let oben = self.kombi_oben;
+                egui::ComboBox::from_id_salt("kombi_oben")
+                    .selected_text(oben.name())
+                    .show_ui(ui, |ui| {
+                        for teil in KombiTeil::ALLE {
+                            if ui.selectable_label(oben == teil, teil.name()).clicked() {
+                                self.kombi_oben = teil;
+                            }
+                        }
+                    });
+                ui.label("Unten:");
+                let unten = self.kombi_unten;
+                egui::ComboBox::from_id_salt("kombi_unten")
+                    .selected_text(unten.name())
+                    .show_ui(ui, |ui| {
+                        for teil in KombiTeil::ALLE {
+                            if ui.selectable_label(unten == teil, teil.name()).clicked() {
+                                self.kombi_unten = teil;
+                            }
+                        }
+                    });
+            });
+            ui.separator();
+            let hoehe = (ui.available_height() - 12.0) / 2.0;
+            let breite = ui.available_width();
+            let oben = self.kombi_oben;
+            ui.allocate_ui(egui::vec2(breite, hoehe), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("kombi_bereich_oben")
+                    .show(ui, |ui| self.teil_ui(ui, oben));
+            });
+            ui.separator();
+            let unten = self.kombi_unten;
+            ui.allocate_ui(egui::vec2(breite, hoehe), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("kombi_bereich_unten")
+                    .show(ui, |ui| self.teil_ui(ui, unten));
+            });
+        });
+    }
+
+    /// Zeichnet ein Modul ohne eigenen Rahmen (fuer den Kombi-Tab).
+    fn teil_ui(&mut self, ui: &mut egui::Ui, teil: KombiTeil) {
+        match teil {
+            KombiTeil::Leer => {
+                ui.colored_label(egui::Color32::GRAY, "leer");
+            }
+            KombiTeil::Bild => {
+                let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+                self.bild.set_target(&host, &port);
+                if self.session.folgen() {
+                    self.bild.set_bpm(self.session.tempo() as f32);
+                }
+                self.bild.ui(ui);
+            }
+            KombiTeil::Rhythmus => self.rhythm.ui(ui),
+            KombiTeil::Maske => self.maske.ui(ui, self.rhythm.pattern_mut()),
+            KombiTeil::Tempo => self.mic.ui(ui),
+            KombiTeil::Session => self.session_block(ui),
+            KombiTeil::Tagebuch => {
+                let bpm = self.mic.bpm();
+                let noten = self.rhythm.pattern().clone();
+                self.diary.ui(ui, bpm, &noten);
+            }
+            KombiTeil::Kreis => {
+                let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+                self.kreis.set_target(&host, &port);
+                self.kreis.ui(ui);
+            }
+        }
+    }
+
     fn view_tagebuch(&mut self, ui: &mut egui::Ui) {
         let bpm = self.mic.bpm();
         let noten = self.rhythm.pattern().clone();
@@ -377,6 +499,11 @@ impl JamApp {
     }
 
     fn view_session(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| self.session_block(ui));
+    }
+
+    /// Session-Inhalt ohne eigenen Rahmen (fuer den Kombi-Tab).
+    fn session_block(&mut self, ui: &mut egui::Ui) {
         // Link-Zustand holen und dem Panel geben (wie beim Rhythmus-Follow).
         let mut s = jamcore::rusty_link::SessionState::new();
         self.link.capture_app_session_state(&mut s);
@@ -388,31 +515,29 @@ impl JamApp {
         };
         self.session.set_zustand(zustand);
         let link_aktiv = self.link_aktiv;
-        egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(aktion) = self.session.ui(ui, link_aktiv) {
-                match aktion {
-                    session_ui::SessionAktion::LinkNeustart => {
-                        self.link.enable(false);
-                        self.link.enable(true);
-                        self.status = "Link neu gestartet (Interfaces neu gesucht)".to_string();
-                        log::info!("session: Link neu gestartet");
-                    }
-                    session_ui::SessionAktion::LinkUmschalten(an) => {
-                        self.link.enable(an);
-                        self.link_aktiv = an;
-                        if let Ok(app) = crate::current_app() {
-                            if an {
-                                let _ = link_support::aktivieren(&app);
-                            } else {
-                                link_support::freigeben(&app);
-                            }
+        if let Some(aktion) = self.session.ui(ui, link_aktiv) {
+            match aktion {
+                session_ui::SessionAktion::LinkNeustart => {
+                    self.link.enable(false);
+                    self.link.enable(true);
+                    self.status = "Link neu gestartet (Interfaces neu gesucht)".to_string();
+                    log::info!("session: Link neu gestartet");
+                }
+                session_ui::SessionAktion::LinkUmschalten(an) => {
+                    self.link.enable(an);
+                    self.link_aktiv = an;
+                    if let Ok(app) = crate::current_app() {
+                        if an {
+                            let _ = link_support::aktivieren(&app);
+                        } else {
+                            link_support::freigeben(&app);
                         }
-                        self.status = format!("Link {}", if an { "an" } else { "aus" });
-                        log::info!("session: Link {}", if an { "an" } else { "aus" });
                     }
+                    self.status = format!("Link {}", if an { "an" } else { "aus" });
+                    log::info!("session: Link {}", if an { "an" } else { "aus" });
                 }
             }
-        });
+        }
     }
 
     fn view_kreis(&mut self, ui: &mut egui::Ui) {

@@ -482,11 +482,16 @@ Rest für die Parität:
   Notenlänge/Instrument-Eingabe, `remove_and_record`.
 - Offen bleibt das Kombi-Layout:
 
-### S11b: Kombi-Layout & Feinschliff (offen)
-- Ziel: Mehrere Module gleichzeitig sichtbar (Split-View/Panels):
-  Kamera+Scan | Rhythmus | Session | Diary; Tablet/Querformat-Layouts.
-- Dateien: `android/src/layout.rs`.
-- Verify: Gerät: zwei Module parallel, Session-Sync aktiv, CPU/Pacing im Rahmen.
+### S11b: Kombi-Layout & Feinschliff — **Kern erledigt, auf Gerät verifiziert**
+- Ziel: Mehrere Module gleichzeitig sichtbar (Split-View/Panels).
+- Umsetzung: Tab „Kombi“ mit zwei Bereichen (oben/unten), jeweils per
+  Auswahl: Kamera/Scan, Rhythmus, Takt-Maske, Tempo, Session, Tagebuch,
+  Kreis oder leer; beide Bereiche teilen den App-Zustand (`teil_ui`).
+- Gerätetest (Pixel 10 Pro, adb wireless): Oben „Kamera/Scan“, unten
+  „Rhythmus“ – die Kamera läuft (`Frame 58 (640x480)`), das Raster ist
+  gleichzeitig bedienbar.
+- Offen: Querformat/Tablet-Layout (zwei Bereiche nebeneinander), eigenes
+  `layout.rs` (die Bereiche liegen derzeit in `lib.rs`).
 
 ### S12: Verpackung/Release
 - Ziel: Icon, Version, Signatur, README (Build via Nix), Release-APK.
