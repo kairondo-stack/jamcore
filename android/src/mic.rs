@@ -434,6 +434,8 @@ pub struct MicPanel {
     /// Stand der Fensterzaehler beim Start der Messung; nur ein hoeherer
     /// Wert zaehlt als neue Messung.
     start_windows: u32,
+    /// Tap-Tempo: Zeitpunkte der letzten Tipps.
+    taps: Vec<Instant>,
     gemessen: Option<f32>,
     status: String,
     host: String,
@@ -452,6 +454,7 @@ impl MicPanel {
             recorder: None,
             messen_bis: None,
             start_windows: 0,
+            taps: Vec::new(),
             gemessen: None,
             status: "Bereit. Mikrofon an, dann klatschen oder Musik spielen.".to_string(),
             host: jamcore::osc::DEFAULT_HOST.to_string(),
@@ -514,6 +517,42 @@ impl MicPanel {
         self.start_windows = recorder.level().windows;
         self.messen_bis = Some(Instant::now() + Duration::from_secs(4));
         self.status = "Messe 4 Sekunden lang …".to_string();
+    }
+
+    /// Tap-Tempo wie im Desktop-Recorder: mittleres Intervall der Tipps.
+    fn tap(&mut self) {
+        let jetzt = Instant::now();
+        // Mehr als drei Sekunden Pause beginnt eine neue Messung.
+        if self
+            .taps
+            .last()
+            .is_some_and(|t| jetzt.duration_since(*t).as_secs_f32() > 3.0)
+        {
+            self.taps.clear();
+        }
+        self.taps.push(jetzt);
+        if self.taps.len() > 8 {
+            self.taps.remove(0);
+        }
+        let basis = self.taps[0];
+        let sekunden: Vec<f64> = self
+            .taps
+            .iter()
+            .map(|t| t.duration_since(basis).as_secs_f64())
+            .collect();
+        match jamcore::transformation::bpm_aus_taps(&sekunden) {
+            Some(bpm) => {
+                self.gemessen = Some(bpm);
+                self.status = format!(
+                    "Tap: {bpm:.1} BPM ({} Tipps) - mit Übernehmen senden",
+                    self.taps.len()
+                );
+                info!("mic: Tap-Tempo {bpm:.1} BPM ({} Tipps)", self.taps.len());
+            }
+            None => {
+                self.status = format!("Tap: weiter tippen ({} Tipps)", self.taps.len());
+            }
+        }
     }
 
     fn uebernehmen(&mut self) {
@@ -598,6 +637,9 @@ impl MicPanel {
             if ui.button("Stop").clicked() {
                 self.stop();
                 self.status = "Beendet.".to_string();
+            }
+            if ui.button("Tap").clicked() {
+                self.tap();
             }
             if ui.button("Übernehmen").clicked() {
                 self.uebernehmen();
