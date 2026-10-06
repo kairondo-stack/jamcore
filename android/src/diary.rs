@@ -91,7 +91,7 @@ impl DiaryPanel {
         };
         let dateiname = format!("{}.txt", eintrag.datum_zeit().replace([' ', ':'], "_"));
         let pfad = ordner.join(&dateiname);
-        match schreiben_atomar(&pfad, &eintrag.to_text()) {
+        match Self::schreiben_atomar(&pfad, &eintrag.to_text()) {
             Ok(()) => {
                 self.status = format!(
                     "Gespeichert: {} ({} Noten)",
@@ -130,17 +130,22 @@ impl DiaryPanel {
         ui.horizontal(|ui| {
             ui.label("Name");
             ui.text_edit_singleline(&mut self.name);
-            let tempo = bpm
-                .map(|b| format!("{b:.1} BPM"))
-                .unwrap_or_else(|| "kein Tempo gemessen".to_string());
-            ui.label(format!("· {tempo} · {} Noten im Raster", noten.notes().len()));
-            if ui.button("Eintrag speichern").clicked() {
-                self.speichern(bpm, noten);
-            }
         });
         ui.horizontal(|ui| {
             ui.label("Notiz");
             ui.text_edit_singleline(&mut self.notiz);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Eintrag speichern").clicked() {
+                self.speichern(bpm, noten);
+            }
+            let tempo = bpm
+                .map(|b| format!("{b:.1} BPM"))
+                .unwrap_or_else(|| "kein Tempo gemessen".to_string());
+            ui.label(format!(
+                "· {tempo} · {} Noten im Raster",
+                noten.notes().len()
+            ));
         });
         ui.separator();
 
@@ -152,7 +157,11 @@ impl DiaryPanel {
                     let text = format!(
                         "{} · {} ({} Noten)",
                         e.datum_zeit(),
-                        if e.name.is_empty() { "ohne Namen" } else { &e.name },
+                        if e.name.is_empty() {
+                            "ohne Namen"
+                        } else {
+                            &e.name
+                        },
                         e.noten.notes().len()
                     );
                     if ui.selectable_label(auswahl == Some(i), text).clicked() {
@@ -162,35 +171,37 @@ impl DiaryPanel {
                 self.auswahl = auswahl;
             });
             ui.separator();
-            ui.vertical(|ui| match self.auswahl.and_then(|i| self.eintraege.get(i)) {
-                Some((pfad, e)) => {
-                    ui.label(
-                        egui::RichText::new(format!("{} · {}", e.datum_zeit(), e.name))
-                            .strong(),
-                    );
-                    if let Some(b) = e.bpm {
-                        ui.label(format!("Tempo: {b:.1} BPM"));
+            ui.vertical(
+                |ui| match self.auswahl.and_then(|i| self.eintraege.get(i)) {
+                    Some((pfad, e)) => {
+                        ui.label(
+                            egui::RichText::new(format!("{} · {}", e.datum_zeit(), e.name))
+                                .strong(),
+                        );
+                        if let Some(b) = e.bpm {
+                            ui.label(format!("Tempo: {b:.1} BPM"));
+                        }
+                        if !e.notiz.is_empty() {
+                            ui.label(format!("Notiz: {}", e.notiz));
+                        }
+                        ui.label(format!("Datei: {}", pfad.display()));
+                        ui.label(egui::RichText::new("Noten (Desktop-CSV):").small());
+                        let csv = e.noten.to_csv();
+                        ui.label(
+                            egui::RichText::new(if csv.is_empty() {
+                                "(leer)".to_string()
+                            } else {
+                                csv
+                            })
+                            .monospace()
+                            .small(),
+                        );
                     }
-                    if !e.notiz.is_empty() {
-                        ui.label(format!("Notiz: {}", e.notiz));
+                    None => {
+                        ui.colored_label(Color32::GRAY, "Eintrag wählen");
                     }
-                    ui.label(format!("Datei: {}", pfad.display()));
-                    ui.label(egui::RichText::new("Noten (Desktop-CSV):").small());
-                    let csv = e.noten.to_csv();
-                    ui.label(
-                        egui::RichText::new(if csv.is_empty() {
-                            "(leer)".to_string()
-                        } else {
-                            csv
-                        })
-                        .monospace()
-                        .small(),
-                    );
-                }
-                None => {
-                    ui.colored_label(Color32::GRAY, "Eintrag wählen");
-                }
-            });
+                },
+            );
         });
     }
 }

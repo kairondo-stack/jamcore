@@ -428,15 +428,20 @@ Zusätzlich:
 - Abhängig: S2b, S4.
 - Rollback: Session-Screen deaktivierbar; Einzelbetrieb unverändert.
 
-### S10: Musiktagebuch (Risiko: niedrig)
-- Ziel: Schnell im Zug aufnehmen: Mikrofon-BPM messen, Rhythmus tippen,
-  optional Kamera-Farbscan → als Eintrag mit CSV speichern; Liste/Detail-Ansicht;
-  Export per Share.
-- Dateien: `android/src/diary.rs` (Liste/Detail, Capture-Flow),
-  `core/src/diary.rs` (Entry-Metadaten, CSV-Format = vorhandenes
-  `timestamp,instrument,pitch,glide`, ZIP-Export).
-- Test: Unit: Entry-Serialisierung, CSV-Roundtrip, ZIP-Export (tempdir);
-  Gerät: 3 Einträge anlegen → Export teilen → `adb pull` prüfen.
+### S10: Musiktagebuch (Risiko: niedrig) — **Kern erledigt, verifiziert**
+- Ziel: Schnell aufnehmen: Noten/Tempo als Eintrag speichern; Liste/Detail;
+  Export später per Share.
+- Dateien: `core/src/diary.rs` (Entry, Textformat mit Escaping, Kalender
+  ohne Bibliothek, 6 Tests), `android/src/diary.rs` + Tab „Tagebuch“.
+- Ein Eintrag übernimmt das aktuelle Raster (`rhythm.pattern()`) und, wenn
+  gemessen, das Tempo aus dem Tempo-Tab; gespeichert wird je Eintrag eine
+  Datei in `tagebuch/` (atomar, Name aus Datum/Uhrzeit in UTC).
+- Gerätetest (Pixel 10 Pro): zwei Einträge angelegt
+  (`2026-10-06_11_52.txt`, `2026-10-06_11_53.txt`), Inhalt geprüft — Kopf
+  `JamCore-Tagebuch v1`, Noten im Desktop-CSV (`0,0,48,0`, `0.125,0,36,0`),
+  Liste zeigt „2026-10-06 11:52 · Zug-Skizze (2 Noten)“, Detail mit CSV.
+- Offen: **ZIP-Export und Share-Intent** (brauchen Java/SAF), Notizfeld ist
+  einzeilig (Escaping für Umbrüche ist getestet).
 - Abhängig: S2, S5, S6 (MVP).
 - Rollback: eigenes Modul, keine Auswirkung auf Jam/Player.
 

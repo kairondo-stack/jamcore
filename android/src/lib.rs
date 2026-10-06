@@ -2,6 +2,7 @@
 //! Weitere Module (Rhythmus, Bild/Scan, Session, Tagebuch) folgen in S4+.
 
 mod camera;
+mod diary;
 mod image;
 mod insets;
 mod jniutil;
@@ -41,6 +42,7 @@ enum Tab {
     Bild,
     Kreis,
     Session,
+    Tagebuch,
 }
 
 struct JamApp {
@@ -66,6 +68,7 @@ struct JamApp {
     session: session_ui::SessionPanel,
     link_aktiv: bool,
     multicast_aktiv: bool,
+    diary: diary::DiaryPanel,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -96,6 +99,7 @@ impl Default for JamApp {
             session: session_ui::SessionPanel::default(),
             link_aktiv: true,
             multicast_aktiv: false,
+            diary: diary::DiaryPanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -275,6 +279,7 @@ impl eframe::App for JamApp {
                     ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
                     ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
                     ui.selectable_value(&mut self.tab, Tab::Session, "Session");
+                    ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
                 });
             });
             ui.add_space(4.0);
@@ -300,6 +305,7 @@ impl eframe::App for JamApp {
             Tab::Bild => self.view_bild(ui),
             Tab::Kreis => self.view_kreis(ui),
             Tab::Session => self.view_session(ui),
+            Tab::Tagebuch => self.view_tagebuch(ui),
         }
     }
 }
@@ -351,6 +357,12 @@ impl JamApp {
                 }
             }
         });
+    }
+
+    fn view_tagebuch(&mut self, ui: &mut egui::Ui) {
+        let bpm = self.mic.bpm();
+        let noten = self.rhythm.pattern().clone();
+        egui::CentralPanel::default().show(ui, |ui| self.diary.ui(ui, bpm, &noten));
     }
 
     fn view_session(&mut self, ui: &mut egui::Ui) {
