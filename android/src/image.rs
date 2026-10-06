@@ -11,7 +11,7 @@
 use eframe::egui::{self, Color32, TextureOptions};
 
 use jamcore::livescan::{
-    next_column, note_allowed, note_volume, pixel_matches, scan_column, ScanFilter,
+    build_palette, next_column, note_allowed, note_volume, pixel_matches, scan_column, ScanFilter,
 };
 use jamcore::osc::{OscOut, Renoise};
 
@@ -38,6 +38,13 @@ pub struct ImagePanel {
     status: String,
     /// noteadjust-Modus des Scans (0 = Zeile, 2/3 = y, 5/6 = x).
     note_modus: u8,
+    /// Malen (Merken): Farben beim Ziehen in den Merker uebernehmen.
+    malen_an: bool,
+    /// Scan gegen die gemerkten Farben statt gegen die Einzelauswahl.
+    palette_scan: bool,
+    /// Merker: gemalte Pixel in Originalfarbe (RGBA).
+    mal_puffer: Vec<u8>,
+    mal_masse: (usize, usize),
     /// Live-Scan (S7e): Sweep ueber die Spalten, Treffer als OSC-Noten.
     scan_an: bool,
     scan_takt: bool,
@@ -79,6 +86,10 @@ impl ImagePanel {
             treffer: 0,
             status: "Kamera starten, dann ins Bild tippen (halten = einfrieren).".to_string(),
             note_modus: 0,
+            malen_an: false,
+            palette_scan: false,
+            mal_puffer: Vec::new(),
+            mal_masse: (0, 0),
             scan_an: false,
             scan_takt: false,
             scan_bpm: 120.0,
@@ -261,6 +272,20 @@ impl ImagePanel {
             }
             let (r, g, b) = (bild[idx], bild[idx + 1], bild[idx + 2]);
             if pixel_matches(r, g, b, &filter) {
+                // Malen: die Originalfarbe in den Merker uebernehmen, bevor
+                // die Anzeige gruen markiert wird.
+                if self.malen_an {
+                    if self.mal_masse != (w, h) {
+                        self.mal_puffer = vec![0u8; w * h * 4];
+                        self.mal_masse = (w, h);
+                    }
+                    if idx + 3 < self.mal_puffer.len() {
+                        self.mal_puffer[idx] = r;
+                        self.mal_puffer[idx + 1] = g;
+                        self.mal_puffer[idx + 2] = b;
+                        self.mal_puffer[idx + 3] = 255;
+                    }
+                }
                 bild[idx] = 20;
                 bild[idx + 1] = 235;
                 bild[idx + 2] = 60;
@@ -303,6 +328,14 @@ impl ImagePanel {
             sel,
             range: self.toleranz,
         };
+        // Palette-Modus: gegen die gemerkten Farben matchen statt gegen die
+        // Einzelauswahl (wie im Desktop-rrn5).
+        let palette = if self.palette_scan && self.mal_masse == (w, h) {
+            let p = build_palette(&self.mal_puffer, w * h, self.bg);
+            (!p.is_empty()).then_some(p)
+        } else {
+            None
+        };
         let mut noten: Vec<i32> = Vec::new();
         while start.elapsed() < budget {
             let jetzt = std::time::Instant::now();
@@ -315,7 +348,7 @@ impl ImagePanel {
                 self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
             }
             let x = self.scan_x.clamp(0, wi - 1);
-            let treffer = scan_column(&live, wi, hi, x, &filter, None);
+            let treffer = scan_column(&live, wi, hi, x, &filter, palette.as_ref());
             if let Some((_, _, puffer)) = self.scan_puffer.as_mut() {
                 for (y, r, g, b) in &treffer {
                     let idx = (*y as usize) * w + x as usize;
@@ -572,6 +605,23 @@ impl ImagePanel {
             let (r, g, b) = self.bg;
             ui.painter()
                 .rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
+        });
+        ui.horizontal(|ui| {
+            // Malen/Merken und Palette-Scan wie das zweite Fenster im Desktop.
+            ui.checkbox(&mut self.malen_an, "Malen (merken)");
+            ui.checkbox(&mut self.palette_scan, "Palette-Scan");
+            if self.mal_masse != (0, 0) {
+                let farben = build_palette(
+                    &self.mal_puffer,
+                    self.mal_masse.0 * self.mal_masse.1,
+                    self.bg,
+                );
+                ui.label(format!("gemerkt: {} Farben", farben.len()));
+            }
+            if ui.button("Merker löschen").clicked() {
+                self.mal_puffer.clear();
+                self.mal_masse = (0, 0);
+            }
         });
         ui.horizontal(|ui| {
             let mut geaendert = false;
