@@ -46,8 +46,8 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
   1080x2410 → x·1.2385, y·1.2246.
 - Start: `adb shell am start -n org.jamcore.app/android.app.NativeActivity`
   (die Activity ist `android.app.NativeActivity`, **kein** `.MainActivity`).
-- Tabs liegen bei Screenshot-y≈148, also Geräte-y≈181. Vier Tabs (x Gerät):
-  Überblick 254, Player 402, OSC 505, Rhythmus 629.
+- Tabs liegen bei Screenshot-y≈148, also Geräte-y≈181. Fünf Tabs (x Gerät):
+  Überblick 254, Player 402, OSC 505, Rhythmus 629, Tempo 778.
 - `adb logcat -d | grep jamandroid` ist die Quelle der Wahrheit; Bildschirmfotos nur
   zur Kontanz.
 - `adb reverse tcp<port> tcp<port>` für TCP. **UDP kann adb reverse nicht** — OSC
@@ -64,6 +64,22 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 - **Android 17 (Pixel 10 Pro)**: AAudio-C-API ist ein Stub (`nullptr`),
   `SL_IID_*` von libOpenSLES unbrauchbar, `AudioTrack.write(float[],…)` fehlt.
   Funktioniert: AudioTrack + `write(byte[],…)`, PCM 16-Bit.
+- **AudioRecord-Aufnahme**: Die Konstruktoren sind per Greylist gesperrt —
+  fünf Argumente geben „Invalid number or type of arguments", sechs
+  `NoSuchMethodError: <init>(IIIIII)V`. Es geht nur über
+  `AudioRecord$Builder` (`()V`, dann `setAudioSource`/`setBufferSizeInBytes`
+  mit `(I)Landroid/media/AudioRecord$Builder;`, `setAudioFormat` mit einem
+  `AudioFormat$Builder`-Objekt, dann `build()`).
+  `getState()`: **`STATE_INITIALIZED` ist 1** (nicht 3!) — mit dem falschen
+  Wert verwirft man funktionierende Quellen.
+- **Mikrofonquellen**: `VOICE_RECOGNITION` nimmt nur 16000 Hz, `MIC` auch
+  44100. Im Code werden die Kombinationen durchprobiert und geloggt.
+- **Pegel ist alles**: Bei Pegel < 0,1 liefert die BPM-Schätzung Unsinn
+  (120-BPM-Spur → 135,7), bei Stille gar nichts. Für Tests die Quelle laut
+  genug machen (Pegel > 0,5 ist exakt); die App zeigt Pegel und Konfidenz.
+- **Layout-Falle bei Gerätetests**: Die Button-Zeilen im Tempo-Tab wandern je
+  nach Zustand (mit Pegel-Zeile ≈ 40 px tiefer). Vor dem Tap immer einen
+  Screenshot machen und die Koordinate daraus ableiten.
 - **libopenmpt**: Git-Baum hat kein CMake → `build/android_ndk/Android.mk` +
   `ndk-build`; Pfad darf keine Leerzeichen enthalten; `APP_ABI`/`APP_PLATFORM`/
   `APP_STL` nur per eigener `Application.mk`.
@@ -97,5 +113,5 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 
 ## Zustand
 
-Siehe `docs/plans/2026-09-30-android-port.md` (S1–S4 und S6 fertig und auf
-Gerät verifiziert, S5 offen) und `git log`.
+Siehe `docs/plans/2026-09-30-android-port.md` (S1–S6 fertig und auf
+Gerät verifiziert, S2b/S7–S12 offen) und `git log`.

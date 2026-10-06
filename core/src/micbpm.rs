@@ -123,6 +123,21 @@ impl BpmEstimator {
     }
 }
 
+/// PCM 16 Bit little-endian mono (das Format von `AudioRecord.read`) in
+/// Fließkommawerte von -1.0 bis 1.0.
+///
+/// Ungerade Byte-Zahlen werden ignoriert, damit ein halber Frame am Pufferende
+/// nicht die Werte verschiebt.
+pub fn pcm16_le_to_f32(bytes: &[i8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|frame| {
+            let raw = i16::from_le_bytes([frame[0] as u8, frame[1] as u8]);
+            f32::from(raw) / 32768.0
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +214,106 @@ mod tests {
         let (bpm, conf) = bpm_from_onsets(&onsets, 60.0, 200.0).unwrap();
         assert!((bpm - 120.0).abs() < 1.0);
         assert!(conf > 0.9);
+    }
+
+    #[test]
+    fn pcm16_le_rechnet_bytes_in_werte() {
+        let bytes: Vec<i8> = vec![0x00, 0x00, 0x00, 0x40, 0x00, 0xC0u8 as i8, -0x01, 0x7F];
+        let v = pcm16_le_to_f32(&bytes);
+        assert_eq!(v.len(), 4);
+        assert!(v[0].abs() < 1e-6, "0 -> 0");
+        assert!((v[1] - 0.5).abs() < 1e-4, "16384 -> 0.5, war {}", v[1]);
+        assert!((v[2] + 0.5).abs() < 1e-4, "-16384 -> -0.5, war {}", v[2]);
+        assert!(
+            (v[3] - 32767.0 / 32768.0).abs() < 1e-4,
+            "Maximum knapp unter 1.0"
+        );
+    }
+
+    #[test]
+    fn pcm16_le_ignoriert_ein_ungerades_letztes_byte() {
+        assert_eq!(pcm16_le_to_f32(&[0x00, 0x00, 0x7F]).len(), 1);
+        assert!(pcm16_le_to_f32(&[0x01]).is_empty());
+        assert!(pcm16_le_to_f32(&[]).is_empty());
+    }
+
+    #[test]
+    fn pcm16_le_deckt_das_minimum_ab() {
+        // 0x8000 ist -32768 und damit genau -1.0; der Betrag ist eins
+        // groesser als beim Maximum (32767/32768).
+        let v = pcm16_le_to_f32(&[0x00, 0x80u8 as i8]);
+        assert_eq!(v, vec![-1.0]);
+        let max = pcm16_le_to_f32(&[-0x01, 0x7F]);
+        assert!(max[0] < 1.0);
+    }
+
+    #[test]
+    fn schaetzer_ohne_rate_oder_fenster_stuerzt_nicht_ab() {
+        let est = BpmEstimator::new(0);
+        assert!(est.estimate().is_none());
+        let mut est = BpmEstimator::new(44100);
+        est.push(&[]);
+        assert!(est.estimate().is_none());
+    }
+
+    #[test]
+    fn klick_16000_wie_das_mikrofon_ergibt_120_bpm() {
+        // Gleiche Klickform wie die Testspur auf dem Geraet: 8 ms Sinus
+        // 1 kHz mit Abfall, alle 0.5 s, bei 16 kHz wie VOICE_RECOGNITION.
+        let rate = 16000u32;
+        let n = (rate as f32 * 6.0) as usize;
+        let period = rate as usize / 2;
+        let click = (rate as f32 * 0.008) as usize;
+        let mut v = vec![0.0f32; n];
+        let mut i = period / 2;
+        while i < n {
+            for k in 0..click {
+                if i + k < n {
+                    let e = (-6.0 * k as f32 / click as f32).exp();
+                    v[i + k] = 0.85
+                        * e
+                        * (2.0 * std::f32::consts::PI * 1000.0 * k as f32 / rate as f32).sin();
+                }
+            }
+            i += period;
+        }
+        let mut est = BpmEstimator::new(rate);
+        est.push(&v);
+        let (bpm, conf) = est.estimate().expect("BPM aus 16-kHz-Klickspur");
+        assert!(
+            (bpm - 120.0).abs() < 2.0,
+            "erwartet 120 BPM, war {bpm} (Konfidenz {conf})"
+        );
+    }
+
+    #[test]
+    fn pcm16_le_puffer_kann_der_schaetzer_lesen() {
+        // Klick bei 120 BPM als PCM-Puffer, wie AudioRecord ihn liefert.
+        let rate = 44100u32;
+        let mono: Vec<f32> = {
+            let n = (rate as f32 * 6.0) as usize;
+            let mut v = vec![0.0f32; n];
+            let period = rate as usize / 2;
+            let mut i = period / 2;
+            while i < n {
+                for k in 0..441 {
+                    v[i + k] = 0.9;
+                }
+                i += period;
+            }
+            v
+        };
+        let bytes: Vec<i8> = mono
+            .iter()
+            .flat_map(|s| {
+                let raw = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                raw.to_le_bytes()
+            })
+            .map(|b| b as i8)
+            .collect();
+        let mut est = BpmEstimator::new(rate);
+        est.push(&pcm16_le_to_f32(&bytes));
+        let (bpm, _) = est.estimate().expect("BPM aus PCM-Puffer");
+        assert!((bpm - 120.0).abs() < 2.0, "erwartet 120 BPM, war {bpm}");
     }
 }

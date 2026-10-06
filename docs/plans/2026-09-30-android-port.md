@@ -189,12 +189,44 @@ Zusätzlich:
     Aufräumschritt (Desktop bleibt bewusst unangetastet, damit die E2E-Suite grün
     bleibt).
 
-### S5: Mikrofon-BPM (Risiko: mittel)
-- Ziel: `T+M`/`T+L` als Touch: „Messen“ / „Live“, Anzeige + Übernehmen.
-- Dateien: `android/src/mic.rs` (oboe-Capture → `core::micbpm`), UI-Screen.
-- Test: Unit (micbpm unverändert); Gerät: Klatschen/120-BPM-Klick → Anzeige
-  ±2 BPM; Übernehmen sendet OSC-BPM.
+### S5: Mikrofon-BPM (Risiko: mittel) — **geräteseitig fertig und verifiziert**
+- Ziel: Tempo aus dem Mikrofon messen (4 s „Messen“ oder „Live“) und per OSC an
+  Renoise übernehmen.
+- Dateien: `core/src/micbpm.rs` (`pcm16_le_to_f32` + 4 neue Tests), `android/src/mic.rs`
+  (Recorder + `MicPanel`), `android/src/lib.rs` (Tab „Tempo“).
+- Aufnahme: `AudioRecord` ausschließlich über `AudioRecord$Builder` (die Konstruktoren
+  sind auf dem Gerät per Greylist gesperrt, siehe `AGENTS.md`). Aufnahmethread liest
+  `read(byte[], …)` PCM 16 Bit little-endian mono, `jamcore::micbpm::BpmEstimator`
+  schätzt aus den Einsätzen, die UI liest nur Atomics (Pegel, BPM, Konfidenz,
+  Fenster, Rate). Quellen-Kette: VOICE_RECOGNITION/16000 → MIC/44100 → MIC/16000,
+  die erste funktionierende wird geloggt.
+- Gerätetest (Pixel 10 Pro, 120-BPM-Klick-Spur vom Laptop über `pw-play`,
+  Klicks alle 0,5 s, 1 kHz, 8 ms):
+  - Live: **120.0–120.1 BPM, Konfidenz 100 %, Pegel 0.547** (logcat `gemessen` fehlt
+    hier absichtlich, der Live-Modus zeigt nur an)
+  - Messen (4 s): **119.9 und 120.0 BPM, Konfidenz 1.00** (logcat
+    `gemessen 120.0 BPM (Konfidenz 1.00)`)
+  - Übernehmen: logcat `BPM 120.0 -> Port 7003` (OSC an Renoise/Relay)
+  - **Lautstärke ist entscheidend:** mit leiser Quelle (Pegel 0.089) ergab dieselbe
+    Spur 135.7 BPM bei Konfidenz 0.50, bei Pegel 0.001 (stumm) gar keine Messung.
+    Ab etwa Pegel 0.5 ist das Ergebnis exakt. Die UI zeigt Pegel und Konfidenz,
+    damit man das sofort sieht.
+- Tests: jamcore **50 grün** (darunter: PCM-Bytes → Werte, ungerades Byte, leeres
+  Array, Minimum -1.0 exakt, kompletter PCM-Puffer → 120 BPM bei 44,1 kHz,
+  16-kHz-Klickspur in der Form der Testspur → 120 BPM, Schätzer ohne Rate oder
+  Fenster). Desktop: `tests/e2e/run_all.sh` → `== ALLES OK`, `cargo fmt` sauber.
 - Abhängig: S2, S4.
+- Offen / bewusst so:
+  - **Nur eine Quelle praktisch erprobt** (VOICE_RECOGNITION/16000); die Fallbacks
+    MIC/44100 und MIC/16000 sind im Code, wurden auf dem Gerät aber nicht gebraucht.
+  - **Keine Verstärkung (AGC):** leise Quellen liefern unsichere Werte; das ist
+    gewollt ehrlich (Pegel wird angezeigt) und kein stiller Fehler.
+  - **Der gemessene Wert wird nur per OSC gesendet**, nicht in den Rhythmus-Screen
+    übernommen; den Takt dort kann man getrennt stellen.
+  - **Kein Vordergrunddienst:** im Hintergrund friert Android die App ein, die
+    Aufnahme liefert dann nichts. Der Zustand wird sauber angezeigt: endet der
+    Aufnahmethread (Kanal belegt oder entzogen), raeumt die App den Recorder ab
+    statt alte Werte weiterzuzeigen.
 
 ### S6: Rhythmus-Screen (pattern_recorder-MVP) (Risiko: mittel) — **geräteseitig fertig und verifiziert**
 - Ziel: Noten-Raster (Spalte = Schritt, Zeile = Ton), Takt aus Modulzeile oder

@@ -3,6 +3,7 @@
 
 mod insets;
 mod jniutil;
+mod mic;
 mod osc;
 mod paths;
 mod player;
@@ -30,6 +31,7 @@ enum Tab {
     Player,
     Osc,
     Rhythmus,
+    Tempo,
 }
 
 struct JamApp {
@@ -49,6 +51,7 @@ struct JamApp {
     player: Option<player::Player>,
     osc: osc::OscPanel,
     rhythm: rhythm::RhythmPanel,
+    mic: mic::MicPanel,
     last_peak: f32,
     last_report: Instant,
 }
@@ -69,6 +72,7 @@ impl Default for JamApp {
             player: None,
             osc: osc::OscPanel::default(),
             rhythm: rhythm::RhythmPanel::default(),
+            mic: mic::MicPanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
         }
@@ -190,6 +194,7 @@ impl eframe::App for JamApp {
                 ui.selectable_value(&mut self.tab, Tab::Player, "Player");
                 ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
                 ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
+                ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
             });
             ui.add_space(4.0);
         });
@@ -210,6 +215,7 @@ impl eframe::App for JamApp {
             Tab::Player => self.view_player(ui),
             Tab::Osc => self.view_osc(ui),
             Tab::Rhythmus => self.view_rhythm(ui),
+            Tab::Tempo => self.view_mic(ui),
         }
     }
 }
@@ -218,7 +224,8 @@ impl JamApp {
     fn view_ueberblick(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.label(
-                "Schritte: Rhythmus aufnehmen (S6), Bild/Scan (S7), Session (S9), Tagebuch (S10).",
+                "Fertig: Modul-Player, OSC zu Renoise, Rhythmus-Raster, Tempo-Messung. \
+                 Es folgen: Bild/Scan (S7), Session (S9), Tagebuch (S10).",
             );
             ui.separator();
             ui.label(format!("Module gefunden: {}", self.modules.len()));
@@ -236,6 +243,12 @@ impl JamApp {
                 }
             }
         });
+    }
+
+    fn view_mic(&mut self, ui: &mut egui::Ui) {
+        // Das Ziel stellt der Tempo-Tab selbst ein; ein Ueberschreiben aus dem
+        // OSC-Tab heraus wuerde Eingaben bei jedem Frame unmoeglich machen.
+        egui::CentralPanel::default().show(ui, |ui| self.mic.ui(ui));
     }
 
     fn view_rhythm(&mut self, ui: &mut egui::Ui) {

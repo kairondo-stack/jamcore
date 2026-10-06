@@ -73,10 +73,6 @@ impl RhythmPanel {
         self.current_step = step % STEP_COUNT;
     }
 
-    pub fn pattern(&self) -> &Pattern {
-        &self.pattern
-    }
-
     /// Eigene Uhr, wenn der Follow-Modus aus ist.
     fn tick_own_clock(&mut self) {
         if self.follow {
