@@ -118,6 +118,11 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
   PATH und `CARGO_TARGET_DIR=/tmp/opencode/clippy-target`.
 - **Hyprland-Config** `~/.config/hypr/hyprland.lua`: snake_case-Schlüssel
   (`dpms_timeout`, nicht `dpmsTimeout`), kein Git → vorher Backup anlegen.
+- **Bildschirm wurde komplett schwarz** (Laptop lief weiter, DPMS und Backlight laut
+  sysfs an, kein Idle-Daemon, `general:dpms_timeout` gibt es in Hyprland 0.56
+  nicht): PSR/Panel-Problem, Fix `amdgpu.dcdebugmask=0x10` in
+  `boot.kernelParams` (2026-10-06 gesetzt). Helligkeit stand zudem bei 6 %
+  (`brightnessctl --device=amdgpu_bl1 set 80%`).
 - **Stromprofil**: stand wieder auf `balanced` (78 °C, Lüfter laut).
   `powerprofilesctl set power-saver` → 31–40 °C.
 

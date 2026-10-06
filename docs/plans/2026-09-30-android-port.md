@@ -282,12 +282,35 @@ Zusätzlich:
 - Ziel: Kamera-Vorschau, Farbauswahl per Touch (Finger = Linksklick: einfrieren
   bei Berührung, malen beim Ziehen), Live-Scan (frei/Takt/Palette),
   Quintenzirkel als Touch-Scheibe, OSC-Ausgabe.
-- Dateien: `android/src/camera.rs` (JNI/Camera2 → RGBA), `android/src/image.rs`
-  (Canvas + Auswahl + Scan), Wiederverwendung `core::{livescan,quint}`.
-- Test: Unit: `livescan::*`, `quint::*` (core); Gerät: Testvideo auf Bildschirm
-  abfilmen? Nein — stattdessen Kamera auf farbige Fläche: Live-Scan-Log
-  „Sweep beendet, N Noten, N gezeichnet“; OSC-Mitschnitt am Laptop.
+- **Voraussetzung Java-Brücke (Befund vor dem Start):** Camera2 verlangt
+  Pflicht-Callbacks (`CameraDevice.StateCallback`,
+  `CaptureSession.StateCallback`, `ImageReader.OnImageAvailableListener`), die
+  sich in reinem Rust/JNI nicht erzeugen lassen. Die App bekommt deshalb eine
+  kleine Java-Klasse (`android/app/src/main/java/org/jamcore/app/CameraBridge.java`)
+  samt Gradle-Source-Set; sie öffnet die Kamera, hält den ImageReader
+  (YUV_420_888) und ruft eine native Methode mit den drei Plane-Puffern auf.
+  (Für `AudioRecord`/`AudioTrack` war das nicht nötig, die haben
+  argumentlose Methoden bzw. erlaubten den Builder.)
+- Dateien: `android/src/camera.rs` (JNI an CameraBridge, Frame-Puffer),
+  `core/src/yuv.rs` (YUV_420_888 → RGBA, hardwarefrei testbar),
+  `android/src/image.rs` (Canvas, Auswahl, Scan), `core::{livescan,quint}`
+  (vorhanden und getestet).
+- Teilschritte:
+  - **S7a** `core/src/yuv.rs` (TDD): Planes mit Row-/Pixel-Strides → RGBA;
+    Testflächen, Stride-Fälle (Padding, PixelStride 2), Schwarz/Weiß.
+  - **S7b** Java-Brücke + Gradle: Source-Set, `CameraBridge` öffnet Kamera 0
+    (YUV_420_888, 640x480), liefert Frames an eine native Methode; Gerätetest:
+    logcat `frame 640x480`, keine Crashs, CAMERA-Berechtigung.
+  - **S7c** Vorschau in egui: Frame-Doppelpuffer, `ColorImage` → TextureHandle,
+    Bild-Tab mit Vorschau.
+  - **S7d** Touch: Finger einfrieren, Ziehen malen, Quintenzirkel-Scheibe.
+  - **S7e** Live-Scan mit `livescan` (frei/Takt/Palette) + OSC-Notenausgabe;
+    Gerätetest: Log `Sweep beendet, N Noten, N gezeichnet`.
+- Test: Unit: `yuv`, `livescan`, `quint` (core); Gerät: Kamera auf farbige
+  Fläche halten, Sweep-Log, OSC-Mitschnitt am Laptop.
 - Abhängig: S2, S4.
+- Rollback: Falls Camera2 über die Java-Brücke an Android-17-Fallen scheitert,
+  Video-Dateien (S8) als Bildquelle nehmen und die Kamera später nachziehen.
 
 ### S8: Video-Dateien + Feinschliff (Risiko: mittel)
 - Ziel: Videodateien via MediaCodec (oder ExoPlayer-Bridge) als Quelle,
