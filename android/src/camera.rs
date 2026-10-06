@@ -57,9 +57,10 @@ pub fn letztes_bild() -> Option<(usize, usize, Vec<u8>)> {
 /// `JNIEnv::find_class` benutzt bei Threads, die von native an die JVM
 /// gehängt wurden, den Bootstrap-ClassLoader und findet App-Klassen nicht
 /// („Java exception was thrown"). Der Weg über die Activity funktioniert.
-fn bridge_klasse<'a>(
+pub(crate) fn klasse_holen<'a>(
     env: &mut jni::JNIEnv<'a>,
     activity: &jni::objects::JObject,
+    klassenname: &str,
 ) -> Result<jni::objects::JClass<'a>, String> {
     use jni::objects::{JClass, JObject, JValue};
 
@@ -71,7 +72,7 @@ fn bridge_klasse<'a>(
             format!("getClassLoader: {e} / {detail}")
         })?;
     let name = env
-        .new_string("org.jamcore.app.CameraBridge")
+        .new_string(klassenname)
         .map_err(|e| format!("new_string: {e}"))?;
     let klasse = env
         .call_method(
@@ -93,7 +94,7 @@ pub fn start(app: &android_activity::AndroidApp) -> Result<(), String> {
     let ergebnis = jniutil::with_env(app, |env, activity| {
         use jni::objects::{JObject, JValue};
 
-        let klasse = bridge_klasse(env, activity)?;
+        let klasse = klasse_holen(env, activity, "org.jamcore.app.CameraBridge")?;
         let wert = env
             .call_static_method(
                 klasse,
@@ -133,7 +134,7 @@ pub fn start(app: &android_activity::AndroidApp) -> Result<(), String> {
 /// `onError`) landen dort und werden so für die Oberfläche sichtbar.
 pub fn java_fehlermeldung(app: &android_activity::AndroidApp) -> String {
     let ergebnis = jniutil::with_env(app, |env, activity| {
-        let Ok(klasse) = bridge_klasse(env, activity) else {
+        let Ok(klasse) = klasse_holen(env, activity, "org.jamcore.app.CameraBridge") else {
             return String::new();
         };
         let Ok(wert) = env.call_static_method(klasse, "status", "()Ljava/lang/String;", &[]) else {
@@ -151,7 +152,7 @@ pub fn java_fehlermeldung(app: &android_activity::AndroidApp) -> String {
 /// Stoppt die Vorschau über die Java-Brücke.
 pub fn stop(app: &android_activity::AndroidApp) {
     let _ = jniutil::with_env(app, |env, activity| {
-        if let Ok(klasse) = bridge_klasse(env, activity) {
+        if let Ok(klasse) = klasse_holen(env, activity, "org.jamcore.app.CameraBridge") {
             let _ = env.call_static_method(klasse, "stop", "()V", &[]);
         }
     });
@@ -188,32 +189,63 @@ pub extern "system" fn Java_org_jamcore_app_CameraBridge_nativeFrame(
         env.convert_byte_array(&u),
         env.convert_byte_array(&v),
     ) else {
-        info!("camera: Frame-Arrays nicht lesbar");
+        info!("frame: Arrays nicht lesbar");
         return;
     };
+    ablegen(
+        &y,
+        y_row.max(0) as usize,
+        y_pix.max(0) as usize,
+        &u,
+        u_row.max(0) as usize,
+        u_pix.max(0) as usize,
+        &v,
+        v_row.max(0) as usize,
+        v_pix.max(0) as usize,
+        breite,
+        hoehe,
+    );
+}
 
+/// Rechnet drei YUV_420_888-Planes nach RGBA und legt das Bild in den
+/// Framepuffer. Kamera und Videodekoder teilen sich diesen Weg.
+pub(crate) fn ablegen(
+    y: &[u8],
+    y_row: usize,
+    y_pix: usize,
+    u: &[u8],
+    u_row: usize,
+    u_pix: usize,
+    v: &[u8],
+    v_row: usize,
+    v_pix: usize,
+    breite: usize,
+    hoehe: usize,
+) {
+    if breite == 0 || hoehe == 0 {
+        return;
+    }
     let mut rgba = Vec::new();
     yuv420_to_rgba(
         Plane {
-            data: &y,
-            row_stride: y_row.max(0) as usize,
-            pixel_stride: y_pix.max(0) as usize,
+            data: y,
+            row_stride: y_row,
+            pixel_stride: y_pix,
         },
         Plane {
-            data: &u,
-            row_stride: u_row.max(0) as usize,
-            pixel_stride: u_pix.max(0) as usize,
+            data: u,
+            row_stride: u_row,
+            pixel_stride: u_pix,
         },
         Plane {
-            data: &v,
-            row_stride: v_row.max(0) as usize,
-            pixel_stride: v_pix.max(0) as usize,
+            data: v,
+            row_stride: v_row,
+            pixel_stride: v_pix,
         },
         breite,
         hoehe,
         &mut rgba,
     );
-
     if let Ok(mut frame) = frame_slot().lock() {
         frame.width = breite;
         frame.height = hoehe;

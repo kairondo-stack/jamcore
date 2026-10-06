@@ -14,6 +14,7 @@ use jamcore::livescan::{next_column, note_allowed, pixel_matches, scan_column, S
 use jamcore::osc::{OscOut, Renoise};
 
 use crate::camera;
+use crate::video;
 
 const TOLERANZ_STANDARD: i32 = 24;
 
@@ -43,6 +44,12 @@ pub struct ImagePanel {
     sweep_gezeichnet: u64,
     host: String,
     port: String,
+    /// Videos aus dem App-Ordner videos/ (S8).
+    videos: Vec<String>,
+    video_auswahl: Option<String>,
+    video_fps: u32,
+    video_laeuft: bool,
+    video_pruefung: std::time::Instant,
 }
 
 impl Default for ImagePanel {
@@ -75,7 +82,80 @@ impl ImagePanel {
             sweep_gezeichnet: 0,
             host: jamcore::osc::DEFAULT_HOST.to_string(),
             port: jamcore::osc::DEFAULT_BASE_PORT.to_string(),
+            videos: Vec::new(),
+            video_auswahl: None,
+            video_fps: 20,
+            video_laeuft: false,
+            video_pruefung: std::time::Instant::now(),
         }
+    }
+
+    /// Sucht Videodateien im App-Ordner videos/.
+    fn videos_scannen(&mut self) {
+        self.videos.clear();
+        let Ok(app) = crate::current_app() else {
+            return;
+        };
+        let Some(basis) = crate::insets::external_files_dir(&app) else {
+            return;
+        };
+        let ordner = std::path::PathBuf::from(basis).join("videos");
+        let _ = std::fs::create_dir_all(&ordner);
+        let Ok(eintraege) = std::fs::read_dir(&ordner) else {
+            return;
+        };
+        for eintrag in eintraege.flatten() {
+            let pfad = eintrag.path();
+            let ist_video = pfad
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| {
+                    ["mp4", "mkv", "webm", "avi", "mov", "3gp"]
+                        .iter()
+                        .any(|x| e.eq_ignore_ascii_case(x))
+                })
+                .unwrap_or(false);
+            if ist_video {
+                self.videos.push(pfad.display().to_string());
+            }
+        }
+        self.videos.sort();
+        if self.video_auswahl.is_none() {
+            self.video_auswahl = self.videos.first().cloned();
+        }
+        self.status = format!("{} Videos gefunden", self.videos.len());
+    }
+
+    fn video_an(&mut self) {
+        let Some(pfad) = self.video_auswahl.clone() else {
+            self.status = "Kein Video ausgewählt (erst suchen).".to_string();
+            return;
+        };
+        // Nur eine Quelle gleichzeitig.
+        if let Ok(app) = crate::current_app() {
+            camera::stop(&app);
+        }
+        self.eingefroren = None;
+        self.sel = None;
+        self.scan_puffer = None;
+        let ergebnis = crate::current_app()
+            .map_err(|e| e.to_string())
+            .and_then(|app| video::start(&app, &pfad, self.video_fps));
+        match ergebnis {
+            Ok(()) => {
+                self.video_laeuft = true;
+                self.status = format!("Video läuft ({} fps)", self.video_fps);
+            }
+            Err(e) => self.status = format!("Video: {e}"),
+        }
+    }
+
+    fn video_aus(&mut self) {
+        if let Ok(app) = crate::current_app() {
+            video::stop(&app);
+        }
+        self.video_laeuft = false;
+        self.status = "Video gestoppt".to_string();
     }
 
     pub fn set_target(&mut self, host: &str, port: &str) {
@@ -97,6 +177,11 @@ impl ImagePanel {
     }
 
     fn kamera_an(&mut self) {
+        // Nur eine Quelle gleichzeitig.
+        if let Ok(app) = crate::current_app() {
+            video::stop(&app);
+        }
+        self.video_laeuft = false;
         let ergebnis = crate::current_app()
             .map_err(|e| e.to_string())
             .and_then(|app| camera::start(&app));
@@ -305,6 +390,55 @@ impl ImagePanel {
                 "Sweep: {} Noten, {} gezeichnet",
                 self.sweep_noten, self.sweep_gezeichnet
             ));
+        });
+        // Dekodierfehler aus Java einmal je Sekunde sichtbar machen.
+        if self.video_laeuft && self.video_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
+            self.video_pruefung = std::time::Instant::now();
+            if let Ok(app) = crate::current_app() {
+                let meldung = video::java_meldung(&app);
+                if !meldung.is_empty() {
+                    self.status = format!("Video: {meldung}");
+                }
+            }
+        }
+        ui.horizontal(|ui| {
+            if ui.button("Videos suchen").clicked() {
+                self.videos_scannen();
+            }
+            let mut gewaehlt = self.video_auswahl.clone();
+            egui::ComboBox::from_id_salt("videoliste")
+                .selected_text(
+                    self.video_auswahl
+                        .as_deref()
+                        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+                        .unwrap_or_else(|| "keine".to_string()),
+                )
+                .show_ui(ui, |ui| {
+                    for pfad in &self.videos {
+                        let name = pfad.rsplit('/').next().unwrap_or(pfad).to_string();
+                        let ausgewaehlt = self.video_auswahl.as_deref() == Some(pfad.as_str());
+                        if ui.selectable_label(ausgewaehlt, name).clicked() {
+                            gewaehlt = Some(pfad.clone());
+                        }
+                    }
+                });
+            self.video_auswahl = gewaehlt;
+            if ui.button("Video an").clicked() {
+                self.video_an();
+            }
+            if ui.button("Video aus").clicked() {
+                self.video_aus();
+            }
+            ui.label("fps");
+            if ui
+                .add(egui::Slider::new(&mut self.video_fps, 1..=30))
+                .changed()
+                && self.video_laeuft
+            {
+                if let Ok(app) = crate::current_app() {
+                    video::fps_setzen(&app, self.video_fps);
+                }
+            }
         });
 
         // Live-Textur nur, solange keine Auswahl steht und kein Scan laeuft.

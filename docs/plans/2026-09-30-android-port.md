@@ -342,10 +342,19 @@ Zusätzlich:
 - Rollback: Falls Camera2 über die Java-Brücke an Android-17-Fallen scheitert,
   Video-Dateien (S8) als Bildquelle nehmen und die Kamera später nachziehen.
 
-### S8: Video-Dateien + Feinschliff (Risiko: mittel)
-- Ziel: Videodateien via MediaCodec (oder ExoPlayer-Bridge) als Quelle,
-  SHM-Modus entfällt (intern), FPS-Regler, Akku-Sparmodus (Pacing wie Desktop).
-- Test: Gerät: Datei öffnen, 20 fps-Pacing (Log), CPU im Rahmen.
+### S8: Video-Dateien + Feinschliff (Risiko: mittel) — **Kern erledigt, verifiziert**
+- Ziel: Videodateien via MediaCodec als Quelle, FPS-Regler, Pacing.
+- Dateien: `android/app/src/main/java/org/jamcore/app/VideoBridge.java`
+  (MediaExtractor + MediaCodec, synchron, Endlosschleife per seekTo+flush),
+  `android/src/video.rs` (JNI), `android/src/image.rs` (Videoliste, fps-Regler).
+- Gerätetest (Pixel 10 Pro): Screencast-MP4 (H.264, 1080x2410) in den
+  App-Ordner `videos/` kopiert, im Bild-Tab gefunden und abgespielt —
+  Log `start ... (video/avc, 20 fps)`, Status `Frame 59 (1080x2410)`,
+  Bild in der Vorschau farbkorrekt. Die dekodierten Frames gehen durch
+  dieselbe Pipeline wie die Kamera (`camera::ablegen`).
+- Offen: Videos von außerhalb des App-Ordners brauchen SAF oder
+  READ_MEDIA_VIDEO; CPU-Messung steht aus; SHM/externe Bildausgabe entfällt
+  bewusst (die App zeigt selbst an).
 - Abhängig: S7.
 
 ### S2b: Ableton-Link-Spike (Risiko: hoch, zuerst!)

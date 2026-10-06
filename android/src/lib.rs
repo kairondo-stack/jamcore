@@ -11,6 +11,7 @@ mod paths;
 mod player;
 mod quint;
 mod rhythm;
+mod video;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -214,7 +215,7 @@ impl eframe::App for JamApp {
             if self.kamera_laeuft {
                 let (frames, breite, hoehe) = camera::stand();
                 if frames > 0 {
-                    log::info!("camera frames={frames} size={breite}x{hoehe}");
+                    log::info!("bild frames={frames} size={breite}x{hoehe}");
                 }
                 // Java meldet asynchrone Fehler (Kamera getrennt, onError)
                 // über status(); ohne diese Abfrage bliebe kamera_laeuft true.
