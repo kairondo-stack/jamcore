@@ -6,6 +6,7 @@ mod diary;
 mod image;
 mod insets;
 mod jniutil;
+mod klang;
 mod link_support;
 mod mic;
 mod osc;

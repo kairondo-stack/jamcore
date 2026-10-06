@@ -4,6 +4,7 @@
 
 pub mod diary;
 pub mod grid;
+pub mod klang;
 pub mod livescan;
 pub mod micbpm;
 pub mod openmpt;

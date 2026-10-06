@@ -9,6 +9,8 @@
 //! Der Austausch mit Renoise läuft über `jamcore::grid` (CSV wie im Desktop-
 //! Recorder, Clipboard-XML für den Import) und über OSC fürs sofortige Hören.
 
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Grid, RichText, Sense};
@@ -31,6 +33,13 @@ pub struct RhythmPanel {
     clock: Instant,
     status: String,
     dir: Option<String>,
+    /// "Rendern" (wie Taste o im Desktop-Recorder): Raster abspielen.
+    render_laeuft: bool,
+    render_stopp: Option<Arc<AtomicBool>>,
+    render_schritt: Arc<AtomicU16>,
+    render_thread: Option<std::thread::JoinHandle<()>>,
+    render_bpm: f32,
+    transport_mit: bool,
 }
 
 impl Default for RhythmPanel {
@@ -51,6 +60,12 @@ impl RhythmPanel {
             clock: Instant::now(),
             status: "Raster leer. Pad tippen legt eine Note auf den aktuellen Schritt.".to_string(),
             dir: None,
+            render_laeuft: false,
+            render_stopp: None,
+            render_schritt: Arc::new(AtomicU16::new(0)),
+            render_thread: None,
+            render_bpm: DEFAULT_BPM,
+            transport_mit: false,
         }
     }
 
@@ -79,7 +94,95 @@ impl RhythmPanel {
     }
 
     /// Eigene Uhr, wenn der Follow-Modus aus ist.
+    /// "Rendern" wie die Taste o im Desktop-Recorder: spielt das Raster in
+    /// Schleife im 16tel-Takt, sendet je Note `note_on` per OSC und lässt sie
+    /// lokal klingen. Optional startet/stoppt es den Renoise-Transport.
+    fn rendern_starten(&mut self) {
+        if self.render_laeuft {
+            return;
+        }
+        let noten: Vec<(u16, i32)> = self
+            .pattern
+            .notes()
+            .iter()
+            .map(|n| (n.step, n.pitch))
+            .collect();
+        if noten.is_empty() {
+            self.status = "Raster ist leer - nichts zu rendern.".to_string();
+            return;
+        }
+        let anzahl = noten.len();
+        let (host, port) = self.target.clone();
+        let bpm = self.render_bpm.max(20.0);
+        let transport = self.transport_mit;
+        let stopp = Arc::new(AtomicBool::new(false));
+        let schritt = Arc::new(AtomicU16::new(0));
+        let stopp_c = Arc::clone(&stopp);
+        let schritt_c = Arc::clone(&schritt);
+        let thread = std::thread::Builder::new()
+            .name("jam-render".to_string())
+            .spawn(move || {
+                let out = OscOut::new(&host, port).ok();
+                if transport {
+                    if let Some(o) = out.as_ref() {
+                        let _ = Renoise::new(o).transport_start(7000);
+                    }
+                }
+                let mut i: u16 = 0;
+                while !stopp_c.load(Ordering::Relaxed) {
+                    let start = Instant::now();
+                    for (s, pitch) in &noten {
+                        if *s == i {
+                            crate::klang::spielen(*pitch);
+                            if let Some(o) = out.as_ref() {
+                                let _ = Renoise::new(o).note_on(7000, *pitch, 100);
+                            }
+                        }
+                    }
+                    schritt_c.store(i, Ordering::Relaxed);
+                    i = (i + 1) % STEP_COUNT;
+                    // 16tel bei bpm: 60/bpm/4 Sekunden je Schritt.
+                    let ziel = (60_000.0 / bpm / 4.0) as u64;
+                    let rest = ziel.saturating_sub(start.elapsed().as_millis() as u64);
+                    std::thread::sleep(Duration::from_millis(rest));
+                }
+                if transport {
+                    if let Some(o) = out.as_ref() {
+                        let _ = Renoise::new(o).transport_stop(7000);
+                    }
+                }
+            });
+        match thread {
+            Ok(thread) => {
+                self.render_thread = Some(thread);
+                self.render_stopp = Some(stopp);
+                self.render_schritt = schritt;
+                self.render_laeuft = true;
+                self.status = format!("Rendern läuft ({anzahl} Noten, {bpm:.0} BPM)");
+                info!("rhythmus: Rendern gestartet ({anzahl} Noten)");
+            }
+            Err(e) => self.status = format!("Rendern-Thread: {e}"),
+        }
+    }
+
+    fn rendern_stoppen(&mut self) {
+        if let Some(stopp) = self.render_stopp.take() {
+            stopp.store(true, Ordering::Relaxed);
+        }
+        if let Some(thread) = self.render_thread.take() {
+            let _ = thread.join();
+        }
+        self.render_laeuft = false;
+        self.status = "Rendern gestoppt.".to_string();
+        info!("rhythmus: Rendern gestoppt");
+    }
+
     fn tick_own_clock(&mut self) {
+        // Beim Rendern zeigt der Playhead die laufende Abspielposition.
+        if self.render_laeuft {
+            self.current_step = self.render_schritt.load(Ordering::Relaxed) % STEP_COUNT;
+            return;
+        }
         if self.follow {
             return;
         }
@@ -118,6 +221,8 @@ impl RhythmPanel {
         let added = self.pattern.toggle(step, pitch);
         if added {
             self.play(pitch, self.velocity);
+            // Der Ton klingt auch lokal (im Demo-Video hörbar).
+            crate::klang::spielen(pitch);
             self.status = format!(
                 "Schritt {}: {} ({} Noten)",
                 step + 1,
@@ -256,6 +361,24 @@ impl RhythmPanel {
             if ui.button("Vel +").clicked() {
                 self.velocity = (self.velocity + 10).min(127);
             }
+        });
+        ui.horizontal(|ui| {
+            // "Rendern" wie Taste o im Desktop-Recorder: Raster abspielen.
+            if self.render_laeuft {
+                if ui.button("Rendern stoppen").clicked() {
+                    self.rendern_stoppen();
+                }
+                ui.label(
+                    RichText::new(format!("läuft, Schritt {}", self.current_step + 1))
+                        .strong()
+                        .color(Color32::from_rgb(90, 200, 120)),
+                );
+            } else if ui.button("Rendern").clicked() {
+                self.rendern_starten();
+            }
+            ui.label("BPM");
+            ui.add(egui::Slider::new(&mut self.render_bpm, 40.0..=220.0));
+            ui.checkbox(&mut self.transport_mit, "Transport");
         });
 
         // 16 Spalten passen nicht nebeneinander auf die Handy-Breite, deshalb
