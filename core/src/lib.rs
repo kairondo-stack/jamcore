@@ -6,6 +6,7 @@ pub mod diary;
 pub mod grid;
 pub mod klang;
 pub mod livescan;
+pub mod maske;
 pub mod micbpm;
 pub mod openmpt;
 pub mod osc;

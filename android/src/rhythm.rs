@@ -105,7 +105,8 @@ impl RhythmPanel {
         &self.slots[self.slot.min(self.slots.len().saturating_sub(1))]
     }
 
-    fn pattern_mut(&mut self) -> &mut Pattern {
+    /// Aktuelles Raster veraenderbar (fuer die Takt-Maske).
+    pub fn pattern_mut(&mut self) -> &mut Pattern {
         let slot = self.slot.min(self.slots.len().saturating_sub(1));
         &mut self.slots[slot]
     }

@@ -8,6 +8,7 @@ mod insets;
 mod jniutil;
 mod klang;
 mod link_support;
+mod maske;
 mod mic;
 mod osc;
 mod paths;
@@ -44,6 +45,7 @@ enum Tab {
     Kreis,
     Session,
     Tagebuch,
+    Maske,
 }
 
 struct JamApp {
@@ -70,6 +72,7 @@ struct JamApp {
     link_aktiv: bool,
     multicast_aktiv: bool,
     diary: diary::DiaryPanel,
+    maske: maske::MaskePanel,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -101,6 +104,7 @@ impl Default for JamApp {
             link_aktiv: true,
             multicast_aktiv: false,
             diary: diary::DiaryPanel::default(),
+            maske: maske::MaskePanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -281,6 +285,7 @@ impl eframe::App for JamApp {
                     ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
                     ui.selectable_value(&mut self.tab, Tab::Session, "Session");
                     ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
+                    ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
                 });
             });
             ui.add_space(4.0);
@@ -307,6 +312,7 @@ impl eframe::App for JamApp {
             Tab::Kreis => self.view_kreis(ui),
             Tab::Session => self.view_session(ui),
             Tab::Tagebuch => self.view_tagebuch(ui),
+            Tab::Maske => self.view_maske(ui),
         }
     }
 }
@@ -358,6 +364,10 @@ impl JamApp {
                 }
             }
         });
+    }
+
+    fn view_maske(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| self.maske.ui(ui, self.rhythm.pattern_mut()));
     }
 
     fn view_tagebuch(&mut self, ui: &mut egui::Ui) {
