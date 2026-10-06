@@ -44,6 +44,8 @@ pub struct RhythmPanel {
     transport_mit: bool,
     /// Aufnahme: Pad-Tipps landen auf dem laufenden Render-Schritt.
     aufnahme: bool,
+    /// Presenter-Ansicht (wie Taste J im Desktop-Recorder).
+    presenter: bool,
     /// Skalenfilter fuer gesetzte Toene (0 = aus).
     skala: usize,
     grundton: i32,
@@ -75,6 +77,7 @@ impl RhythmPanel {
             render_bpm: DEFAULT_BPM,
             transport_mit: false,
             aufnahme: false,
+            presenter: false,
             skala: 0,
             grundton: 60,
         }
@@ -267,6 +270,67 @@ impl RhythmPanel {
             "Pattern {}: {} Noten",
             self.slot + 1,
             self.pattern().notes().len()
+        );
+    }
+
+    /// Presenter-Ansicht wie die Taste J im Desktop-Recorder: Tempo groß,
+    /// Notenliste und eine Zeitachse mit allen Noten (x = Schritt, y = Tonhöhe).
+    fn presenter_zeichnen(&mut self, ui: &mut egui::Ui) {
+        use egui::{pos2, Color32, Stroke};
+
+        ui.separator();
+        ui.label(
+            RichText::new(format!("{:.0} BPM", self.render_bpm))
+                .size(26.0)
+                .strong(),
+        );
+        let noten: Vec<(u16, i32, String)> = self
+            .pattern()
+            .notes()
+            .iter()
+            .map(|n| (n.step, n.pitch, note_name(n.pitch)))
+            .collect();
+        let liste: Vec<&str> = noten.iter().map(|(_, _, name)| name.as_str()).collect();
+        ui.label(format!(
+            "Noten: {} (Pattern {})",
+            if liste.is_empty() {
+                "—".to_string()
+            } else {
+                liste.join(" ")
+            },
+            self.slot + 1
+        ));
+
+        let breite = ui.available_width();
+        let hoehe = 130.0;
+        let (response, painter) =
+            ui.allocate_painter(egui::vec2(breite, hoehe), egui::Sense::hover());
+        let rect = response.rect;
+        let grau = Color32::from_rgb(60, 60, 66);
+        // Rasterlinien alle vier Schritte.
+        for s in (0..=STEP_COUNT).step_by(4) {
+            let x = rect.left() + breite * s as f32 / STEP_COUNT as f32;
+            painter.line_segment(
+                [pos2(x, rect.top()), pos2(x, rect.bottom())],
+                Stroke::new(1.0, grau),
+            );
+        }
+        if !noten.is_empty() {
+            let (min_p, max_p) = noten
+                .iter()
+                .fold((127, 0), |(mn, mx), (_, p, _)| (mn.min(*p), mx.max(*p)));
+            let spanne = (max_p - min_p).max(1) as f32;
+            for (step, pitch, _) in &noten {
+                let x = rect.left() + breite * *step as f32 / STEP_COUNT as f32;
+                let y = rect.bottom() - (*pitch - min_p) as f32 / spanne * (hoehe - 16.0) - 8.0;
+                painter.circle_filled(pos2(x, y), 5.0, Color32::from_rgb(90, 200, 120));
+            }
+        }
+        // Abspielposition.
+        let x = rect.left() + breite * self.current_step as f32 / STEP_COUNT as f32;
+        painter.line_segment(
+            [pos2(x, rect.top()), pos2(x, rect.bottom())],
+            Stroke::new(2.0, Color32::from_rgb(245, 245, 255)),
         );
     }
 
@@ -521,7 +585,12 @@ impl RhythmPanel {
                 ui.label(format!("Grundton {}", note_name(self.grundton)));
                 ui.add(egui::Slider::new(&mut self.grundton, 48..=72));
             }
+            ui.checkbox(&mut self.presenter, "Presenter");
         });
+
+        if self.presenter {
+            self.presenter_zeichnen(ui);
+        }
 
         // 16 Spalten passen nicht nebeneinander auf die Handy-Breite, deshalb
         // zwei Bloecke a 8 Schritte mit grossen Zellen zum Tippen.
