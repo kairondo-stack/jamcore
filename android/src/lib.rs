@@ -54,6 +54,9 @@ struct JamApp {
     mic: mic::MicPanel,
     last_peak: f32,
     last_report: Instant,
+    /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
+    link: jamcore::rusty_link::AblLink,
+    link_report: Instant,
 }
 
 impl Default for JamApp {
@@ -75,6 +78,13 @@ impl Default for JamApp {
             mic: mic::MicPanel::default(),
             last_peak: 0.0,
             last_report: Instant::now(),
+            link: {
+                let link = jamcore::rusty_link::AblLink::new(120.0);
+                link.enable(true);
+                log::info!("link session gestartet (tempo=120)");
+                link
+            },
+            link_report: Instant::now(),
         }
     }
 }
@@ -178,6 +188,24 @@ fn file_name(path: &std::path::Path) -> String {
 
 impl eframe::App for JamApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // S2b-Spike: einmal pro Sekunde den Link-Zustand ins Log, damit der
+        // Gerätetest ohne UI-Arbeit belegt, dass die Session lebt.
+        if self.link_report.elapsed() >= std::time::Duration::from_secs(1) {
+            let mut session = jamcore::rusty_link::SessionState::new();
+            self.link.capture_app_session_state(&mut session);
+            log::info!(
+                "link tempo={:.2} peers={} beat={:.3}",
+                session.tempo(),
+                self.link.num_peers(),
+                session.beat_at_time(self.link.clock_micros(), 4.0)
+            );
+            self.link_report = Instant::now();
+        }
+        // Ohne Ereignisse zeichnet egui nicht neu; fuer den Spike-Takt (und
+        // spaeter fuer Live-Anzeigen) mindestens einmal pro Sekunde.
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_secs(1));
+
         let px = self.insets_px();
         if px.is_none() {
             ui.ctx().request_repaint();

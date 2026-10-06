@@ -318,10 +318,28 @@ Zusätzlich:
   (Start 140 BPM) übernimmt innerhalb < 1 s (`peers=1, tempo=100.00`).
 - Phase: für Sample-genaue Sync im Audio-Callback `capture_audio_session_state`
   nutzen (LinkHut-Muster), nicht den App-State-Poll.
-- **Android-TODO:** NDK-Build steht aus (braucht Android-SDK/NDK, S2). SDK ist
-  quelloffen und Android-fähig; voraussichtlich kleine Anpassung nötig, damit
-  die C++-Runtime verlinkt wird (Android: `c++_shared` statt `stdc++`) —
-  Workaround über `build.rs` in `jamcore` (target_os="android").
+- **Ergebnis Android-Spike (2026-10-06): bestanden.**
+  - `android/Cargo.toml` bindet `jamcore` mit Feature `link` ein; das Link-SDK
+    kompiliert für arm64-v8a (APK 30 MB).
+  - Zwei Ergänzungen in `android/`: `link-android-toolchain.cmake` +
+    `link_shim/android-link.cmake` setzen `LINK_PLATFORM_LINUX=1` (Android ist
+    für Link Linux) über `CMAKE_PROJECT_INCLUDE`; ein Erweitern von
+    `CMAKE_CXX_FLAGS` in der Toolchain-Datei wird von der cmake-Kiste
+    überschrieben, `CMAKE_PROJECT_INCLUDE` läuft nach `project()`. Dazu
+    `link_shim/htonll.h`, weil Bionic kein `htonll` hat (glibc-Erweiterung).
+    `build-apk.sh` exportiert `CMAKE_TOOLCHAIN_FILE` (die cmake-Kiste liest die
+    Umgebungsvariable).
+  - **Falle:** CMake lädt die Toolchain-Datei nur beim ersten Configure; ein
+    vorhandenes `android/target/<triple>/release/build/rusty_link-*` ignoriert
+    sie (Cache hält den alten, leeren Pfad). Bei Änderungen daran löschen.
+  - Gerätetest (Pixel 10 Pro): Log `link session gestartet (tempo=120)` und
+    `link tempo=120.00 peers=0 beat=…`; die Beat-Differenz ist exakt 2,0
+    Beats/s = 120 BPM, kein Absturz.
+  - Offen für S9 (bewusst nicht Spike): Multicast-Peers brauchen ein
+    gemeinsames Netz **und** auf Android ein `WifiManager.MulticastLock`
+    (Java-API), sonst kommen die Multicast-Pakete nicht an; phasegenaue
+    Übernahme gehört in den Audio-Callback (`capture_audio_session_state`,
+    LinkHut-Muster); das Spike-Logging wird bei der UI-Integration ersetzt.
 
 ### S9: Session/Jam-Modul (Risiko: mittel)
 - Ziel: Tempo/Phase über Link teilen; Noten live, Patterns senden.

@@ -102,6 +102,16 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 - **Format-Strings und negative Zahlen**: `format!("-{octave}")` mit `octave = -1`
   ergibt `"--1"` (das `-` ist Text, der Wert bringt sein eigenes Minus mit).
   Bei der Oktave einfach `octave.to_string()` verwenden.
+- **Ableton-Link auf Android**: Das Link-SDK kennt Android nicht als Plattform
+  (nur Windows/macOS/Linux; kein `LINK_PLATFORM_ANDROID`). Nötig sind
+  `LINK_PLATFORM_LINUX=1` und ein `htonll`-Shim (Bionic hat es nicht), gesetzt
+  über `CMAKE_PROJECT_INCLUDE` aus `android/link_shim/` – ein Erweitern von
+  `CMAKE_CXX_FLAGS` in der Toolchain-Datei wird von der cmake-Kiste
+  überschrieben. `CMAKE_TOOLCHAIN_FILE` muss als Umgebungsvariable gesetzt
+  sein (macht `build-apk.sh`). Nach Toolchain-Änderungen
+  `android/target/<triple>/release/build/rusty_link-*` löschen, sonst lädt
+  CMake die Toolchain nicht nach (Cache). Für Peers fehlt noch ein
+  `WifiManager.MulticastLock` (Java), sonst kommen Multicast-Pakete nicht an.
 - **Clippy in der Nix-Shell**: nix liefert rustc/cargo 1.97, der rustup-Shim
   `clippy-driver` ist 1.99 → `E0514 found crate compiled by an incompatible
   version of rustc`. Workaround: `~/.rustup/toolchains/stable-*/bin` vorn in den
@@ -113,5 +123,5 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 
 ## Zustand
 
-Siehe `docs/plans/2026-09-30-android-port.md` (S1–S6 fertig und auf
-Gerät verifiziert, S2b/S7–S12 offen) und `git log`.
+Siehe `docs/plans/2026-09-30-android-port.md` (S1–S6 fertig, S2b-Spike bestanden, auf
+Gerät verifiziert; S7–S12 offen) und `git log`.

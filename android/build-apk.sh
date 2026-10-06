@@ -9,6 +9,11 @@ export PATH="$HOME/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin:$PATH"
 export RUSTC_WRAPPER=
 export CARGO_BUILD_JOBS="$(nproc)"
 
+# Ableton-Link (rusty_link) baut sein C++-SDK per CMake mit. Android gilt dort
+# nicht als Linux-Plattform und Bionic hat kein htonll; beides ergaenzt die
+# Toolchain-Datei (die cmake-Kiste liest CMAKE_TOOLCHAIN_FILE aus der Umgebung).
+export CMAKE_TOOLCHAIN_FILE="$(pwd)/link-android-toolchain.cmake"
+
 cargo ndk -t arm64-v8a --platform 26 -o app/src/main/jniLibs build --release
 
 for cxx in "$ANDROID_NDK_HOME"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so; do

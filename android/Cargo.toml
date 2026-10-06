@@ -17,7 +17,7 @@ eframe = { version = "0.36", default-features = false, features = [
     "wayland",
     "x11",
 ] }
-jamcore = { path = "../core" }
+jamcore = { path = "../core", features = ["link"] }
 rosc = "0.9"
 log = "0.4"
 
