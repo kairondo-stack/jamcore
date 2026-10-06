@@ -49,7 +49,11 @@ pub fn naechster_beat(beat: f64, quantum: f64) -> f64 {
 
 /// Wartezeit bis zum nächsten Beat in Sekunden (0.0, wenn schon drauf).
 pub fn wartezeit_bis_beat(beat: f64, quantum: f64, bpm: f64) -> f64 {
-    let bpm = if bpm.is_finite() && bpm > 0.0 { bpm } else { 120.0 };
+    let bpm = if bpm.is_finite() && bpm > 0.0 {
+        bpm
+    } else {
+        120.0
+    };
     let delta = naechster_beat(beat, quantum) - beat;
     (delta.max(0.0)) * 60.0 / bpm
 }

@@ -19,6 +19,8 @@ pub struct Entry {
     pub bpm: Option<f32>,
     pub notiz: String,
     pub noten: Pattern,
+    /// Dateiname einer Kameraaufnahme (Video mit Ton) im selben Ordner.
+    pub video: Option<String>,
 }
 
 impl Entry {
@@ -29,6 +31,7 @@ impl Entry {
             bpm: None,
             notiz: String::new(),
             noten: Pattern::new(),
+            video: None,
         }
     }
 
@@ -47,6 +50,9 @@ impl Entry {
             self.bpm.map(|b| format!("{b}")).unwrap_or_default()
         );
         s += &format!("notiz={}\n", self.notiz.replace('\n', "\\n"));
+        if let Some(video) = &self.video {
+            s += &format!("video={video}\n");
+        }
         s += "noten:\n";
         s += &self.noten.to_csv();
         s
@@ -63,6 +69,7 @@ impl Entry {
         let mut name = String::new();
         let mut bpm = None;
         let mut notiz = String::new();
+        let mut video = None;
         let mut noten_text = String::new();
         let mut bei_noten = false;
         for zeile in zeilen {
@@ -89,6 +96,7 @@ impl Entry {
                     }
                 }
                 "notiz" => notiz = wert.replace("\\n", "\n"),
+                "video" => video = Some(wert.to_string()),
                 anderes => return Err(format!("unbekannter Schlüssel: {anderes:?}")),
             }
         }
@@ -100,6 +108,7 @@ impl Entry {
             name,
             bpm,
             notiz,
+            video,
             noten: Pattern::from_csv(&noten_text, crate::grid::STEPS_PER_CYCLE)?,
         })
     }
@@ -164,6 +173,17 @@ mod tests {
     }
 
     #[test]
+    fn video_dateiname_ueberlebt_den_roundtrip() {
+        let mut e = beispiel();
+        e.video = Some("demo.mp4".to_string());
+        let text = e.to_text();
+        assert!(text.contains("video=demo.mp4"), "{text}");
+        let gelesen = Entry::from_text(&text).expect("lesbar");
+        assert_eq!(gelesen.video.as_deref(), Some("demo.mp4"));
+        assert_eq!(gelesen, e);
+    }
+
+    #[test]
     fn text_ohne_bpm_und_notiz_geht_auch() {
         let e = Entry::neu(0, "leer");
         let gelesen = Entry::from_text(&e.to_text()).expect("lesbar");
@@ -175,7 +195,10 @@ mod tests {
     fn kaputte_dateien_werden_gemeldet() {
         assert!(Entry::from_text("Quatsch\n").is_err());
         assert!(Entry::from_text("JamCore-Tagebuch v1\nzeit=abc\nnoten:\n").is_err());
-        assert!(Entry::from_text("JamCore-Tagebuch v1\nzeit=1\n").is_err(), "noten fehlt");
+        assert!(
+            Entry::from_text("JamCore-Tagebuch v1\nzeit=1\n").is_err(),
+            "noten fehlt"
+        );
         assert!(
             Entry::from_text("JamCore-Tagebuch v1\nzeit=1\ntier=hund\nnoten:\n").is_err(),
             "unbekannter Schlüssel"
