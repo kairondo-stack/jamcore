@@ -325,8 +325,17 @@ Zusätzlich:
     Statuszeile und „Notenklassen“ zeigen die Harmonie
     (`core::quint::note_classes`). Gerätetest: `quint: Note 60 (Klasse 0)`,
     Segment hellblau, Klassen `[0]`; zweites Segment → `[0, 6]`.
-  - **S7e** Live-Scan mit `livescan` (frei/Takt/Palette) + OSC-Notenausgabe;
-    Gerätetest: Log `Sweep beendet, N Noten, N gezeichnet`.
+  - **S7e erledigt (2026-10-06), Palette offen:** Live-Scan über die Spalten
+    (Schrittweite 2). „frei“ mit fester Spaltenrate, „Takt“ macht einen Sweep
+    pro Beat (BPM-Regler; Kopplung an Modul/Tempo-Tab offen). Treffer werden
+    in ihrer Farbe in den Sweep-Puffer gezeichnet (nur sie leuchten), der
+    Notenwert kommt aus der Zeile (oben hoch, unten tief, 36..72), die
+    Sendefrequenz ist über „Noten/s“ begrenzt (`note_allowed`), OSC geht an
+    Port 7000 über die Basis des OSC-Tabs. Gerätetest: Logs
+    `Scan-Note 65 -> 127.0.0.1:7003` und `Sweep beendet, 6 Noten, 38340
+    gezeichnet (frei)`; im Takt-Modus 0,51 s je Sweep bei 120 BPM.
+    **Palette-Modus offen:** er braucht das „Malen“ (zweiter Puffer), das die
+    App noch nicht hat.
 - Test: Unit: `yuv`, `livescan`, `quint` (core); Gerät: Kamera auf farbige
   Fläche halten, Sweep-Log, OSC-Mitschnitt am Laptop.
 - Abhängig: S2, S4.

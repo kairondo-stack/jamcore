@@ -343,6 +343,8 @@ impl JamApp {
     }
 
     fn view_bild(&mut self, ui: &mut egui::Ui) {
+        let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+        self.bild.set_target(&host, &port);
         egui::CentralPanel::default().show(ui, |ui| self.bild.ui(ui));
     }
 

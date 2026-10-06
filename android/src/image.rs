@@ -10,7 +10,8 @@
 
 use eframe::egui::{self, Color32, TextureOptions};
 
-use jamcore::livescan::{pixel_matches, ScanFilter};
+use jamcore::livescan::{next_column, note_allowed, pixel_matches, scan_column, ScanFilter};
+use jamcore::osc::{OscOut, Renoise};
 
 use crate::camera;
 
@@ -29,6 +30,19 @@ pub struct ImagePanel {
     toleranz: i32,
     treffer: u64,
     status: String,
+    /// Live-Scan (S7e): Sweep ueber die Spalten, Treffer als OSC-Noten.
+    scan_an: bool,
+    scan_takt: bool,
+    scan_bpm: f32,
+    scan_x: i32,
+    scan_puffer: Option<(usize, usize, Vec<u8>)>,
+    scan_naechste_spalte: std::time::Instant,
+    scan_letzte_note: std::time::Instant,
+    scan_max_noten: u32,
+    sweep_noten: u64,
+    sweep_gezeichnet: u64,
+    host: String,
+    port: String,
 }
 
 impl Default for ImagePanel {
@@ -49,6 +63,36 @@ impl ImagePanel {
             toleranz: TOLERANZ_STANDARD,
             treffer: 0,
             status: "Kamera starten, dann ins Bild tippen (halten = einfrieren).".to_string(),
+            scan_an: false,
+            scan_takt: false,
+            scan_bpm: 120.0,
+            scan_x: 0,
+            scan_puffer: None,
+            scan_naechste_spalte: std::time::Instant::now(),
+            scan_letzte_note: std::time::Instant::now(),
+            scan_max_noten: 8,
+            sweep_noten: 0,
+            sweep_gezeichnet: 0,
+            host: jamcore::osc::DEFAULT_HOST.to_string(),
+            port: jamcore::osc::DEFAULT_BASE_PORT.to_string(),
+        }
+    }
+
+    pub fn set_target(&mut self, host: &str, port: &str) {
+        self.host = host.trim().to_string();
+        self.port = port.trim().to_string();
+    }
+
+    fn note_senden(&mut self, note: i32, volume: i32) {
+        let (host, port) = (
+            self.host.clone(),
+            self.port.parse().unwrap_or(jamcore::osc::DEFAULT_BASE_PORT),
+        );
+        match OscOut::new(&host, port)
+            .and_then(|out| Renoise::new(&out).note_on(7000, note, volume))
+        {
+            Ok(used) => log::info!("bild: Scan-Note {note} -> {host}:{used}"),
+            Err(e) => self.status = format!("OSC-Fehler: {e}"),
         }
     }
 
@@ -128,6 +172,94 @@ impl ImagePanel {
         self.textur_setzen(ctx, w, h, &bild);
     }
 
+    /// Ein Sweep-Schritt: Spalten scannen, Treffer als OSC-Noten senden.
+    ///
+    /// Wie im Desktop-rrn5: "frei" laeuft mit fester Spaltenrate, "Takt" macht
+    /// einen vollen Durchlauf in einem Beat. Notenwert aus der Zeile
+    /// (oben hoch, unten tief), Lautstaerke 127, Rate ueber `scan_max_noten`.
+    fn scan_schritt(&mut self, ctx: &egui::Context) {
+        if !self.scan_an {
+            return;
+        }
+        let Some(sel) = self.sel else {
+            return;
+        };
+        let Some((w, h, live)) = camera::letztes_bild() else {
+            return;
+        };
+        let (wi, hi) = (w as i32, h as i32);
+        let schritt = 2;
+        let schritte = ((wi + schritt - 1) / schritt).max(1) as i64;
+        let spalten_ns: i64 = if self.scan_takt {
+            // Ein voller Sweep dauert einen Beat; die Spaltenzahl richtet
+            // sich nach der Schrittweite, sonst waere der Sweep zu kurz.
+            ((60.0 / self.scan_bpm.max(20.0) * 1.0e9) as i64 / schritte).max(1)
+        } else {
+            2_500_000
+        };
+        let budget = std::time::Duration::from_millis(10);
+        let start = std::time::Instant::now();
+        let filter = ScanFilter {
+            bg: self.bg,
+            sel,
+            range: (self.toleranz, self.toleranz, self.toleranz),
+        };
+        let mut noten: Vec<i32> = Vec::new();
+        while start.elapsed() < budget {
+            let jetzt = std::time::Instant::now();
+            if jetzt < self.scan_naechste_spalte {
+                std::thread::sleep(self.scan_naechste_spalte - jetzt);
+                continue;
+            }
+            if self.scan_x == 0 {
+                // Sweep beginnt: Puffer leeren (nur die Treffer leuchten).
+                self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
+            }
+            let x = self.scan_x.clamp(0, wi - 1);
+            let treffer = scan_column(&live, wi, hi, x, &filter, None);
+            if let Some((_, _, puffer)) = self.scan_puffer.as_mut() {
+                for (y, r, g, b) in &treffer {
+                    let idx = (*y as usize) * w + x as usize;
+                    let idx = idx * 4;
+                    if idx + 2 < puffer.len() {
+                        // "gezeichnet": Treffer in ihrer Farbe in den Puffer.
+                        puffer[idx] = *r;
+                        puffer[idx + 1] = *g;
+                        puffer[idx + 2] = *b;
+                        puffer[idx + 3] = 255;
+                        // Note aus der Zeile: oben hoch, unten tief.
+                        noten.push(72 - (*y * 36 / hi.max(1)));
+                        self.sweep_gezeichnet += 1;
+                    }
+                }
+            }
+            for note in noten.drain(..) {
+                if note_allowed(self.scan_letzte_note.elapsed(), self.scan_max_noten) {
+                    self.scan_letzte_note = std::time::Instant::now();
+                    self.note_senden(note, 127);
+                    self.sweep_noten += 1;
+                }
+            }
+            let next = next_column(x, 0, wi, schritt);
+            if next == 0 {
+                log::info!(
+                    "bild: Sweep beendet, {} Noten, {} gezeichnet ({})",
+                    self.sweep_noten,
+                    self.sweep_gezeichnet,
+                    if self.scan_takt { "Takt" } else { "frei" }
+                );
+                self.sweep_noten = 0;
+                self.sweep_gezeichnet = 0;
+                self.scan_puffer = None;
+            }
+            self.scan_x = next;
+            self.scan_naechste_spalte += std::time::Duration::from_nanos(spalten_ns.max(1) as u64);
+        }
+        if let Some((w, h, puffer)) = self.scan_puffer.clone() {
+            self.textur_setzen(ctx, w, h, &puffer);
+        }
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         // ~20 Bilder je Sekunde reichen fuer die Vorschau und sparen Strom.
         ui.ctx()
@@ -142,17 +274,50 @@ impl ImagePanel {
             }
             ui.label(&self.status);
         });
+        ui.horizontal(|ui| {
+            if ui
+                .button(if self.scan_an { "Scan aus" } else { "Scan an" })
+                .clicked()
+            {
+                self.scan_an = !self.scan_an;
+                self.scan_puffer = None;
+                self.scan_x = 0;
+                self.status = format!(
+                    "Scan {} ({}), {} Noten/s",
+                    if self.scan_an { "an" } else { "aus" },
+                    if self.scan_takt { "Takt" } else { "frei" },
+                    self.scan_max_noten
+                );
+            }
+            if ui
+                .button(if self.scan_takt { "Takt" } else { "frei" })
+                .clicked()
+            {
+                self.scan_takt = !self.scan_takt;
+            }
+            ui.label("Noten/s");
+            ui.add(egui::Slider::new(&mut self.scan_max_noten, 1..=30));
+            if self.scan_takt {
+                ui.label("BPM");
+                ui.add(egui::Slider::new(&mut self.scan_bpm, 60.0..=180.0));
+            }
+            ui.label(format!(
+                "Sweep: {} Noten, {} gezeichnet",
+                self.sweep_noten, self.sweep_gezeichnet
+            ));
+        });
 
-        // Live-Textur nur, solange keine Auswahl steht. Eine Auswahl friert
-        // die Anzeige ein (wie der gedrueckte Linksklick im Original).
+        // Live-Textur nur, solange keine Auswahl steht und kein Scan laeuft.
         let (nummer, _, _) = camera::stand();
-        if self.sel.is_none() && nummer != self.letzte_nummer {
+        if !self.scan_an && self.sel.is_none() && nummer != self.letzte_nummer {
             if let Some((w, h, rgba)) = camera::letztes_bild() {
                 self.textur_setzen(ui.ctx(), w, h, &rgba);
                 self.letzte_nummer = nummer;
                 self.status = format!("Frame {nummer} ({w}x{h})");
             }
         }
+
+        self.scan_schritt(ui.ctx());
 
         let (w, h) = self.textur_masse;
         if let Some(texture) = self.texture.clone() {
