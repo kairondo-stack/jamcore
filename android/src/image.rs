@@ -45,6 +45,11 @@ pub struct ImagePanel {
     /// Merker: gemalte Pixel in Originalfarbe (RGBA).
     mal_puffer: Vec<u8>,
     mal_masse: (usize, usize),
+    /// Radieren: Treffer aus dem Merker loeschen statt merken.
+    radieren: bool,
+    /// Takt-Maske (biialpha): welche der 16 Sweep-Abschnitte durchkommen.
+    maske_an: bool,
+    maske: [bool; 16],
     /// Live-Scan (S7e): Sweep ueber die Spalten, Treffer als OSC-Noten.
     scan_an: bool,
     scan_takt: bool,
@@ -90,6 +95,9 @@ impl ImagePanel {
             palette_scan: false,
             mal_puffer: Vec::new(),
             mal_masse: (0, 0),
+            radieren: false,
+            maske_an: false,
+            maske: [true; 16],
             scan_an: false,
             scan_takt: false,
             scan_bpm: 120.0,
@@ -280,10 +288,18 @@ impl ImagePanel {
                         self.mal_masse = (w, h);
                     }
                     if idx + 3 < self.mal_puffer.len() {
-                        self.mal_puffer[idx] = r;
-                        self.mal_puffer[idx + 1] = g;
-                        self.mal_puffer[idx + 2] = b;
-                        self.mal_puffer[idx + 3] = 255;
+                        if self.radieren {
+                            // Radieren: die Stelle im Merker loeschen.
+                            self.mal_puffer[idx] = 0;
+                            self.mal_puffer[idx + 1] = 0;
+                            self.mal_puffer[idx + 2] = 0;
+                            self.mal_puffer[idx + 3] = 255;
+                        } else {
+                            self.mal_puffer[idx] = r;
+                            self.mal_puffer[idx + 1] = g;
+                            self.mal_puffer[idx + 2] = b;
+                            self.mal_puffer[idx + 3] = 255;
+                        }
                     }
                 }
                 bild[idx] = 20;
@@ -348,7 +364,23 @@ impl ImagePanel {
                 self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
             }
             let x = self.scan_x.clamp(0, wi - 1);
-            let treffer = scan_column(&live, wi, hi, x, &filter, palette.as_ref());
+            // Takt-Maske (biialpha): abschnittsweise entscheiden, welche
+            // Spalten durchkommen. Sechzehn Abschnitte ueber die Breite.
+            let alpha = if self.maske_an {
+                let abschnitt = ((x * 16) / wi.max(1)).clamp(0, 15) as usize;
+                if self.maske[abschnitt] {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                1.0
+            };
+            let treffer = if alpha > 0.0 {
+                scan_column(&live, wi, hi, x, &filter, palette.as_ref())
+            } else {
+                Vec::new()
+            };
             if let Some((_, _, puffer)) = self.scan_puffer.as_mut() {
                 for (y, r, g, b) in &treffer {
                     let idx = (*y as usize) * w + x as usize;
@@ -609,6 +641,7 @@ impl ImagePanel {
         ui.horizontal(|ui| {
             // Malen/Merken und Palette-Scan wie das zweite Fenster im Desktop.
             ui.checkbox(&mut self.malen_an, "Malen (merken)");
+            ui.checkbox(&mut self.radieren, "Radieren");
             ui.checkbox(&mut self.palette_scan, "Palette-Scan");
             if self.mal_masse != (0, 0) {
                 let farben = build_palette(
@@ -638,5 +671,31 @@ impl ImagePanel {
                 self.markieren(&ctx);
             }
         });
+        ui.horizontal(|ui| {
+            // Takt-Maske (biialpha): Rhythmische Abschnitte des Sweeps an/aus.
+            ui.checkbox(&mut self.maske_an, "Takt-Maske");
+            ui.label(
+                egui::RichText::new("Abschnitte: grün = kommt durch")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
+        if self.maske_an {
+            ui.horizontal(|ui| {
+                for i in 0..16usize {
+                    let (rect, resp) =
+                        ui.allocate_exact_size(egui::vec2(16.0, 22.0), egui::Sense::click());
+                    let farbe = if self.maske[i] {
+                        Color32::from_rgb(90, 200, 120)
+                    } else {
+                        Color32::from_rgb(45, 48, 58)
+                    };
+                    ui.painter().rect_filled(rect, 2.0, farbe);
+                    if resp.clicked() {
+                        self.maske[i] = !self.maske[i];
+                    }
+                }
+            });
+        }
     }
 }
