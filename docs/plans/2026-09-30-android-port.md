@@ -313,7 +313,13 @@ Zusätzlich:
     YUV-Konvertierung stimmt auf echter Hardware. Die Tab-Leiste ist jetzt
     seitlich wischbar (sechs Tabs). Offen für S7d/S7e: Auswahl, Malen,
     Live-Scan, Quintenzirkel, OSC.
-  - **S7d** Touch: Finger einfrieren, Ziehen malen, Quintenzirkel-Scheibe.
+  - **S7d-a erledigt (2026-10-06):** Finger auf der Vorschau halten = Bild
+    einfrieren + Farbe unter dem Finger; Ziehen wandert die Auswahl; alle
+    Pixel in Toleranzweite werden markiert (grün) und gezählt, Toleranz-Regler
+    und Hintergrundfarbe sichtbar, „Auswahl löschen“ gibt die Live-Anzeige
+    wieder frei. Gerätetest: `bild: Auswahl RGB(47, 45, 40), 108174 Pixel`,
+    Markierung im Screenshot deutlich sichtbar.
+  - **S7d-b offen:** Quintenzirkel als Touch-Scheibe (`core::quint`).
   - **S7e** Live-Scan mit `livescan` (frei/Takt/Palette) + OSC-Notenausgabe;
     Gerätetest: Log `Sweep beendet, N Noten, N gezeichnet`.
 - Test: Unit: `yuv`, `livescan`, `quint` (core); Gerät: Kamera auf farbige
