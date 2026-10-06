@@ -11,6 +11,7 @@ mod paths;
 mod player;
 mod quint;
 mod rhythm;
+mod session_ui;
 mod video;
 
 use std::path::PathBuf;
@@ -38,6 +39,7 @@ enum Tab {
     Tempo,
     Bild,
     Kreis,
+    Session,
 }
 
 struct JamApp {
@@ -60,6 +62,8 @@ struct JamApp {
     mic: mic::MicPanel,
     bild: image::ImagePanel,
     kreis: quint::QuintPanel,
+    session: session_ui::SessionPanel,
+    link_aktiv: bool,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -87,6 +91,8 @@ impl Default for JamApp {
             mic: mic::MicPanel::default(),
             bild: image::ImagePanel::default(),
             kreis: quint::QuintPanel::default(),
+            session: session_ui::SessionPanel::default(),
+            link_aktiv: true,
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -246,21 +252,18 @@ impl eframe::App for JamApp {
             ui.add_space(top);
             ui.horizontal(|ui| {
                 ui.heading("JamCore");
-                // Sechs Tabs passen nicht mehr nebeneinander; die Leiste
-                // laesst sich seitlich wischen.
-                egui::ScrollArea::horizontal()
-                    .id_salt("tabs")
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
-                            ui.selectable_value(&mut self.tab, Tab::Player, "Player");
-                            ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
-                            ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
-                            ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
-                            ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
-                            ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
-                        });
-                    });
+                // Acht Tabs passen nicht in eine Zeile; sie brechen um. Eine
+                // scrollende Leiste war auf dem Touchscreen schwer zu treffen.
+                ui.horizontal_wrapped(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
+                    ui.selectable_value(&mut self.tab, Tab::Player, "Player");
+                    ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
+                    ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
+                    ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
+                    ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
+                    ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
+                    ui.selectable_value(&mut self.tab, Tab::Session, "Session");
+                });
             });
             ui.add_space(4.0);
         });
@@ -284,6 +287,7 @@ impl eframe::App for JamApp {
             Tab::Tempo => self.view_mic(ui),
             Tab::Bild => self.view_bild(ui),
             Tab::Kreis => self.view_kreis(ui),
+            Tab::Session => self.view_session(ui),
         }
     }
 }
@@ -337,6 +341,32 @@ impl JamApp {
         });
     }
 
+    fn view_session(&mut self, ui: &mut egui::Ui) {
+        // Link-Zustand holen und dem Panel geben (wie beim Rhythmus-Follow).
+        let mut s = jamcore::rusty_link::SessionState::new();
+        self.link.capture_app_session_state(&mut s);
+        let zustand = jamcore::session::SessionZustand {
+            bpm: s.tempo(),
+            beat: s.beat_at_time(self.link.clock_micros(), 4.0),
+            peers: self.link.num_peers() as usize,
+            playing: s.is_playing(),
+        };
+        self.session.set_zustand(zustand);
+        let link_aktiv = self.link_aktiv;
+        egui::CentralPanel::default().show(ui, |ui| {
+            if let Some(aktion) = self.session.ui(ui, link_aktiv) {
+                match aktion {
+                    session_ui::SessionAktion::LinkUmschalten(an) => {
+                        self.link.enable(an);
+                        self.link_aktiv = an;
+                        self.status = format!("Link {}", if an { "an" } else { "aus" });
+                        log::info!("session: Link {}", if an { "an" } else { "aus" });
+                    }
+                }
+            }
+        });
+    }
+
     fn view_kreis(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.kreis.set_target(&host, &port);
@@ -346,6 +376,9 @@ impl JamApp {
     fn view_bild(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.bild.set_target(&host, &port);
+        if self.session.folgen() {
+            self.bild.set_bpm(self.session.tempo() as f32);
+        }
         egui::CentralPanel::default().show(ui, |ui| self.bild.ui(ui));
     }
 

@@ -8,6 +8,7 @@ pub mod micbpm;
 pub mod openmpt;
 pub mod osc;
 pub mod quint;
+pub mod session;
 pub mod yuv;
 
 /// Ableton-Link-SDK (GPLv2, siehe `Cargo.toml`, Feature `link`).

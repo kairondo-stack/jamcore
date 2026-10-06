@@ -163,6 +163,11 @@ impl ImagePanel {
         self.port = port.trim().to_string();
     }
 
+    /// Tempo fuer den Takt-Scan von aussen setzen (Session-Follow).
+    pub fn set_bpm(&mut self, bpm: f32) {
+        self.scan_bpm = bpm.clamp(20.0, 300.0);
+    }
+
     fn note_senden(&mut self, note: i32, volume: i32) {
         let (host, port) = (
             self.host.clone(),

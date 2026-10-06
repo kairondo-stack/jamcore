@@ -403,14 +403,19 @@ Zusätzlich:
     Übernahme gehört in den Audio-Callback (`capture_audio_session_state`,
     LinkHut-Muster); das Spike-Logging wird bei der UI-Integration ersetzt.
 
-### S9: Session/Jam-Modul (Risiko: mittel)
+### S9: Session/Jam-Modul (Risiko: mittel) — **Kern erledigt, verifiziert**
 - Ziel: Tempo/Phase über Link teilen; Noten live, Patterns senden.
-- Dateien: `core/src/session.rs` (Link-Session, Enable/Disable, Quanten),
-  `android/src/session_ui.rs`, Desktop-Gegenstück in `bundle_udp`/rrn5
-  (`--link on`), Pacing-Anbindung in `livescan`/`micbpm`.
-- Test: Unit: Link-Quantisierung (Phase→nächster Beat), Enable/Disable;
-  E2E: zwei Prozesse (Desktop) teilen Tempo (Assert per Log/OSC),
-  Pattern-Transfer als CSV-Upload.
+- Dateien: `core/src/session.rs` (6 Tests: Rasterpunkt, Wartezeit, Tempo-Folgen,
+  Unsinn-Eingaben), `android/src/session_ui.rs`, Tab „Session“, Tab-Leiste
+  bricht jetzt um (acht Tabs).
+- Gerätetest (Pixel 10 Pro): Session-Tab zeigt `120.0 BPM`, „Link an“, Beat und
+  nächsten Rasterpunkt (`Beat 117.241 → 120 in 1.38 s`, bei 120 BPM korrekt);
+  „Link aus“/„Link an“ loggt `session: Link …`; „Tempo folgen“ setzt das
+  Scan-Tempo im Bild-Tab (Status `Scan-Tempo folgt der Session (120.0 BPM)`).
+- Offen: **MulticastLock** (`WifiManager` + `CHANGE_WIFI_MULTICAST_STATE`) für
+  Peer-Empfang — ohne ihn kommen Multicast-Pakete im WLAN nicht an; Desktop-
+  Gegenstück `--link on` in `bundle_udp`/rrn5; E2E zweier Prozesse;
+  Pacing-Anbindung in `micbpm`; Pattern-Transfer als CSV.
 - Abhängig: S2b, S4.
 - Rollback: Session-Screen deaktivierbar; Einzelbetrieb unverändert.
 
