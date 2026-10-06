@@ -17,6 +17,11 @@ use jamcore::grid::{Note, Pattern, STEPS_PER_CYCLE as STEP_COUNT};
 use jamcore::maske::{profil_aus_geschwindigkeiten, schritt_positionen, Verteilung};
 use log::info;
 
+/// Regenbogenfarbe fuer den Touch-Verlauf (0.0 = rot, 1.0 = violett).
+fn regenbogen(anteil: f32) -> Color32 {
+    egui::ecolor::Hsva::new(anteil.clamp(0.0, 1.0) * 0.8, 0.85, 0.95, 1.0).into()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Feldart {
     /// Eine Taste je Wert (gut zum gezielten Anschlagen).
@@ -34,6 +39,10 @@ pub struct MaskePanel {
     /// Wischproben: (x, y, Zeit in Sekunden).
     proben: Vec<(f32, f32, f32)>,
     letzter_wisch: Option<(usize, Verteilung)>,
+    /// Getouchte Tasten in Reihenfolge (Index und Mitte) fuer den Regenbogen.
+    spur: Vec<(usize, egui::Pos2)>,
+    /// Noten des letzten Wischs (Schritt, Wert) fuer die Schrittweiten-Leiste.
+    wisch_noten: Vec<(u16, i32)>,
 }
 
 impl Default for MaskePanel {
@@ -52,6 +61,8 @@ impl MaskePanel {
             status: "Taste tippen = Note; über Tasten wischen = Schritte setzen.".to_string(),
             proben: Vec::new(),
             letzter_wisch: None,
+            spur: Vec::new(),
+            wisch_noten: Vec::new(),
         }
     }
 
@@ -85,6 +96,19 @@ impl MaskePanel {
     }
 
     /// Taste unter einer Position im Feld (None außerhalb).
+    /// Mitte einer Taste im Feld.
+    fn zentrum(&self, rect: egui::Rect, index: usize) -> egui::Pos2 {
+        let reihen = self.reihen();
+        let zell_w = rect.width() / self.spalten.max(1) as f32;
+        let zell_h = rect.height() / reihen.max(1) as f32;
+        let spalte = (index % self.spalten) as f32;
+        let reihe = (index / self.spalten) as f32;
+        egui::pos2(
+            rect.left() + (spalte + 0.5) * zell_w,
+            rect.top() + (reihe + 0.5) * zell_h,
+        )
+    }
+
     fn taste_unter(&self, rect: egui::Rect, pos: egui::Pos2) -> Option<usize> {
         if !rect.contains(pos) {
             return None;
@@ -118,6 +142,12 @@ impl MaskePanel {
             self.status = "Nichts getroffen.".to_string();
             return;
         }
+        // Touch-Verlauf fuer die Anzeige (Regenbogen + Linien).
+        self.spur.clear();
+        self.wisch_noten.clear();
+        for taste in &reihenfolge {
+            self.spur.push((*taste, self.zentrum(rect, *taste)));
+        }
         if reihenfolge.len() == 1 {
             // Tippen: Wert auf Schritt 1 des Rasters.
             let wert = self.wert_der_taste(reihenfolge[0]);
@@ -128,6 +158,7 @@ impl MaskePanel {
                     pitch: wert,
                     glide: false,
                 });
+                self.wisch_noten.push((0, wert));
                 self.status = format!(
                     "Taste {} -> Note {} auf Schritt 1",
                     reihenfolge[0] + 1,
@@ -176,6 +207,7 @@ impl MaskePanel {
                     pitch: wert,
                     glide: false,
                 });
+                self.wisch_noten.push((schritt as u16, wert));
                 belegt += 1;
             }
         }
@@ -282,7 +314,16 @@ impl MaskePanel {
                 egui::vec2(zell_w - 2.0, zell_h - 2.0),
             );
             let wert = self.wert_der_taste(i);
-            let farbe = if aktiv == Some(i) {
+            // Getouchte Tasten im Regenbogen nach ihrer Reihenfolge.
+            let spur_index = self.spur.iter().position(|(t, _)| *t == i);
+            let farbe = if let Some(k) = spur_index {
+                let anteil = if self.spur.len() <= 1 {
+                    0.0
+                } else {
+                    k as f32 / (self.spur.len() - 1) as f32
+                };
+                regenbogen(anteil)
+            } else if aktiv == Some(i) {
                 Color32::from_rgb(0, 200, 255)
             } else if wert == 0 {
                 Color32::from_rgb(45, 48, 58)
@@ -296,6 +337,15 @@ impl MaskePanel {
                 format!("{wert}"),
                 egui::FontId::proportional(schrift),
                 Color32::from_rgb(230, 230, 235),
+            );
+        }
+
+        // Wischweg als Linien zwischen den getouchten Tasten.
+        for (k, fenster) in self.spur.windows(2).enumerate() {
+            let anteil = k as f32 / (self.spur.len().max(2) - 1) as f32;
+            painter.line_segment(
+                [fenster[0].1, fenster[1].1],
+                egui::Stroke::new(3.0, regenbogen(anteil)),
             );
         }
 
@@ -320,6 +370,59 @@ impl MaskePanel {
                 // Beim reinen Tippen dieselbe Taste als einzelne Probe.
                 self.proben.push((pos.x, pos.y, jetzt));
                 self.wisch_auswerten(rect, pattern);
+            }
+        }
+
+        // Schrittweiten-Leiste: die Wisch-Noten auf den 16 Schritten, mit den
+        // Abständen dazwischen (Werte über den Punkten, +Schritte darunter).
+        if !self.wisch_noten.is_empty() {
+            let (leiste, painter) =
+                ui.allocate_painter(egui::vec2(breite, 52.0), egui::Sense::hover());
+            let rect = leiste.rect;
+            let mitte = rect.center().y;
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left(), mitte),
+                    egui::pos2(rect.right(), mitte),
+                ],
+                egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
+            );
+            for s in 0..STEP_COUNT {
+                let x = rect.left() + rect.width() * s as f32 / (STEP_COUNT - 1) as f32;
+                painter.line_segment(
+                    [egui::pos2(x, mitte - 3.0), egui::pos2(x, mitte + 3.0)],
+                    egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
+                );
+            }
+            let n = self.wisch_noten.len();
+            for (k, (step, wert)) in self.wisch_noten.iter().enumerate() {
+                let x = rect.left() + rect.width() * *step as f32 / (STEP_COUNT - 1) as f32;
+                let anteil = if n <= 1 {
+                    0.0
+                } else {
+                    k as f32 / (n - 1) as f32
+                };
+                let farbe = regenbogen(anteil);
+                painter.circle_filled(egui::pos2(x, mitte), 6.0, farbe);
+                painter.text(
+                    egui::pos2(x, mitte - 18.0),
+                    egui::Align2::CENTER_CENTER,
+                    format!("{wert}"),
+                    egui::FontId::proportional(10.0),
+                    Color32::from_rgb(225, 225, 230),
+                );
+                if k > 0 {
+                    let vor = self.wisch_noten[k - 1].0;
+                    let x_vor = rect.left() + rect.width() * vor as f32 / (STEP_COUNT - 1) as f32;
+                    let diff = *step as i32 - vor as i32;
+                    painter.text(
+                        egui::pos2((x + x_vor) / 2.0, mitte + 18.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("+{diff}"),
+                        egui::FontId::proportional(10.0),
+                        Color32::from_rgb(150, 150, 158),
+                    );
+                }
             }
         }
 
