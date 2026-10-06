@@ -261,10 +261,15 @@ impl ImagePanel {
 
     /// Markiert alle Pixel in Toleranzweite der Auswahl und zeigt das Bild.
     fn markieren(&mut self, ctx: &egui::Context) {
-        let Some(sel) = self.sel else {
+        let Some((w, h, bild)) = self.eingefroren.clone().or_else(camera::letztes_bild) else {
             return;
         };
-        let Some((w, h, mut bild)) = self.eingefroren.clone().or_else(camera::letztes_bild) else {
+        self.markieren_bild(ctx, w, h, bild);
+    }
+
+    /// Markiert ein gegebenes Bild (auch fuer das laufende Livebild).
+    fn markieren_bild(&mut self, ctx: &egui::Context, w: usize, h: usize, mut bild: Vec<u8>) {
+        let Some(sel) = self.sel else {
             return;
         };
         let filter = ScanFilter {
@@ -536,11 +541,17 @@ impl ImagePanel {
             }
         });
 
-        // Live-Textur nur, solange keine Auswahl steht und kein Scan laeuft.
+        // Live-Textur: laeuft auch mit bestehender Auswahl weiter (dann mit
+        // Markierung) — kein Standbild nach dem Farbwaehlen. Nur der Scan
+        // uebernimmt die Anzeige.
         let (nummer, _, _) = camera::stand();
-        if !self.scan_an && self.sel.is_none() && nummer != self.letzte_nummer {
+        if !self.scan_an && nummer != self.letzte_nummer {
             if let Some((w, h, rgba)) = camera::letztes_bild() {
-                self.textur_setzen(ui.ctx(), w, h, &rgba);
+                if self.sel.is_some() {
+                    self.markieren_bild(ui.ctx(), w, h, rgba);
+                } else {
+                    self.textur_setzen(ui.ctx(), w, h, &rgba);
+                }
                 self.letzte_nummer = nummer;
                 self.status = format!("Frame {nummer} ({w}x{h})");
             }

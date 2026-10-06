@@ -7,6 +7,7 @@ mod image;
 mod insets;
 mod jniutil;
 mod klang;
+mod layout;
 mod link_support;
 mod maske;
 mod mic;
@@ -33,44 +34,7 @@ pub fn current_app() -> Result<android_activity::AndroidApp, String> {
 }
 
 use eframe::egui;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum KombiTeil {
-    Leer,
-    Bild,
-    Rhythmus,
-    Maske,
-    Tempo,
-    Session,
-    Tagebuch,
-    Kreis,
-}
-
-impl KombiTeil {
-    const ALLE: [KombiTeil; 8] = [
-        KombiTeil::Leer,
-        KombiTeil::Bild,
-        KombiTeil::Rhythmus,
-        KombiTeil::Maske,
-        KombiTeil::Tempo,
-        KombiTeil::Session,
-        KombiTeil::Tagebuch,
-        KombiTeil::Kreis,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            KombiTeil::Leer => "leer",
-            KombiTeil::Bild => "Kamera/Scan",
-            KombiTeil::Rhythmus => "Rhythmus",
-            KombiTeil::Maske => "Takt-Maske",
-            KombiTeil::Tempo => "Tempo",
-            KombiTeil::Session => "Session",
-            KombiTeil::Tagebuch => "Tagebuch",
-            KombiTeil::Kreis => "Kreis",
-        }
-    }
-}
+use layout::KombiTeil;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
@@ -415,49 +379,15 @@ impl JamApp {
         egui::CentralPanel::default().show(ui, |ui| self.maske.ui(ui, self.rhythm.pattern_mut()));
     }
 
-    /// Kombi-Ansicht: zwei Module gleichzeitig (oben/unten wählbar).
+    /// Kombi-Ansicht: zwei Module gleichzeitig (im Hochformat untereinander,
+    /// im Querformat nebeneinander).
     fn view_kombi(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Oben:");
-                let oben = self.kombi_oben;
-                egui::ComboBox::from_id_salt("kombi_oben")
-                    .selected_text(oben.name())
-                    .show_ui(ui, |ui| {
-                        for teil in KombiTeil::ALLE {
-                            if ui.selectable_label(oben == teil, teil.name()).clicked() {
-                                self.kombi_oben = teil;
-                            }
-                        }
-                    });
-                ui.label("Unten:");
-                let unten = self.kombi_unten;
-                egui::ComboBox::from_id_salt("kombi_unten")
-                    .selected_text(unten.name())
-                    .show_ui(ui, |ui| {
-                        for teil in KombiTeil::ALLE {
-                            if ui.selectable_label(unten == teil, teil.name()).clicked() {
-                                self.kombi_unten = teil;
-                            }
-                        }
-                    });
-            });
-            ui.separator();
-            let hoehe = (ui.available_height() - 12.0) / 2.0;
-            let breite = ui.available_width();
-            let oben = self.kombi_oben;
-            ui.allocate_ui(egui::vec2(breite, hoehe), |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("kombi_bereich_oben")
-                    .show(ui, |ui| self.teil_ui(ui, oben));
-            });
-            ui.separator();
-            let unten = self.kombi_unten;
-            ui.allocate_ui(egui::vec2(breite, hoehe), |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("kombi_bereich_unten")
-                    .show(ui, |ui| self.teil_ui(ui, unten));
-            });
+            let (mut oben, mut unten) = (self.kombi_oben, self.kombi_unten);
+            layout::wahlzeile(ui, &mut oben, &mut unten);
+            self.kombi_oben = oben;
+            self.kombi_unten = unten;
+            layout::bereiche(ui, oben, unten, |ui, teil| self.teil_ui(ui, teil));
         });
     }
 
