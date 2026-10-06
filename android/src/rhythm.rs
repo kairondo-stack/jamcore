@@ -24,7 +24,8 @@ const BLOCK: u16 = 8;
 const DEFAULT_BPM: f32 = 128.0;
 
 pub struct RhythmPanel {
-    pattern: Pattern,
+    slots: Vec<Pattern>,
+    slot: usize,
     target: (String, u16),
     velocity: u8,
     bpm: f32,
@@ -53,7 +54,8 @@ impl Default for RhythmPanel {
 impl RhythmPanel {
     pub fn new() -> Self {
         Self {
-            pattern: Pattern::new(),
+            slots: vec![Pattern::new(); 8],
+            slot: 0,
             target: ("127.0.0.1".to_string(), 7003),
             velocity: 100,
             bpm: DEFAULT_BPM,
@@ -88,7 +90,12 @@ impl RhythmPanel {
 
     /// Aktuelles Raster (fuer das Tagebuch und spaetere Exporte).
     pub fn pattern(&self) -> &Pattern {
-        &self.pattern
+        &self.slots[self.slot.min(self.slots.len().saturating_sub(1))]
+    }
+
+    fn pattern_mut(&mut self) -> &mut Pattern {
+        let slot = self.slot.min(self.slots.len().saturating_sub(1));
+        &mut self.slots[slot]
     }
 
     /// Schritt aus dem laufenden Modul (Follow-Modus).
@@ -105,7 +112,7 @@ impl RhythmPanel {
             return;
         }
         let noten: Vec<(u16, i32)> = self
-            .pattern
+            .pattern()
             .notes()
             .iter()
             .map(|n| (n.step, n.pitch))
@@ -225,8 +232,8 @@ impl RhythmPanel {
         // die Recorder-Tasten im Desktop), nicht auf der angefassten Zelle.
         if self.aufnahme && self.render_laeuft {
             let ziel = self.render_schritt.load(Ordering::Relaxed) % STEP_COUNT;
-            if !self.pattern.has_at(ziel, pitch) {
-                self.pattern.insert(Note {
+            if !self.pattern_mut().has_at(ziel, pitch) {
+                self.pattern_mut().insert(Note {
                     step: ziel,
                     instrument: 0,
                     pitch,
@@ -238,12 +245,12 @@ impl RhythmPanel {
                     "Aufnahme: Schritt {} <- {} ({} Noten)",
                     ziel + 1,
                     note_name(pitch),
-                    self.pattern.notes().len()
+                    self.pattern().notes().len()
                 );
             }
             return;
         }
-        let added = self.pattern.toggle(step, pitch);
+        let added = self.pattern_mut().toggle(step, pitch);
         if added {
             self.play(pitch, self.velocity);
             // Der Ton klingt auch lokal (im Demo-Video hörbar).
@@ -252,13 +259,13 @@ impl RhythmPanel {
                 "Schritt {}: {} ({} Noten)",
                 step + 1,
                 note_name(pitch),
-                self.pattern.notes().len()
+                self.pattern().notes().len()
             );
         } else {
             self.status = format!(
                 "Schritt {} frei ({} Noten)",
                 step + 1,
-                self.pattern.notes().len()
+                self.pattern().notes().len()
             );
         }
     }
@@ -282,13 +289,13 @@ impl RhythmPanel {
             self.status = "Kein App-Verzeichnis für Patterns.".to_string();
             return;
         };
-        let path = std::path::Path::new(&dir).join("muster.csv");
-        let csv = self.pattern.to_csv();
+        let path = std::path::Path::new(&dir).join(format!("pattern {}.csv", self.slot));
+        let csv = self.pattern().to_csv();
         match self.write_atomic(&path, &csv) {
             Ok(()) => {
                 self.status = format!(
                     "{} Noten -> {} ({} Bytes)",
-                    self.pattern.notes().len(),
+                    self.pattern().notes().len(),
                     path.display(),
                     csv.len()
                 );
@@ -303,8 +310,8 @@ impl RhythmPanel {
             self.status = "Kein App-Verzeichnis für Patterns.".to_string();
             return;
         };
-        let path = std::path::Path::new(&dir).join("muster.xml");
-        let xml = self.pattern.to_renoise_xml();
+        let path = std::path::Path::new(&dir).join(format!("pattern {}.xml", self.slot));
+        let xml = self.pattern().to_renoise_xml();
         match self.write_atomic(&path, &xml) {
             Ok(()) => {
                 self.status = format!("XML für Renoise -> {}", path.display());
@@ -333,14 +340,14 @@ impl RhythmPanel {
             self.status = "Kein App-Verzeichnis fuer Patterns.".to_string();
             return;
         };
-        let path = std::path::Path::new(&dir).join("muster.csv");
+        let path = std::path::Path::new(&dir).join(format!("pattern {}.csv", self.slot));
         match std::fs::read_to_string(&path) {
             Ok(content) => match Pattern::from_csv(&content, STEP_COUNT) {
                 Ok(loaded) => {
-                    self.pattern = loaded;
+                    *self.pattern_mut() = loaded;
                     self.status = format!(
                         "{} Noten aus {}",
-                        self.pattern.notes().len(),
+                        self.pattern().notes().len(),
                         path.display()
                     );
                     info!("CSV geladen: {}", path.display());
@@ -356,8 +363,24 @@ impl RhythmPanel {
         ui.ctx().request_repaint_after(Duration::from_millis(50));
 
         ui.horizontal(|ui| {
+            // Acht Slots wie im Desktop-Recorder; gespeichert wird je Slot
+            // als "pattern N.csv" (Zaehlung ab 0 wie dort).
+            ui.label("Pattern");
+            for i in 0..self.slots.len() {
+                let text = format!("{}", i + 1);
+                if ui.selectable_label(self.slot == i, text).clicked() {
+                    self.slot = i;
+                    self.status = format!(
+                        "Pattern {} gewählt ({} Noten)",
+                        i + 1,
+                        self.pattern().notes().len()
+                    );
+                }
+            }
+        });
+        ui.horizontal(|ui| {
             ui.label(format!("Schritt {}/{}", self.current_step + 1, STEP_COUNT));
-            ui.label(format!("Noten: {}", self.pattern.notes().len()));
+            ui.label(format!("Noten: {}", self.pattern().notes().len()));
             if self.follow {
                 ui.label(RichText::new("Follow: Modul").strong());
             } else {
@@ -376,7 +399,7 @@ impl RhythmPanel {
                 info!("Follow = {}", self.follow);
             }
             if ui.button("Leeren").clicked() {
-                self.pattern.clear();
+                self.pattern_mut().clear();
                 self.status = "Raster geleert.".to_string();
             }
             if ui.button("Vel -").clicked() {
@@ -445,7 +468,7 @@ impl RhythmPanel {
                         ui.label(RichText::new(note_name(pitch)).small());
                         for i in 0..BLOCK {
                             let step = block * BLOCK + i;
-                            let on = self.pattern.has_at(step, pitch);
+                            let on = self.pattern().has_at(step, pitch);
                             let played = step == self.current_step;
                             let color = if on {
                                 Color32::from_rgb(90, 200, 120)
