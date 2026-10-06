@@ -64,6 +64,11 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 - **Android 17 (Pixel 10 Pro)**: AAudio-C-API ist ein Stub (`nullptr`),
   `SL_IID_*` von libOpenSLES unbrauchbar, `AudioTrack.write(float[],…)` fehlt.
   Funktioniert: AudioTrack + `write(byte[],…)`, PCM 16-Bit.
+- **Ableton-Link braucht ein echtes gemeinsames WLAN**: Android-Hotspots
+  (Tethering-Bridge `ap_br_wlan2`) leiten das Link-Multicast nicht weiter –
+  der Laptop erreicht das Handy per Ping, umgekehrt kommt nichts an, beide
+  Sessions bleiben `peers=0`. Mit MulticastLock (`LinkSupport.java`) und einem
+  normalen WLAN funktioniert es. Desktop↔Desktop ist im Spike bewiesen.
 - **Camera2 braucht eine Java-Bruecke**: Die Pflicht-Callbacks
   (`CameraDevice.StateCallback`, `CaptureSession.StateCallback`,
   `ImageReader.OnImageAvailableListener`) lassen sich nicht in reinem JNI

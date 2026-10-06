@@ -412,10 +412,17 @@ Zusätzlich:
   nächsten Rasterpunkt (`Beat 117.241 → 120 in 1.38 s`, bei 120 BPM korrekt);
   „Link aus“/„Link an“ loggt `session: Link …`; „Tempo folgen“ setzt das
   Scan-Tempo im Bild-Tab (Status `Scan-Tempo folgt der Session (120.0 BPM)`).
-- Offen: **MulticastLock** (`WifiManager` + `CHANGE_WIFI_MULTICAST_STATE`) für
-  Peer-Empfang — ohne ihn kommen Multicast-Pakete im WLAN nicht an; Desktop-
-  Gegenstück `--link on` in `bundle_udp`/rrn5; E2E zweier Prozesse;
-  Pacing-Anbindung in `micbpm`; Pattern-Transfer als CSV.
+- **MulticastLock erledigt (2026-10-06):** `CHANGE_WIFI_MULTICAST_STATE` im
+  Manifest, `LinkSupport.java` holt/gibt das Lock, Rust ruft es beim ersten
+  Frame (wenn Link an) und beim Umschalten. Gerätetest:
+  `WifiService: acquireMulticastLock ... jamcore-link`, Log `MulticastLock aktiv`.
+- Offen: **Peer-Test über Handy-Hotspot scheitert an Android**: Der Laptop
+  erreicht das Handy (Ping auf die Tethering-Bridge `ap_br_wlan2`,
+  10.179.32.50), aber die Gegenrichtung verliert 100 % der Pakete und beide
+  Link-Sessions bleiben `peers=0`. Für echte Peers brauchen Handy und Laptop
+  dasselbe normale WLAN (Desktop↔Desktop geht im Spike nachweislich).
+  Ebenfalls offen: Desktop-Gegenstück `--link on` in `bundle_udp`/rrn5,
+  Pacing-Anbindung in `micbpm`, Pattern-Transfer als CSV.
 - Abhängig: S2b, S4.
 - Rollback: Session-Screen deaktivierbar; Einzelbetrieb unverändert.
 

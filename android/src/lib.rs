@@ -5,6 +5,7 @@ mod camera;
 mod image;
 mod insets;
 mod jniutil;
+mod link_support;
 mod mic;
 mod osc;
 mod paths;
@@ -64,6 +65,7 @@ struct JamApp {
     kreis: quint::QuintPanel,
     session: session_ui::SessionPanel,
     link_aktiv: bool,
+    multicast_aktiv: bool,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -93,6 +95,7 @@ impl Default for JamApp {
             kreis: quint::QuintPanel::default(),
             session: session_ui::SessionPanel::default(),
             link_aktiv: true,
+            multicast_aktiv: false,
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -206,6 +209,15 @@ fn file_name(path: &std::path::Path) -> String {
 
 impl eframe::App for JamApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // MulticastLock fuer Link holen, sobald die App laeuft (ohne ihn
+        // kommen im WLAN keine Peer-Pakete an).
+        if self.link_aktiv && !self.multicast_aktiv {
+            if let Ok(app) = crate::current_app() {
+                if link_support::aktivieren(&app).is_ok() {
+                    self.multicast_aktiv = true;
+                }
+            }
+        }
         // S2b-Spike: einmal pro Sekunde den Link-Zustand ins Log, damit der
         // Gerätetest ohne UI-Arbeit belegt, dass die Session lebt.
         if self.link_report.elapsed() >= std::time::Duration::from_secs(1) {
@@ -359,6 +371,13 @@ impl JamApp {
                     session_ui::SessionAktion::LinkUmschalten(an) => {
                         self.link.enable(an);
                         self.link_aktiv = an;
+                        if let Ok(app) = crate::current_app() {
+                            if an {
+                                let _ = link_support::aktivieren(&app);
+                            } else {
+                                link_support::freigeben(&app);
+                            }
+                        }
                         self.status = format!("Link {}", if an { "an" } else { "aus" });
                         log::info!("session: Link {}", if an { "an" } else { "aus" });
                     }
