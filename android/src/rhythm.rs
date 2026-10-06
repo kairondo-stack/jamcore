@@ -46,6 +46,8 @@ pub struct RhythmPanel {
     aufnahme: bool,
     /// Presenter-Ansicht (wie Taste J im Desktop-Recorder).
     presenter: bool,
+    /// Instrumentnummer fuer neue Noten (Renoise-Instrument).
+    instrument: u8,
     /// Skalenfilter fuer gesetzte Toene (0 = aus).
     skala: usize,
     grundton: i32,
@@ -78,6 +80,7 @@ impl RhythmPanel {
             transport_mit: false,
             aufnahme: false,
             presenter: false,
+            instrument: 0,
             skala: 0,
             grundton: 60,
         }
@@ -341,9 +344,10 @@ impl RhythmPanel {
         if self.aufnahme && self.render_laeuft {
             let ziel = self.render_schritt.load(Ordering::Relaxed) % STEP_COUNT;
             if !self.pattern_mut().has_at(ziel, pitch) {
+                let instrument = self.instrument;
                 self.pattern_mut().insert(Note {
                     step: ziel,
-                    instrument: 0,
+                    instrument,
                     pitch,
                     glide: false,
                 });
@@ -358,7 +362,19 @@ impl RhythmPanel {
             }
             return;
         }
-        let added = self.pattern_mut().toggle(step, pitch);
+        // Normalfall: Note setzen (mit gewaehltem Instrument) oder entfernen.
+        let instrument = self.instrument;
+        let added = if self.pattern_mut().has_at(step, pitch) {
+            self.pattern_mut().toggle(step, pitch)
+        } else {
+            self.pattern_mut().insert(Note {
+                step,
+                instrument,
+                pitch,
+                glide: false,
+            });
+            true
+        };
         if added {
             self.play(pitch, self.velocity);
             // Der Ton klingt auch lokal (im Demo-Video hörbar).
@@ -586,6 +602,17 @@ impl RhythmPanel {
                 ui.add(egui::Slider::new(&mut self.grundton, 48..=72));
             }
             ui.checkbox(&mut self.presenter, "Presenter");
+            if ui.button("Instr -").clicked() {
+                self.instrument = self.instrument.saturating_sub(1);
+            }
+            ui.label(format!("Instr {}", self.instrument));
+            if ui.button("Instr +").clicked() {
+                self.instrument = (self.instrument + 1).min(15);
+            }
+            if ui.button("Instr auf alle").clicked() {
+                let inst = self.instrument;
+                self.noten_transformieren(move |n| transformation::instrument_setzen(n, inst));
+            }
         });
 
         if self.presenter {
