@@ -50,6 +50,11 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
   Überblick 254, Player 402, OSC 505, Rhythmus 629, Tempo 778.
 - `adb logcat -d | grep jamandroid` ist die Quelle der Wahrheit; Bildschirmfotos nur
   zur Kontanz.
+- **Handy-Hotspot + Laptop = haeufigstes Setup, adb per TCP**: Im AP-Modus ist
+  „Drahtloses Debugging“ ausgegraut (verlangt WLAN-Station). Einmal USB
+  anstecken, dann `adb tcpip 5555` und `adb connect 10.179.32.50:5555`
+  (10.179.32.50 ist das Handy als Hotspot-Gateway; Laptop z.B. 10.179.32.209).
+  Danach laeuft adb ohne Kabel bis zum Handy-Neustart.
 - `adb reverse tcp<port> tcp<port>` für TCP. **UDP kann adb reverse nicht** — OSC
   von Handy zu Laptop braucht beide Geräte im selben Netz (Laptop-IP in der App).
 - Geräte-Seitennachweis ohne Netz: `adb shell "nc -u -l -p 7003 > /data/local/tmp/o.txt"`
