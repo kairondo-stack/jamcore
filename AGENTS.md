@@ -69,6 +69,12 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
 - **Android 17 (Pixel 10 Pro)**: AAudio-C-API ist ein Stub (`nullptr`),
   `SL_IID_*` von libOpenSLES unbrauchbar, `AudioTrack.write(float[],…)` fehlt.
   Funktioniert: AudioTrack + `write(byte[],…)`, PCM 16-Bit.
+- **OSC-Ports in der NixOS-Firewall freigeben**: `networking.firewall`
+  blockt eingehendes UDP; fuer Renoise/bundle_udp (z.B. 7005) und die
+  Desktop-Werkzeuge ist `allowedUDPPortRanges = [ { from = 7000; to = 7010; } ]`
+  gesetzt (plus 20808 fuer Link). Ohne die Regel sendet die App, aber in
+  Renoise kommt nichts an (Diagnose 2026-10-07: `nc -u` vom Handy kam an,
+  die App-Note nicht).
 - **Ableton-Link über Handy-Hotspot (gelöst 2026-10-06)**: Zwei Ursachen für
   `peers=0`: (1) Die NixOS-Firewall des Laptops blockt eingehendes UDP –
   `networking.firewall.allowedUDPPorts = [ 20808 ]` und `allowPing = true`
