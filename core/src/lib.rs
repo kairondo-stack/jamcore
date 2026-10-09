@@ -6,6 +6,7 @@ pub mod bmp;
 pub mod diary;
 pub mod gesten;
 pub mod grid;
+pub mod harmonie;
 pub mod klang;
 pub mod livescan;
 pub mod maske;

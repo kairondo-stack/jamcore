@@ -72,7 +72,7 @@ impl QuintPanel {
         );
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> Option<Vec<i32>> {
         let groesse = (R_AUSSEN * 2.0 + 20.0).min(ui.available_width());
         let (response, painter) =
             ui.allocate_painter(egui::vec2(groesse, groesse), egui::Sense::click());
@@ -147,10 +147,18 @@ impl QuintPanel {
         }
         let klassen = note_classes(&self.ausgewaehlt);
         ui.label(format!("Notenklassen: {klassen:?}"));
+        // Die Auswahl als Harmonie-Band in den Bild-Tab übernehmen
+        // (Desktop: `useNotesSet`-Mengen aus `quintenzirkel_flow`).
+        let mut uebernehmen = None;
+        if !klassen.is_empty() && ui.button("Notenmenge (Bild-Tab)").clicked() {
+            uebernehmen = Some(klassen.clone());
+            self.status = format!("{klassen:?} als Notenmenge übernommen.");
+        }
         ui.label(
             egui::RichText::new("Note geht beim Antippen sofort raus (OSC-Ziel aus dem OSC-Tab).")
                 .small()
                 .color(Color32::DARK_GRAY),
         );
+        uebernehmen
     }
 }

@@ -31,7 +31,7 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 | 2 | ⚠️ | **Scan-Schrittweite `iadd`** — bewusst weg (der Sweep läuft über die Schrittzahl); die Schrittzahl ersetzt sie |
 | 3 | ⚠️ | **Zeilen-Ausdünnung `jadd`** — laut Desktop-Beleg nur bei der Maus-Rasterabtastung (mittlere Taste) wirksam, nicht im Live-Scan; auf Touch nicht übertragbar |
 | 4 | ✅ | **Alle neun Zuordnungen** — 0 = Farbe (`note_volume_farbe`), 1–8 nach den Desktop-Formeln (6/7 waren vertauscht und sind korrigiert), UI bietet 0…8 |
-| 5 | ❌ | **Harmonics, Harmonien-Editor, Chord-Filter** (`is_note_in_chordpatt`, `chordTypes`, `useNotesSet`, Major/Plagal) fehlen komplett |
+| 5 | ✅ | **Harmonics-Filter** — Kern `harmonie.rs` (8 Tests): Dur/Plagal/Moll, Quinte, Transposition und Notenmengen mit X-Bändern (`in_notesset_range` mit Desktop-Test). UI im Bild-Tab (Akkord-Wahl, Bänder mit Endspalte), Bänder kommen über „Notenmenge (Bild-Tab)" aus dem Kreis. Der Desktop-Chord-Teil (`chordTypes`/`is_note_in_chordpatt`) ist dort toter Code (Liste wird nie gefüllt) und bleibt bewusst aus. Gerätetest: Dur → 35 Noten, alle Klasse 0; Band {8} → 0 Noten |
 | 6 | ❌ | **Frequenzspanne/Teiler** (`y_ashape`) fehlt; der Quintenzirkel (Kreis-Tab) ist da |
 | 7 | ✅ | **KeyEventRender.txt** — Knöpfe „Datei sichern“/„Datei laden“ im Bild-Tab (`als_keyevent`/`aus_keyevent`); Rest hinter der Datei bleibt gesperrt (rrn5-Semantik). Die BPM/Dauer-Übernahme aus der Datei gibt es nicht mehr (die App hat **ein** Tempo). |
 | 8 | ✅ | **Snapshot als BMP** — Knopf „Snapshot“ schreibt `frame4save.bmp`; eigener BMP-Schreiber im Kern (`core/src/bmp.rs`, Tests) ohne neue Abhängigkeit |
@@ -85,10 +85,10 @@ SDL-Audio (ersetzt durch `klang.rs`).
 
 ## Offene Punkte, nach Nutzen sortiert
 
-1. **Harmonics/Chord-Filter** (rrn5 Nr. 5)
-2. **Recorder-Ketten** + Graph-Editor + Notenrampe/remove_and_record (pattern_recorder Nr. 2–6)
-3. **Player**: WAV-Rendern, Struktur-Dump, Order-Variation (it_live Nr. 2–4)
-4. **Bild-Follow** (rrn5 Nr. 15) und **Einzel-Slot-Wiedergabe** + Pattern-Dauer (pattern_recorder Nr. 10–11)
+1. **Recorder-Ketten** + Graph-Editor + Notenrampe/remove_and_record
+   (pattern_recorder Nr. 2–6)
+2. **Bild-Follow** (rrn5 Nr. 15) und **Einzel-Slot-Wiedergabe** + Pattern-Dauer
+   (pattern_recorder Nr. 10–11)
 
 ## Gerätetest — am 2026-10-09 auf dem Pixel 10 Pro durchgeführt
 

@@ -106,6 +106,8 @@ pub struct ImagePanel {
     bild_versatz: (f32, f32),
     /// Mehrfinger (zwei Finger Zoom, drei Finger verschieben).
     finger: crate::touch::Mehrfinger,
+    /// Harmonics-Filter (Akkord/Notenmengen) wie im Desktop-rrn5.
+    harmonie: jamcore::harmonie::Harmonie,
     /// Schrittzahl des letzten Bildes (die Maske haengt daran).
     schritte_letzte: u16,
     /// Start- und Endpunkt des Pattern-Ausschnitts der X-Auflösung (Schritte).
@@ -165,6 +167,7 @@ impl ImagePanel {
             scan_rechts: 1.0,
             bild_versatz: (0.0, 0.0),
             finger: crate::touch::Mehrfinger::neu(),
+            harmonie: jamcore::harmonie::Harmonie::default(),
             schritte_letzte: 0,
             abschnitt_von: 0,
             abschnitt_bis: u16::MAX,
@@ -441,7 +444,25 @@ impl ImagePanel {
         }
     }
 
-    /// Pfad der Austauschdatei mit dem Desktop-Recorder.
+    /// Ein Harmonie-Band aus der Quintenzirkel-Auswahl anhängen. Das vorige
+    /// Band wird auf die halbe Breite gekürzt, wenn es sonst alles abdeckt —
+    /// sonst bliebe das neue Band wirkungslos (erstes Band gewinnt).
+    pub fn harmonie_band(&mut self, klassen: Vec<i32>) {
+        let breite = self.schritte() as i32;
+        if let Some(letzte) = self.harmonie.setx.last_mut().and_then(|v| v.first_mut()) {
+            if *letzte >= breite {
+                *letzte = (breite / 2).max(1);
+            }
+        }
+        self.harmonie.set_anhaengen(klassen, breite);
+        self.harmonie.notenmenge = true;
+        self.status = format!(
+            "Notenmenge: Band {} bis {}",
+            self.harmonie.sets.len(),
+            breite
+        );
+    }
+
     /// Geprüfter Scan-Bereich (Anteile der Breite) — wie im Kern: beide Grenzen
     /// endlich, geklemmt, rechts > links, sonst die volle Breite.
     fn bereich(&self) -> (f32, f32) {
@@ -464,6 +485,7 @@ impl ImagePanel {
         Some(std::path::PathBuf::from(basis).join(name))
     }
 
+    /// Pfad der Austauschdatei mit dem Desktop-Recorder.
     fn keyevent_pfad(&self) -> Option<std::path::PathBuf> {
         self.app_datei("KeyEventRender.txt")
     }
@@ -666,6 +688,11 @@ impl ImagePanel {
                         } else {
                             note_volume(x, *y, wi, hi, self.note_modus, 36, 36)
                         };
+                        // Harmonics-Filter wie im Desktop-Live-Scan: gesperrte
+                        // Noten fallen ganz weg (kein Pixel, kein Ton).
+                        if !self.harmonie.note_erlaubt(note, x) {
+                            continue;
+                        }
                         noten.push((note, ((vol as f32 * alpha) as i32).clamp(0, 127)));
                         self.sweep_gezeichnet += 1;
                     }
@@ -890,7 +917,7 @@ impl ImagePanel {
 
     /// Wie viele Zeilen die Steuerung hat. Jede Zeile ist schmal genug für eine
     /// Spalte; im Querformat wechseln sie zwischen zwei Spalten ab.
-    const STEUERUNG_ZEILEN: usize = 9;
+    const STEUERUNG_ZEILEN: usize = 11;
 
     /// Eine Zeile der Steuerung. Jede Zeile ist schmal genug für eine Spalte;
     /// im Querformat wechseln sie sich zwischen zwei Spalten ab.
@@ -905,6 +932,8 @@ impl ImagePanel {
             6 => self.zeile_auswahl(ui),
             7 => self.zeile_malen(ui),
             8 => self.zeile_kanal(ui),
+            9 => self.zeile_harmonics(ui),
+            10 => self.zeile_notenmenge(ui),
             _ => {}
         }
     }
@@ -1212,6 +1241,73 @@ impl ImagePanel {
                 let ctx = ui.ctx().clone();
                 self.markieren(&ctx);
             }
+        }
+    }
+
+    /// Harmonics: Filter an/aus, Akkordart, Quinte, Transposition.
+    fn zeile_harmonics(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.harmonie.an, "Harmonics");
+            // Wie im Desktop: Dur gewinnt, sonst Plagal, sonst Moll.
+            let moll = !self.harmonie.dur && !self.harmonie.plagal;
+            if ui.selectable_label(self.harmonie.dur, "Dur").clicked() {
+                self.harmonie.dur = true;
+                self.harmonie.plagal = false;
+            }
+            if ui
+                .selectable_label(!self.harmonie.dur && self.harmonie.plagal, "Plagal")
+                .clicked()
+            {
+                self.harmonie.dur = false;
+                self.harmonie.plagal = true;
+            }
+            if ui.selectable_label(moll, "Moll").clicked() {
+                self.harmonie.dur = false;
+                self.harmonie.plagal = false;
+            }
+            ui.checkbox(&mut self.harmonie.quinte, "Quinte");
+            ui.label("Transp");
+            ui.add(egui::DragValue::new(&mut self.harmonie.note_value_add).range(-11..=11));
+        });
+    }
+
+    /// Notenmengen: Bänder aus der Quintenzirkel-Auswahl, mit Endspalte.
+    fn zeile_notenmenge(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.harmonie.notenmenge, "Notenmenge");
+            ui.label(
+                egui::RichText::new("Bänder kommen über „Notenmenge (Bild-Tab)“ aus dem Kreis")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            if !self.harmonie.sets.is_empty() && ui.button("Bänder löschen").clicked() {
+                self.harmonie.sets.clear();
+                self.harmonie.setx.clear();
+                self.harmonie.notessetcount = 0;
+            }
+        });
+        let schritte = self.schritte().max(1) as i32;
+        let mut loeschen = None;
+        for i in 0..self.harmonie.sets.len() {
+            ui.horizontal(|ui| {
+                ui.label(format!("B{}: {:?}", i + 1, self.harmonie.sets[i]));
+                ui.label("bis");
+                if let Some(bis) = self.harmonie.setx.get_mut(i).and_then(|v| v.first_mut()) {
+                    ui.add(egui::DragValue::new(bis).range(1..=schritte));
+                }
+                if ui.button("x").clicked() {
+                    loeschen = Some(i);
+                }
+            });
+        }
+        if let Some(i) = loeschen {
+            if i < self.harmonie.sets.len() {
+                self.harmonie.sets.remove(i);
+            }
+            if i < self.harmonie.setx.len() {
+                self.harmonie.setx.remove(i);
+            }
+            self.harmonie.notessetcount = self.harmonie.sets.len() as i32;
         }
     }
 

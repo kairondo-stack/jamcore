@@ -452,7 +452,9 @@ impl JamApp {
             KombiTeil::Kreis => {
                 let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
                 self.kreis.set_target(&host, &port);
-                self.kreis.ui(ui);
+                if let Some(klassen) = self.kreis.ui(ui) {
+                    self.bild.harmonie_band(klassen);
+                }
             }
         }
     }
@@ -538,7 +540,13 @@ impl JamApp {
     fn view_kreis(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.kreis.set_target(&host, &port);
-        egui::CentralPanel::default().show(ui, |ui| self.kreis.ui(ui));
+        let mut uebernehmen = None;
+        egui::CentralPanel::default().show(ui, |ui| {
+            uebernehmen = self.kreis.ui(ui);
+        });
+        if let Some(klassen) = uebernehmen {
+            self.bild.harmonie_band(klassen);
+        }
     }
 
     fn view_bild(&mut self, ui: &mut egui::Ui) {
