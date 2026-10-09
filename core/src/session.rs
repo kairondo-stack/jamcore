@@ -67,6 +67,13 @@ pub fn tempo_folgen(lokal: f64, session: f64, folgen: bool) -> f64 {
     }
 }
 
+/// Das **eine** Tempo der App: bei aktivem Link-Follow das Session-Tempo,
+/// sonst der selbst eingestellte Wert. Genau dieser Wert geht an den
+/// Takt-Scan, ans Rendern und ins Tagebuch.
+pub fn tempo_gesamt(folgen: bool, session_bpm: f64, eigenes_bpm: f32) -> f32 {
+    tempo_folgen(eigenes_bpm as f64, session_bpm, folgen) as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,6 +97,24 @@ mod tests {
         assert_eq!(naechster_beat(-0.5, 4.0), 0.0);
         assert_eq!(naechster_beat(2.3, 0.0), 3.0, "Quantum 0 wird zu 1");
         assert_eq!(naechster_beat(f64::NAN, 4.0), 0.0);
+    }
+
+    #[test]
+    fn tempo_gesamt_nutzt_die_session_beim_follow() {
+        assert_eq!(tempo_gesamt(true, 128.0, 100.0), 128.0, "Follow gewinnt");
+        assert_eq!(
+            tempo_gesamt(false, 128.0, 100.0),
+            100.0,
+            "ohne Follow der eigene"
+        );
+    }
+
+    #[test]
+    fn tempo_gesamt_verschaubt_ungueltige_sessionsangaben() {
+        assert_eq!(tempo_gesamt(true, 0.0, 100.0), 100.0, "Session 0");
+        assert_eq!(tempo_gesamt(true, f64::NAN, 100.0), 100.0, "Session NaN");
+        assert_eq!(tempo_gesamt(true, -5.0, 100.0), 100.0, "negativ");
+        assert_eq!(tempo_gesamt(true, 128.0, 100.0), 128.0);
     }
 
     #[test]

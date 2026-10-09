@@ -3,8 +3,24 @@
 //! Zeitachse wie im Desktop-`pattern_recorder` und im Renoise-Clipboard: ein
 //! Pattern-Zyklus geht von 0.0 bis 1.0, ein Schritt belegt `1/steps_per_cycle`.
 
-/// Schritte je Pattern-Zyklus, unveränderlich für Desktop und Android.
+/// Schritte je Pattern-Zyklus als Vorgabe, wenn kein Bild die Länge vorgibt.
 pub const STEPS_PER_CYCLE: u16 = 16;
+/// Unter- und Obergrenze der Schrittzahl aus der Bildbreite.
+pub const MIN_SCHRITTE: u16 = 4;
+pub const MAX_SCHRITTE: u16 = 4096;
+
+/// Schrittzahl aus der **X-Auflösung des Bildes**: ein Schritt je Punkt Breite
+/// (wie im Desktop-rrn5 eine Spalte `x;key;iialpha;xkeyk`). Damit ist die
+/// Schrittzahl zugleich die Patternlänge; auf ganze Punkte gerundet.
+pub fn schritte_aus_breite(breite_pt: f32) -> u16 {
+    if !breite_pt.is_finite() || breite_pt <= 0.0 {
+        return MIN_SCHRITTE;
+    }
+    (breite_pt
+        .round()
+        .max(MIN_SCHRITTE as f32)
+        .min(MAX_SCHRITTE as f32)) as u16
+}
 
 const NOTE_NAMES: [&str; 12] = [
     "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
@@ -25,6 +41,8 @@ pub struct Note {
 pub struct Pattern {
     steps_per_cycle: u16,
     notes: Vec<Note>,
+    /// Startpunkt des Ausschnitts in der X-Auflösung (0 = ganzes Pattern).
+    abschnitt_von: u16,
 }
 
 impl Default for Pattern {
@@ -42,7 +60,42 @@ impl Pattern {
         Self {
             steps_per_cycle: steps_per_cycle.max(1),
             notes: Vec::new(),
+            abschnitt_von: 0,
         }
+    }
+
+    /// Pattern aus einem **Abschnitt** der X-Auflösung: `von` bis `bis`
+    /// (einschließlich). Genau wie am Desktop, wo `s` `0` nach „Width?" und
+    /// „Start?" fragt — der Ausschnitt bestimmt, wie lang das Pattern wird.
+    ///
+    /// Ende hinter dem Start beginnt beim Endpunkt (Start 0), Ende außerhalb der
+    /// X-Auflösung wird abgeschnitten. Schritte werden mit
+    /// [`Pattern::abschnitt_step`] in die Patternlänge übersetzt.
+    pub fn mit_abschnitt(von: u16, bis: u16, x_auflosung: u16) -> Self {
+        let aufloesung = x_auflosung.max(1);
+        let (von, bis) = (von.min(aufloesung - 1), bis.min(aufloesung - 1));
+        // Start hinter dem Ende: es gibt kein sinnvolles Fenster, also wird ab
+        // dem Endpunkt begonnen (Start 0).
+        let (von, bis) = if von > bis { (0, bis) } else { (von, bis) };
+        Self {
+            steps_per_cycle: (bis - von + 1).max(1),
+            notes: Vec::new(),
+            abschnitt_von: von,
+        }
+    }
+
+    /// Startpunkt des Ausschnitts; ohne Ausschnitt 0.
+    pub fn abschnitt_von(&self) -> u16 {
+        self.abschnitt_von
+    }
+
+    /// Übersetzt einen Schritt der X-Auflösung in die Patternlänge. Schritte
+    /// außerhalb des Ausschnitts werden umgebrochen, damit eine Note im Bild
+    /// immer irgendwo im Pattern landet.
+    pub fn abschnitt_step(&self, step: u16) -> u16 {
+        // In u32 rechnen: step nahe u16::MAX wuerde sonst ueberlaufen.
+        ((step as u32 + self.steps_per_cycle as u32 - self.abschnitt_von as u32)
+            % self.steps_per_cycle as u32) as u16
     }
 
     pub fn steps_per_cycle(&self) -> u16 {
@@ -87,7 +140,7 @@ impl Pattern {
     /// Setzt eine Note (inklusive Instrument) auf dem Schritt; vorhandene Noten
     /// auf dem Schritt werden ersetzt.
     pub fn insert(&mut self, note: Note) -> bool {
-        let step = note.step % self.steps_per_cycle;
+        let step = self.abschnitt_step(note.step);
         self.notes.retain(|n| n.step != step);
         self.notes.push(Note { step, ..note });
         self.notes.sort_by_key(|n| (n.step, n.pitch));
@@ -132,6 +185,35 @@ impl Pattern {
                 note.pitch,
                 if note.glide { 1 } else { 0 }
             );
+        }
+        out
+    }
+
+    /// Schism-Clipboard-Format wie im Desktop-Recorder
+    /// (`notes_to_schism_pattern`): Kopfzeile „Pasted Pattern - IT“, dann je
+    /// Schritt eine 12 Zeichen breite Zeile `|<Note>00..|...`; leere Schritte
+    /// sind `|...........` („|“ + 10 Punkte + Abschlusspunkt). Noten ohne Tonhöhe
+    /// (0 oder negativ) fallen weg.
+    pub fn to_schism(&self) -> String {
+        let mut out = String::from("Pasted Pattern - IT\n");
+        for schritt in 0..self.steps_per_cycle {
+            let mut zeile = String::new();
+            let mut getroffen = false;
+            for note in &self.notes {
+                if note.step == schritt && note.pitch > 0 {
+                    zeile += "|";
+                    zeile += &note_name(note.pitch);
+                    zeile += "00..";
+                    zeile += "...";
+                    zeile += ".\n";
+                    getroffen = true;
+                }
+            }
+            if !getroffen {
+                // Wie am Desktop: „|" + 10 Punkte + Abschlusspunkt = 12 Zeichen.
+                zeile += "|...........\n";
+            }
+            out += &zeile;
         }
         out
     }
@@ -374,6 +456,171 @@ mod tests {
         let mut p = pattern_with(&[(0, 36), (8, 48)]);
         p.clear();
         assert!(p.is_empty());
+    }
+
+    #[test]
+    fn schritte_aus_breite_ist_ein_schritt_je_punkt() {
+        assert_eq!(schritte_aus_breite(317.0), 317, "Hochformat");
+        assert_eq!(schritte_aus_breite(872.0), 872, "Querformat");
+        assert_eq!(schritte_aus_breite(317.4), 317, "gerundet");
+        assert_eq!(schritte_aus_breite(0.0), MIN_SCHRITTE, "leer = Minimum");
+        assert_eq!(schritte_aus_breite(-5.0), MIN_SCHRITTE);
+        assert_eq!(schritte_aus_breite(f32::NAN), MIN_SCHRITTE);
+        assert_eq!(schritte_aus_breite(99_999.0), MAX_SCHRITTE, "Obergrenze");
+        assert_eq!(schritte_aus_breite(2.0), MIN_SCHRITTE, "unter dem Minimum");
+    }
+
+    #[test]
+    fn csv_bleibt_normiert_0_bis_1() {
+        // Dieselben Zeitpunkte, zwei Patternlängen: der CSV bleibt 0..1, nur die
+        // Auflösung (steps_per_cycle) unterscheidet sich.
+        let mut a = Pattern::with_steps(16);
+        let mut b = Pattern::with_steps(40);
+        a.insert(Note {
+            step: 0,
+            instrument: 0,
+            pitch: 36,
+            glide: false,
+        });
+        b.insert(Note {
+            step: 0,
+            instrument: 0,
+            pitch: 36,
+            glide: false,
+        });
+        assert_eq!(a.to_csv(), b.to_csv());
+        assert_eq!(a.to_csv(), "0,0,36,0\n");
+    }
+
+    #[test]
+    fn einlesen_quantisiert_nach_der_aufloesung() {
+        let csv = "0.025,0,60,0\n0.5,0,64,0\n";
+        let fein = Pattern::from_csv(csv, 40).unwrap();
+        assert_eq!(fein.notes()[0].step, 1, "0,025 * 40 = 1");
+        assert_eq!(fein.notes()[1].step, 20);
+        let grob = Pattern::from_csv(csv, 16).unwrap();
+        assert_eq!(grob.notes()[0].step, 0, "0,025 * 16 = 0,4 gerundet 0");
+        assert_eq!(grob.notes()[1].step, 8);
+    }
+
+    #[test]
+    fn xml_indiziert_je_schritt_bis_zum_letzten() {
+        let mut p = Pattern::with_steps(40);
+        p.insert(Note {
+            step: 39,
+            instrument: 0,
+            pitch: 72,
+            glide: false,
+        });
+        let xml = p.to_renoise_xml();
+        assert!(xml.contains("Line index=\"39\""), "letzter Schritt: {xml}");
+        assert!(!xml.contains("index=\"40\""), "nur bis 39");
+        // Kuerzere Laenge: Schritte ausserhalb fallen weg (kein Umlauf).
+        assert!(
+            Pattern::from_renoise_xml(&xml, 16)
+                .unwrap()
+                .notes()
+                .is_empty(),
+            "Schritt 39 passt nicht in 16 Schritte"
+        );
+        // Genau diese Laenge liest die Note zurueck.
+        assert_eq!(
+            Pattern::from_renoise_xml(&xml, 40).unwrap().notes()[0].step,
+            39
+        );
+    }
+
+    #[test]
+    fn start_und_endpunkt_waehlen_den_abschnitt() {
+        // Der Nutzer legt fest, welcher Abschnitt der X-Aufloesung in die
+        // Patternlaenge kommt — so wird aus dem Bild ein Pattern von gewaehlter
+        // Laenge. Die Noten zaehlen ab dem Startpunkt wieder bei 0.
+        let mut p = Pattern::mit_abschnitt(4, 20, 40);
+        assert_eq!(p.steps_per_cycle(), 17, "Schritte 4..=20");
+        // Noten kommen in X-Aufloesungs-Schritten und landen im Ausschnitt bei 0.
+        p.insert(Note {
+            step: 4,
+            instrument: 0,
+            pitch: 36,
+            glide: false,
+        });
+        p.insert(Note {
+            step: 20,
+            instrument: 0,
+            pitch: 72,
+            glide: false,
+        });
+        // Der CSV bleibt normiert 0..1: Schritt 16 von 17 ist 16/17.
+        assert_eq!(p.to_csv(), "0,0,36,0\n0.9411765,0,72,0\n");
+        let xml = p.to_renoise_xml();
+        assert!(xml.contains("index=\"0\""), "{xml}");
+        assert!(xml.contains("index=\"16\""), "letzter Schritt: {xml}");
+    }
+
+    #[test]
+    fn abschnitt_begrenzt_die_schritte() {
+        let p = Pattern::mit_abschnitt(10, 10, 40);
+        assert_eq!(p.steps_per_cycle(), 1, "nur ein Schritt");
+        assert_eq!(p.abschnitt_von(), 10);
+        // Schritte werden in die Patternlaenge uebersetzt und umgebrochen.
+        assert_eq!(p.abschnitt_step(10), 0);
+        assert_eq!(p.abschnitt_step(9), 0, "eins davor, Umlauf");
+        assert_eq!(p.abschnitt_step(11), 0, "eins danach, Umlauf");
+
+        let mut ganz = Pattern::mit_abschnitt(4, 20, 40);
+        assert_eq!(ganz.abschnitt_step(4), 0, "Startpunkt = 0");
+        assert_eq!(ganz.abschnitt_step(20), 16, "Endpunkt = letzter Schritt");
+        assert_eq!(ganz.abschnitt_step(2), 15, "davor umgebrochen");
+        ganz.insert(Note {
+            step: 20,
+            instrument: 0,
+            pitch: 60,
+            glide: false,
+        });
+        assert_eq!(ganz.notes()[0].step, 16);
+        // Start hinter dem Ende: es gibt kein sinnvolles Fenster, also wird mit dem
+        // Endpunkt begonnen und der Start auf 0 gesetzt.
+        let verkehrt = Pattern::mit_abschnitt(40, 3, 16);
+        assert_eq!(verkehrt.steps_per_cycle(), 4, "0..=3");
+        assert_eq!(verkehrt.abschnitt_von(), 0);
+        // Ausserhalb der X-Aufloesung wird abgeschnitten.
+        let zu_breit = Pattern::mit_abschnitt(0, 99, 16);
+        assert_eq!(zu_breit.steps_per_cycle(), 16, "ganze Aufloesung");
+        assert_eq!(zu_breit.abschnitt_von(), 0);
+    }
+
+    #[test]
+    fn schism_export_trifft_das_clipboard_format() {
+        // Regression aus dem Desktop-Recorder
+        // (`notes_to_schism_pattern_matches_clipboard_format`): gleiche Noten,
+        // gleiche Zeilen, gleiche Zellenbreite.
+        let mut p = Pattern::with_steps(64);
+        for (step, pitch) in [(0, 60), (21, 60), (32, 61), (42, 60), (49, 61), (56, 62)] {
+            p.insert(Note {
+                step,
+                instrument: 0,
+                pitch,
+                glide: false,
+            });
+        }
+        let s = p.to_schism();
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(lines[0], "Pasted Pattern - IT");
+        assert_eq!(lines.len(), 65, "Kopfzeile + ein Schritt je Zeile");
+        for l in &lines[1..] {
+            assert_eq!(l.len(), 12, "Zellenbreite: {l}");
+        }
+        assert_eq!(lines[1], "|C-400......");
+        assert_eq!(lines[22], "|C-400......");
+        assert_eq!(lines[33], "|C#400......");
+        assert_eq!(lines[43], "|C-400......");
+        assert_eq!(lines[50], "|C#400......");
+        assert_eq!(lines[57], "|D-400......");
+        assert_eq!(Pattern::with_steps(3).to_schism().lines().count(), 4);
+        assert_eq!(
+            Pattern::with_steps(2).to_schism().lines().next().unwrap(),
+            "Pasted Pattern - IT"
+        );
     }
 
     #[test]

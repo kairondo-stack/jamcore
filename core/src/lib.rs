@@ -2,7 +2,9 @@
 //! Mikrofon-BPM, Live-Scan-Filter, Quintenzirkel-Geometrie, Pattern-Raster,
 //! OSC-Ausgang.
 
+pub mod bmp;
 pub mod diary;
+pub mod gesten;
 pub mod grid;
 pub mod klang;
 pub mod livescan;
@@ -11,7 +13,9 @@ pub mod micbpm;
 pub mod openmpt;
 pub mod osc;
 pub mod quint;
+pub mod scanmask;
 pub mod session;
+pub mod takte;
 pub mod transformation;
 pub mod yuv;
 

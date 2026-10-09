@@ -238,7 +238,11 @@ impl Mod {
             if p.is_null() {
                 return String::new();
             }
-            CStr::from_ptr(p).to_string_lossy().into_owned()
+            // libopenmpt gibt den String dynamisch heraus — ohne
+            // openmpt_free_string leckt jede Abfrage (der Player fragt je Frame).
+            let name = CStr::from_ptr(p).to_string_lossy().into_owned();
+            openmpt_free_string(p);
+            name
         }
     }
 

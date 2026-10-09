@@ -155,6 +155,33 @@ pub fn note_allowed(elapsed: Duration, max_per_sec: u32) -> bool {
     elapsed.as_secs_f64() >= 1.0 / max_per_sec as f64
 }
 
+/// Bildspalte für einen Sweep-Schritt in einem **Bereich**: `links` und
+/// `rechts` sind Anteile (0.0 … 1.0) der Bildbreite — wie die Split-Grenzen
+/// Alt+D/Alt+C im Desktop-rrn5. Schritt 0 liegt auf `links`, der letzte auf
+/// `rechts`; unbrauchbare Grenzen bedeuten die volle Breite.
+pub fn spalte_im_bereich(schritt: i32, schritte: i32, links: f32, rechts: f32, breite: i32) -> i32 {
+    let breite = breite.max(1);
+    // Beide Grenzen müssen brauchbar sein, sonst gilt die volle Breite.
+    let (links, rechts) = if links.is_finite() && rechts.is_finite() && rechts > links {
+        (links.clamp(0.0, 1.0), rechts.clamp(0.0, 1.0))
+    } else {
+        (0.0, 1.0)
+    };
+    let (links, rechts) = if rechts > links {
+        (links, rechts)
+    } else {
+        (0.0, 1.0)
+    };
+    let schritte = schritte.max(1);
+    let anteil = if schritte <= 1 {
+        0.0
+    } else {
+        schritt.clamp(0, schritte - 1) as f32 / (schritte - 1) as f32
+    };
+    let x = links * breite as f32 + anteil * (rechts - links) * breite as f32;
+    (x as i32).clamp(0, breite - 1)
+}
+
 /// Taktdauer pro Spalte: eine Spalte entspricht `h` Pixeln; damit dauert ein
 /// voller Durchlauf (alle Spalten) genau einen Beat wie bei `o`.
 pub fn column_interval_ns(h: i32, time_per_pixel_ns: i64) -> i64 {
@@ -269,6 +296,47 @@ mod tests {
     fn column_interval_matches_pixel_distance() {
         assert_eq!(column_interval_ns(240, 4_000), 960_000);
         assert_eq!(column_interval_ns(0, 0), 1);
+    }
+
+    #[test]
+    fn bereich_bildet_schritte_auf_spalten_ab() {
+        // 640 breit, Bereich 25 % … 75 % (Spalten 160 … 480).
+        assert_eq!(spalte_im_bereich(0, 2, 0.25, 0.75, 640), 160);
+        assert_eq!(spalte_im_bereich(1, 2, 0.25, 0.75, 640), 480);
+        assert_eq!(
+            spalte_im_bereich(0, 1, 0.25, 0.75, 640),
+            160,
+            "ein einziger Schritt liegt auf dem Anfang"
+        );
+        // Ohne Bereich die volle Breite, letzter Schritt bleibt im Bild.
+        assert_eq!(spalte_im_bereich(0, 2, 0.0, 1.0, 640), 0);
+        assert_eq!(spalte_im_bereich(1, 2, 0.0, 1.0, 640), 639);
+        // Unsinnige Grenzen: volle Breite.
+        assert_eq!(
+            spalte_im_bereich(1, 2, 0.8, 0.2, 640),
+            639,
+            "rechts < links"
+        );
+        assert_eq!(spalte_im_bereich(1, 2, f32::NAN, 0.5, 640), 639, "NaN");
+        // Schrittnummern werden geklemmt.
+        assert_eq!(spalte_im_bereich(99, 2, 0.25, 0.75, 640), 480);
+        assert_eq!(spalte_im_bereich(-3, 2, 0.25, 0.75, 640), 160);
+    }
+
+    #[test]
+    fn bereich_verkraftet_randfaelle() {
+        // Grenzen ausserhalb 0..1 werden geklemmt.
+        assert_eq!(spalte_im_bereich(0, 2, -1.0, 1.5, 640), 0);
+        assert_eq!(spalte_im_bereich(1, 2, -1.0, 1.5, 640), 639);
+        // links == rechts ist kein Bereich -> volle Breite.
+        assert_eq!(spalte_im_bereich(1, 2, 0.5, 0.5, 640), 639);
+        // Keine Breite und keine Schritte duerfen nicht paniken.
+        assert_eq!(spalte_im_bereich(0, 0, 0.25, 0.75, 0), 0);
+        assert_eq!(spalte_im_bereich(5, -4, 0.25, 0.75, 1), 0);
+        assert_eq!(spalte_im_bereich(5, 1, 0.0, 1.0, 100), 0, "ein Schritt");
+        // Unendlich zaehlt wie NaN: volle Breite.
+        assert_eq!(spalte_im_bereich(1, 2, f32::INFINITY, 0.5, 640), 639);
+        assert_eq!(spalte_im_bereich(1, 2, 0.1, f32::NEG_INFINITY, 640), 639);
     }
 
     #[test]

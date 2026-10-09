@@ -112,6 +112,23 @@ impl<'a> Renoise<'a> {
             vec![OscType::Bool(on)],
         )
     }
+
+    /// MIDI-Trigger wie im Desktop-rrn5 (`/renoise/trigger/midi`, Port 7002).
+    pub fn trigger_midi(&self, port: u16, value: i32) -> Result<u16, String> {
+        self.0
+            .send(port, "/renoise/trigger/midi", vec![OscType::Int(value)])
+    }
+}
+
+/// Tempo für die beiden Renoise-Ports: 7000 bekommt `bpm`, 7001 `bpm * teiler`
+/// (wie `send_bpm` im Desktop-rrn5). Ein Teiler, der nichts ändert oder
+/// unbrauchbar ist, liefert `None` für 7001.
+pub fn bpm_und_teiler(bpm: f32, teiler: f32) -> (f32, Option<f32>) {
+    if teiler.is_finite() && teiler > 0.0 && (teiler - 1.0).abs() > 1e-6 {
+        (bpm, Some(bpm * teiler))
+    } else {
+        (bpm, None)
+    }
 }
 
 #[cfg(test)]
@@ -131,6 +148,35 @@ mod tests {
     fn decode_addr(data: &[u8]) -> String {
         let end = data.iter().position(|b| *b == 0).unwrap_or(0);
         String::from_utf8_lossy(&data[..end]).into_owned()
+    }
+
+    #[test]
+    fn trigger_midi_reaches_receiver_on_mapped_port() {
+        let (port, sock) = receiver();
+        // 7002 wird auf Basis+2 abgebildet — die Basis liegt zwei darunter,
+        // damit der Empfaenger genau den gemappten Port hoert.
+        let out = OscOut::new("127.0.0.1", port.saturating_sub(2)).expect("out");
+        let used = Renoise::new(&out).trigger_midi(7002, 100).expect("send");
+        assert_eq!(used, port, "7002 wird auf Basis+2 gemappt");
+        let mut buf = [0u8; 256];
+        let (n, _) = sock.recv_from(&mut buf).expect("recv");
+        assert_eq!(decode_addr(&buf[..n]), "/renoise/trigger/midi");
+    }
+
+    #[test]
+    fn bpm_teiler_faltet_das_tempo_fuer_port_7001() {
+        // Wie `send_bpm` im Desktop-rrn5: 7000 bekommt das Tempo, 7001 das
+        // gefaltete Tempo — aber nur, wenn der Teiler wirklich etwas aendert.
+        assert_eq!(bpm_und_teiler(128.0, 1.0), (128.0, None));
+        assert_eq!(bpm_und_teiler(128.0, 0.5), (128.0, Some(64.0)));
+        assert_eq!(bpm_und_teiler(128.0, 2.0), (128.0, Some(256.0)));
+        assert_eq!(
+            bpm_und_teiler(128.0, 0.0),
+            (128.0, None),
+            "Null ist kein Teiler"
+        );
+        assert_eq!(bpm_und_teiler(128.0, -1.0), (128.0, None));
+        assert_eq!(bpm_und_teiler(128.0, f32::NAN), (128.0, None));
     }
 
     #[test]
