@@ -175,6 +175,11 @@ impl Mod {
         unsafe { openmpt_module_get_pattern_rows_per_beat(self.ptr, pattern) }.max(1)
     }
 
+    /// Anzahl der Zeilen eines Patterns (für den Struktur-Dump).
+    pub fn pattern_num_rows(&self, pattern: i32) -> i32 {
+        unsafe { openmpt_module_get_pattern_num_rows(self.ptr, pattern) }
+    }
+
     pub fn order_pattern(&self, order: i32) -> i32 {
         unsafe { openmpt_module_get_order_pattern(self.ptr, order) }
     }

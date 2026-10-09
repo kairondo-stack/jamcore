@@ -84,6 +84,8 @@ struct JamApp {
     tempo_bpm: f32,
     /// Tempo-Teiler fuer Renoise-Port 7001 (wie rrn5 send_bpm; 1.0 = aus).
     tempo_teiler: f32,
+    /// Laenge des WAV-Renders im Player-Tab (Sekunden).
+    wav_sekunden: f64,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -120,6 +122,7 @@ impl Default for JamApp {
             maske: maske::MaskePanel::default(),
             tempo_bpm: 128.0,
             tempo_teiler: 1.0,
+            wav_sekunden: 60.0,
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -685,6 +688,45 @@ impl JamApp {
         });
     }
 
+    /// Rendert das geladene Modul als WAV in den App-Ordner `wav/` (Desktop:
+    /// `it_live --wav`). Stoppt dafuer die Wiedergabe — der Renderer braucht das
+    /// Modul exklusiv.
+    fn wav_sichern(&mut self) {
+        let Some(app) = self.app() else {
+            self.meldung = "Keine Activity".to_string();
+            return;
+        };
+        let Some(basis) = insets::external_files_dir(app) else {
+            self.meldung = "Kein App-Ordner".to_string();
+            return;
+        };
+        let name = self
+            .player
+            .as_ref()
+            .map(|p| {
+                std::path::Path::new(p.pfad())
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "modul".to_string())
+            })
+            .unwrap_or_else(|| "modul".to_string());
+        let ordner = std::path::PathBuf::from(basis).join("wav");
+        let _ = std::fs::create_dir_all(&ordner);
+        let pfad = ordner.join(format!("{name}.wav"));
+        let sekunden = self.wav_sekunden;
+        let Some(player) = self.player.as_mut() else {
+            self.meldung = "Kein Modul geladen".to_string();
+            return;
+        };
+        self.status = format!("Rendere {sekunden:.0} s WAV …");
+        match player.wav_schreiben(&pfad.display().to_string(), sekunden) {
+            Ok(frames) => {
+                self.status = format!("WAV: {} ({} Frames)", pfad.display(), frames);
+            }
+            Err(e) => self.meldung = format!("WAV-Fehler: {e}"),
+        }
+    }
+
     fn view_player(&mut self, ui: &mut egui::Ui) {
         // Werte laufen im Audio-Thread, also regelmaessig neu zeichnen.
         ui.ctx()
@@ -701,6 +743,18 @@ impl JamApp {
                     self.stop();
                 }
                 ui.checkbox(&mut self.looping, "Dauerschleife");
+            });
+            // WAV-Render wie `it_live --wav` (Stoppt die Wiedergabe).
+            ui.horizontal(|ui| {
+                ui.label("WAV");
+                ui.add(
+                    egui::DragValue::new(&mut self.wav_sekunden)
+                        .range(5.0..=600.0)
+                        .suffix(" s"),
+                );
+                if ui.button("WAV sichern").clicked() {
+                    self.wav_sichern();
+                }
             });
             ui.separator();
 
@@ -761,6 +815,16 @@ impl JamApp {
                 if !samples.is_empty() {
                     ui.collapsing(format!("Samples ({})", samples.len()), |ui| {
                         ui.label(samples.join(", "));
+                    });
+                }
+                // Struktur-Dump wie `it_live --dump` (Orders mit Pattern und
+                // Zeilen; `<BREAK>` = 0xFFFE).
+                let struktur = player.struktur(48);
+                if !struktur.is_empty() {
+                    ui.collapsing("Struktur", |ui| {
+                        for zeile in &struktur {
+                            ui.label(zeile);
+                        }
                     });
                 }
             } else {

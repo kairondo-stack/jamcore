@@ -17,9 +17,9 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 | # | Status | Fehlt/Details |
 |---|---|---|
 | 1 | ✅ | **Modul-Info und Sample-Namen** — `player.rs::info_paare()` (Titel, Künstler, Format, Länge, Aufbau) und `sample_namen()`; Anzeige im Player-Tab. Beim Abarbeiten fiel ein **libopenmpt-Leck** auf (`sample_name` gab den String nicht frei) — behoben. |
-| 2 | ❌ | **WAV-Rendern** (`--wav`) auf Android nicht vorhanden |
-| 3 | ❌ | **Struktur-Dump** (`--dump`) auf Android nicht vorhanden |
-| 4 | ❌ | **Beat-genaue Order-Variation** (alle 4 Beats Order auf `creative % 8`) fehlt |
+| 2 | ✅ | **WAV-Rendern** — Knopf im Player (Sekundenfeld, Vorgabe 60 s) schreibt nach `wav/<name>.wav`; Kern `wav::wav_stereo` (Tests). Gerätetest: `file` erkennt „RIFF, WAVE PCM 16 bit stereo 44100 Hz", 2.646.000 Frames = 60,0 s |
+| 3 | ✅ | **Struktur-Dump** — aufklappbar „Struktur" im Player: Order, Pattern, Zeilen je Pattern, `<BREAK>`; Gerätetest: 26 Orders mit Patterns und 128 Zeilen |
+| 4 | ✅ | **Beat-genaue Order-Variation** — im WAV-Render wie `render_variation`: alle vier Beats Order auf `(creative-1) % 8`, nur wenn das Pattern später vorkommt, Zeile bleibt; Kern `BeatTracker` + `order_mit_pattern` (Tests) |
 
 *Nicht übertragbar:* `--device`, `--seconds`/Enter, cpal (ersetzt durch AudioTrack).
 

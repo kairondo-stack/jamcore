@@ -152,6 +152,11 @@ impl Player {
         namen
     }
 
+    /// Pfad der geladenen Datei.
+    pub fn pfad(&self) -> &str {
+        &self.path
+    }
+
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
     }
@@ -207,7 +212,54 @@ impl Player {
         }
         let _ = call_void(&self.vm, &self.track, "stop", "()V");
         let _ = call_void(&self.vm, &self.track, "release", "()V");
-        info!("jamandroid: Wiedergabe beendet ({})", self.path);
+        info!("Wiedergabe beendet ({})", self.path);
+    }
+
+    /// Rendert eine taktkompatible Variation als WAV-Datei (Desktop-it_live:
+    /// `--wav`). Stoppt dabei die Wiedergabe, weil der Renderer das Modul
+    /// exklusiv braucht; liefert die Zahl der geschriebenen Frames.
+    pub fn wav_schreiben(&mut self, pfad: &str, sekunden: f64) -> Result<usize, String> {
+        self.stop();
+        let modul = self
+            .shared
+            .module
+            .lock()
+            .map_err(|_| "Modul gesperrt".to_string())?;
+        let rate = self.shared.sample_rate.max(8000) as u32;
+        let bytes = jamcore::wav::wav_variation(&modul, sekunden, rate);
+        let frames = bytes.len().saturating_sub(44) / 4;
+        std::fs::write(pfad, &bytes).map_err(|e| e.to_string())?;
+        info!("WAV geschrieben: {pfad} ({frames} Frames, {sekunden:.0} s)");
+        Ok(frames)
+    }
+
+    /// Struktur für den Dump: je Order das Pattern, `<BREAK>` markiert
+    /// 0xFFFE wie im Desktop, dazu die Zeilen je Pattern.
+    pub fn struktur(&self, max_orders: usize) -> Vec<String> {
+        let Ok(modul) = self.shared.module.lock() else {
+            return Vec::new();
+        };
+        let mut zeilen = Vec::new();
+        let anzahl = (modul.num_orders() as usize).min(max_orders.max(1));
+        for order in 0..anzahl {
+            let pattern = modul.order_pattern(order as i32);
+            let marke = if pattern == 0xFFFE { " <BREAK>" } else { "" };
+            let rows = if (0..modul.num_patterns()).contains(&pattern) {
+                modul.pattern_num_rows(pattern)
+            } else {
+                0
+            };
+            zeilen.push(format!(
+                "Order {order}: Pattern {pattern} ({rows} Zeilen){marke}"
+            ));
+        }
+        if modul.num_orders() as usize > anzahl {
+            zeilen.push(format!(
+                "… {} weitere",
+                modul.num_orders() as usize - anzahl
+            ));
+        }
+        zeilen
     }
 }
 

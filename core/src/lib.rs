@@ -17,6 +17,7 @@ pub mod scanmask;
 pub mod session;
 pub mod takte;
 pub mod transformation;
+pub mod wav;
 pub mod yuv;
 
 /// Ableton-Link-SDK (GPLv2, siehe `Cargo.toml`, Feature `link`).
