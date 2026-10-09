@@ -1024,6 +1024,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -1061,6 +1063,7 @@ dependencies = [
  "android-activity",
  "android_logger",
  "eframe",
+ "image",
  "jamcore",
  "jni 0.21.1",
  "log",

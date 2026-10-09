@@ -11,7 +11,8 @@
 use eframe::egui::{self, Color32, TextureOptions};
 
 use jamcore::livescan::{
-    build_palette, note_allowed, note_volume, pixel_matches, scale_rgb, scan_column, ScanFilter,
+    build_palette, note_allowed, note_volume, note_volume_farbe, pixel_matches, scale_rgb,
+    scan_column, ScanFilter,
 };
 use jamcore::osc::{OscOut, Renoise};
 use jamcore::scanmask::{Aufloesung, ScanMaske};
@@ -49,6 +50,20 @@ fn gesperrte_spalten(maske: &ScanMaske, schritte: usize) -> usize {
         .sum()
 }
 
+/// Ist die Datei ein Standbild (Endungen wie im Desktop-rrn5,
+/// `filter_image_files`: png/jpg/jpeg/bmp).
+fn ist_bild(pfad: &str) -> bool {
+    std::path::Path::new(pfad)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            ["png", "jpg", "jpeg", "bmp"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        })
+        .unwrap_or(false)
+}
+
 pub struct ImagePanel {
     texture: Option<egui::TextureHandle>,
     textur_masse: (usize, usize),
@@ -63,7 +78,8 @@ pub struct ImagePanel {
     toleranz: (i32, i32, i32),
     treffer: u64,
     status: String,
-    /// noteadjust-Modus des Scans (0 = Zeile, 2/3 = y, 5/6 = x).
+    /// noteadjust-Modus des Scans: 0 = Farbe (`note_volume_farbe`), 1-8 =
+    /// Lage im Bild (Desktop-rrn5, `event_note_volume`).
     note_modus: u8,
     /// Malen (Merken): Farben beim Ziehen in den Merker uebernehmen.
     malen_an: bool,
@@ -180,38 +196,75 @@ impl ImagePanel {
         let Some(basis) = crate::insets::external_files_dir(&app) else {
             return;
         };
-        let ordner = std::path::PathBuf::from(basis).join("videos");
-        let _ = std::fs::create_dir_all(&ordner);
-        let Ok(eintraege) = std::fs::read_dir(&ordner) else {
-            return;
-        };
-        for eintrag in eintraege.flatten() {
-            let pfad = eintrag.path();
-            let ist_video = pfad
-                .extension()
-                .and_then(|e| e.to_str())
-                .map(|e| {
-                    ["mp4", "mkv", "webm", "avi", "mov", "3gp"]
-                        .iter()
-                        .any(|x| e.eq_ignore_ascii_case(x))
-                })
-                .unwrap_or(false);
-            if ist_video {
-                self.videos.push(pfad.display().to_string());
+        // Videos aus `videos/`, Standbilder aus `bilder/` — wie am Desktop
+        // (dort liest rrn5 ein Verzeichnis mit png/jpg/jpeg/bmp).
+        for (ordner_name, endungen) in [
+            ("videos", &["mp4", "mkv", "webm", "avi", "mov", "3gp"][..]),
+            ("bilder", &["png", "jpg", "jpeg", "bmp"][..]),
+        ] {
+            let ordner = std::path::PathBuf::from(&basis).join(ordner_name);
+            let _ = std::fs::create_dir_all(&ordner);
+            let Ok(eintraege) = std::fs::read_dir(&ordner) else {
+                continue;
+            };
+            for eintrag in eintraege.flatten() {
+                let pfad = eintrag.path();
+                let passt = pfad
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| endungen.iter().any(|x| e.eq_ignore_ascii_case(x)))
+                    .unwrap_or(false);
+                if passt {
+                    self.videos.push(pfad.display().to_string());
+                }
             }
         }
         self.videos.sort();
         if self.video_auswahl.is_none() {
             self.video_auswahl = self.videos.first().cloned();
         }
-        self.status = format!("{} Videos gefunden", self.videos.len());
+        self.status = format!("{} Quellen gefunden", self.videos.len());
+    }
+
+    /// Laedt ein Standbild aus `bilder/` in den Framepuffer. Grosse Bilder
+    /// werden auf 640 Punkte lange Kante verkleinert (wie die Kameraauflösung).
+    fn bild_an(&mut self, pfad: &str) {
+        if let Ok(app) = crate::current_app() {
+            camera::stop(&app);
+            video::stop(&app);
+        }
+        self.video_laeuft = false;
+        self.eingefroren = None;
+        self.sel = None;
+        self.scan_puffer = None;
+        match image::open(pfad) {
+            Ok(bild) => {
+                // Seitenverhaeltnis bleibt erhalten; nur die lange Kante wird
+                // auf 640 begrenzt (wie die Kameraaufloesung).
+                let bild = if bild.width().max(bild.height()) > 640 {
+                    bild.resize(640, 640, image::imageops::FilterType::Triangle)
+                } else {
+                    bild
+                };
+                let (breite, hoehe) = (bild.width() as usize, bild.height() as usize);
+                camera::ruhebild_setzen(breite, hoehe, bild.to_rgba8().into_raw());
+                self.status = format!("Bild geladen: {breite}x{hoehe}");
+                log::info!("Standbild geladen: {pfad} ({breite}x{hoehe})");
+            }
+            Err(e) => self.status = format!("Bild nicht lesbar: {e}"),
+        }
     }
 
     fn video_an(&mut self) {
         let Some(pfad) = self.video_auswahl.clone() else {
-            self.status = "Kein Video ausgewählt (erst suchen).".to_string();
+            self.status = "Keine Quelle ausgewählt (erst suchen).".to_string();
             return;
         };
+        // Standbilder aus `bilder/` werden einmal geladen statt abgespielt.
+        if ist_bild(&pfad) {
+            self.bild_an(&pfad);
+            return;
+        }
         // Nur eine Quelle gleichzeitig.
         if let Ok(app) = crate::current_app() {
             camera::stop(&app);
@@ -606,8 +659,13 @@ impl ImagePanel {
                         puffer[idx + 2] = db;
                         puffer[idx + 3] = 255;
                         // Note/Lautstaerke nach dem gewaehlten Zuordnungsmodus
-                        // (wie noteadjust im Desktop-rrn5).
-                        let (note, vol) = note_volume(x, *y, wi, hi, self.note_modus, 36, 36);
+                        // (wie noteadjust im Desktop-rrn5). Modus 0 nimmt die
+                        // Farbe des Treffers, 1-8 die Lage im Bild.
+                        let (note, vol) = if self.note_modus == 0 {
+                            note_volume_farbe(*r, *g, *b, 36, 36)
+                        } else {
+                            note_volume(x, *y, wi, hi, self.note_modus, 36, 36)
+                        };
                         noten.push((note, ((vol as f32 * alpha) as i32).clamp(0, 127)));
                         self.sweep_gezeichnet += 1;
                     }
@@ -679,17 +737,20 @@ impl ImagePanel {
                 self.scan_naechste_spalte = std::time::Instant::now();
                 self.status = format!("Scan {}", if self.scan_an { "an" } else { "aus" });
             }
-            let modi: [u8; 5] = [0, 2, 3, 5, 6];
             let namen = [
+                "Note: Farbe",
                 "Note: Zeile",
-                "Note: y, Vol rechts leise",
-                "Note: y umgekehrt",
-                "Note: Spalte",
-                "Note: x umgekehrt",
+                "Note: y steigt, Vol leise",
+                "Note: y fällt, Vol laut",
+                "Note: y fällt, Vol leise",
+                "Note: x steigt, Vol laut",
+                "Note: x steigt, Vol leise",
+                "Note: x fällt, Vol laut",
+                "Note: x fällt, Vol leise",
             ];
-            let idx = modi.iter().position(|m| *m == self.note_modus).unwrap_or(0);
+            let idx = (self.note_modus as usize).min(namen.len() - 1);
             if ui.button(namen[idx]).clicked() {
-                self.note_modus = modi[(idx + 1) % modi.len()];
+                self.note_modus = ((idx + 1) % namen.len()) as u8;
             }
             ui.label(format!(
                 "Sweep: {} Noten, {} gezeichnet",
@@ -710,7 +771,7 @@ impl ImagePanel {
             }
         }
         ui.horizontal(|ui| {
-            if ui.button("Videos suchen").clicked() {
+            if ui.button("Quellen suchen").clicked() {
                 self.videos_scannen();
             }
             let mut gewaehlt = self.video_auswahl.clone();
@@ -731,10 +792,10 @@ impl ImagePanel {
                     }
                 });
             self.video_auswahl = gewaehlt;
-            if ui.button("Video an").clicked() {
+            if ui.button("Quelle an").clicked() {
                 self.video_an();
             }
-            if ui.button("Video aus").clicked() {
+            if ui.button("Quelle aus").clicked() {
                 self.video_aus();
             }
             ui.label("fps");

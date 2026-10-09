@@ -29,13 +29,13 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 |---|---|---|
 | 1 | ✅ | **Scan-Bereich links/rechts** — Regler „Bereich von/bis %“ + „ganz“ im Zoom-Block; Kern `livescan::spalte_im_bereich` (Tests inkl. NaN/Invertiert/Klemmen). Sweep und Maskenleiste liegen nur im Bereich. |
 | 2 | ⚠️ | **Scan-Schrittweite `iadd`** — bewusst weg (der Sweep läuft über die Schrittzahl); die Schrittzahl ersetzt sie |
-| 3 | ❌ | **Zeilen-Ausdünnung `jadd`** fehlt |
-| 4 | ⚠️ | **Zuordnungen 1/4** fehlen (Kern fällt auf Modus 0 zurück), **7/8** stecken hinter 5/6, UI bietet 0/2/3/5/6 |
+| 3 | ⚠️ | **Zeilen-Ausdünnung `jadd`** — laut Desktop-Beleg nur bei der Maus-Rasterabtastung (mittlere Taste) wirksam, nicht im Live-Scan; auf Touch nicht übertragbar |
+| 4 | ✅ | **Alle neun Zuordnungen** — 0 = Farbe (`note_volume_farbe`), 1–8 nach den Desktop-Formeln (6/7 waren vertauscht und sind korrigiert), UI bietet 0…8 |
 | 5 | ❌ | **Harmonics, Harmonien-Editor, Chord-Filter** (`is_note_in_chordpatt`, `chordTypes`, `useNotesSet`, Major/Plagal) fehlen komplett |
 | 6 | ❌ | **Frequenzspanne/Teiler** (`y_ashape`) fehlt; der Quintenzirkel (Kreis-Tab) ist da |
 | 7 | ✅ | **KeyEventRender.txt** — Knöpfe „Datei sichern“/„Datei laden“ im Bild-Tab (`als_keyevent`/`aus_keyevent`); Rest hinter der Datei bleibt gesperrt (rrn5-Semantik). Die BPM/Dauer-Übernahme aus der Datei gibt es nicht mehr (die App hat **ein** Tempo). |
 | 8 | ✅ | **Snapshot als BMP** — Knopf „Snapshot“ schreibt `frame4save.bmp`; eigener BMP-Schreiber im Kern (`core/src/bmp.rs`, Tests) ohne neue Abhängigkeit |
-| 9 | ❌ | **Bilddateien als Quelle** (PNG/JPG/BMP) — Android liest nur Videos aus `videos/` |
+| 9 | ✅ | **Bilddateien als Quelle** — Ordner `bilder/` (png/jpg/jpeg/bmp), laden über die `image`-Kiste, verkleinert auf 640er-Kante; Auswahl im selben Dropdown wie Videos |
 | 10 | ✅ | **MIDI-Trigger (Port 7002)** — `Renoise::trigger_midi` (Test) läuft im Bild-Scan neben `note_on` mit, wie im Desktop |
 | 11 | ✅ | **BPM-Teiler (Port 7001)** — Regler „Teiler“ im OSC-Tab + `bpm_und_teiler` (Test). ⚠️ Anders als rrn5 sendet die App Port 7001 nur, wenn der Teiler ≠ 1 ist. |
 | 12 | ❌ | **Pattern-XML aus den Scan-Treffern** (`g`) — der Tagebuch-Export zeigt den Masken-Ausschnitt (noch ohne Noten) |
@@ -71,14 +71,24 @@ SDL-Audio (ersetzt durch `klang.rs`).
 - **Bildbetrachter `imgsh`** entfällt (kein Prozess-Shared-Memory); die Rolle
   „Bilder zuführen“ hat der Ordner `videos/` — **Standbilder fehlen** (rrn5 Nr. 9).
 
+## Runde 2 (2026-10-09): Zuordnungen und Standbilder erledigt
+
+- **Alle neun Notenzuordnungen** — 0 = Farbe (`note_volume_farbe`), 1–8 nach
+  `event_note_volume`; dabei war 6/7 im Kern vertauscht (korrigiert). Kern-Tests 143 grün;
+  Gerätetest: der Modus-Knopf zeigt „Note: Farbe".
+- **Standbilder als Quelle** — `bilder/` (png/jpg/jpeg/bmp) wird mitgescannt, Laden über
+  die `image`-Kiste, auf 640er-Kante verkleinert. Gerätetest mit einem farbigen 8×8-BMP:
+  blau/weiß oben, rot/grün unten, korrekt dargestellt; Log „Standbild geladen: … (8x8)".
+- **`jadd`** ist laut Desktop-Beleg (Subagent, `rrn5/src/main.rs` 2619–2659) Teil der
+  Maus-Rasterabtastung (mittlere Taste), nicht des Live-Scans → als nicht übertragbar
+  festgehalten.
+
 ## Offene Punkte, nach Nutzen sortiert
 
 1. **Harmonics/Chord-Filter** (rrn5 Nr. 5)
 2. **Recorder-Ketten** + Graph-Editor + Notenrampe/remove_and_record (pattern_recorder Nr. 2–6)
-3. **Scan-Feinschliff**: Zuordnungen 1/4/7/8, jadd (rrn5 Nr. 3–4)
-4. **Player**: WAV-Rendern, Struktur-Dump, Order-Variation (it_live Nr. 2–4)
-5. **Standbilder als Quelle** (braucht einen Decoder), **Bild-Follow** (rrn5 Nr. 9, 15)
-6. **Einzel-Slot-Wiedergabe** und Pattern-Dauer (pattern_recorder Nr. 10–11)
+3. **Player**: WAV-Rendern, Struktur-Dump, Order-Variation (it_live Nr. 2–4)
+4. **Bild-Follow** (rrn5 Nr. 15) und **Einzel-Slot-Wiedergabe** + Pattern-Dauer (pattern_recorder Nr. 10–11)
 
 ## Gerätetest — am 2026-10-09 auf dem Pixel 10 Pro durchgeführt
 

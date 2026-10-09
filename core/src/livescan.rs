@@ -340,6 +340,77 @@ mod tests {
     }
 
     #[test]
+    fn noten_modi_folgen_dem_desktop() {
+        // Formeln wie `event_note_volume` im Desktop-rrn5.
+        let (w, h, scale, add, x, y) = (100, 50, 120, 10, 25, 10);
+        let y_steigend = (y * scale / h + add).clamp(0, 127); // 34
+        let y_fallend = (scale - y * scale / h + add).clamp(0, 127); // 106
+        let x_steigend = (x * scale / w + add).clamp(0, 127); // 40
+        let x_fallend = (scale - x * scale / w + add).clamp(0, 127); // 100
+        let vol_rechts_laut = x * 127 / w; // 31
+        let vol_rechts_leise = 127 - x * 127 / w; // 96
+        assert_eq!(
+            note_volume(x, y, w, h, 1, scale, add),
+            (y_fallend, 127),
+            "Modus 1: Note aus der Zeile (wie der _-Zweig)"
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 2, scale, add),
+            (y_steigend, vol_rechts_leise)
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 3, scale, add),
+            (y_fallend, vol_rechts_laut)
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 4, scale, add),
+            (y_fallend, vol_rechts_leise)
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 5, scale, add),
+            (x_steigend, vol_rechts_laut)
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 6, scale, add),
+            (x_steigend, vol_rechts_leise),
+            "Modus 6 steigt mit x"
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 7, scale, add),
+            (x_fallend, vol_rechts_laut),
+            "Modus 7 faellt mit x"
+        );
+        assert_eq!(
+            note_volume(x, y, w, h, 8, scale, add),
+            (x_fallend, vol_rechts_leise),
+            "Modus 8 faellt mit x"
+        );
+        // Unbekannte Modi fallen wie am Desktop auf den _-Zweig zurueck.
+        assert_eq!(note_volume(x, y, w, h, 9, scale, add), (y_fallend, 127));
+        assert_eq!(
+            note_volume(x, y, w, h, 0, scale, add),
+            (y_fallend, 127),
+            "Modus 0 wird im Bild-Tab farbbasiert gerechnet"
+        );
+    }
+
+    #[test]
+    fn noten_modus_farbe_nimmt_den_farbanteil() {
+        // `color_to_note_value_and_volume`: Rot/Gruen/Blau bestimmen Note und
+        // Lautstaerke (die Testwerte liegen im gueltigen Bereich).
+        assert_eq!(note_volume_farbe(200, 50, 30, 60, 0), (47, 46), "Rot");
+        assert_eq!(note_volume_farbe(10, 200, 30, 60, 0), (68, 40), "Gruen");
+        assert_eq!(note_volume_farbe(10, 20, 200, 60, 0), (89, 38), "Blau");
+        assert_eq!(
+            note_volume_farbe(200, 50, 30, 60, 12),
+            (59, 46),
+            "add wirkt als Grundton"
+        );
+        // Ergebnis bleibt im MIDI-Bereich.
+        assert_eq!(note_volume_farbe(255, 255, 255, 120, 60), (127, 127));
+    }
+
+    #[test]
     fn mask_alpha_gates_columns() {
         let alphas = [0.0f32, 0.5, 1.0];
         assert_eq!(mask_alpha(&alphas, 0), 0.0);
@@ -367,13 +438,18 @@ mod tests {
 /// Ton und Lautstärke eines Farbtreffers je Zuordnungsmodus
 /// (Portierung von `event_note_volume` aus dem Desktop-rrn5):
 ///
-/// - 0: Note aus der Zeile (oben hoch), Lautstärke 127
-/// - 2: Note aus y, Lautstärke fällt nach rechts
-/// - 3: Note aus y (umgekehrt), Lautstärke steigt nach rechts
-/// - 5: Note aus x, Lautstärke steigt nach rechts
-/// - 6: Note aus x, Lautstärke fällt nach rechts
+/// - 0: nicht hier — im Bild-Tab farbbasiert über [`note_volume_farbe`]
+/// - 1: Note aus der Zeile, fallend mit y; Lautstärke 127 (der `_`-Zweig)
+/// - 2: Note steigt mit y, Lautstärke fällt nach rechts
+/// - 3: Note fällt mit y, Lautstärke steigt nach rechts
+/// - 4: Note fällt mit y, Lautstärke fällt nach rechts
+/// - 5: Note steigt mit x, Lautstärke steigt nach rechts
+/// - 6: Note steigt mit x, Lautstärke fällt nach rechts
+/// - 7: Note fällt mit x, Lautstärke steigt nach rechts
+/// - 8: Note fällt mit x, Lautstärke fällt nach rechts
 ///
-/// `note_scale` ist der Tonumfang, `add` der Grundton.
+/// `note_scale` ist der Tonumfang, `add` der Grundton. Anders als am Desktop
+/// wird auf 0..=127 geklemmt (gültige MIDI-Werte).
 pub fn note_volume(
     x: i32,
     y: i32,
@@ -386,16 +462,16 @@ pub fn note_volume(
     let w = w.max(1);
     let h = h.max(1);
     let scale = note_scale.max(1);
-    let aus_y = |umgekehrt: bool| {
-        let anteil = if umgekehrt {
+    let aus_y = |steigend: bool| {
+        let anteil = if steigend {
             y * scale / h
         } else {
             scale - y * scale / h
         };
         (anteil + add).clamp(0, 127)
     };
-    let aus_x = |umgekehrt: bool| {
-        let anteil = if umgekehrt {
+    let aus_x = |fallend: bool| {
+        let anteil = if fallend {
             scale - x * scale / w
         } else {
             x * scale / w
@@ -405,10 +481,28 @@ pub fn note_volume(
     match modus {
         2 => (aus_y(true), (127 - x * 127 / w).clamp(0, 127)),
         3 => (aus_y(false), (x * 127 / w).clamp(0, 127)),
-        5 | 7 => (aus_x(false), (x * 127 / w).clamp(0, 127)),
-        6 | 8 => (aus_x(true), (127 - x * 127 / w).clamp(0, 127)),
+        4 => (aus_y(false), (127 - x * 127 / w).clamp(0, 127)),
+        5 => (aus_x(false), (x * 127 / w).clamp(0, 127)),
+        6 => (aus_x(false), (127 - x * 127 / w).clamp(0, 127)),
+        7 => (aus_x(true), (x * 127 / w).clamp(0, 127)),
+        8 => (aus_x(true), (127 - x * 127 / w).clamp(0, 127)),
         _ => (aus_y(false), 127),
     }
+}
+
+/// Modus 0 wie am Desktop (`color_to_note_value_and_volume`): die Farbe des
+/// Treffers bestimmt Note und Lautstärke.
+pub fn note_volume_farbe(r: u8, g: u8, b: u8, note_scale: i32, add: i32) -> (i32, i32) {
+    let scale = note_scale.max(1);
+    let lautstaerke = ((r as i32 + g as i32 + b as i32) / 6).clamp(0, 127);
+    let note = if r > g && r > b {
+        r as i32 * scale / 255 + add
+    } else if g > r && g > b {
+        g as i32 * scale / 255 + add + 43 * scale / 120
+    } else {
+        b as i32 * scale / 255 + add + 85 * scale / 120
+    };
+    (note.clamp(0, 127), lautstaerke)
 }
 
 #[cfg(test)]
@@ -416,8 +510,9 @@ mod tests_note_volume {
     use super::*;
 
     #[test]
-    fn modus_null_nimmt_die_zeile() {
-        // Standard-Modus: oben hohe Note, unten tiefe, Lautstärke voll.
+    fn modus_null_ist_im_kern_der_zeilen_fallback() {
+        // Modus 0 rechnet der Bild-Tab farbbasiert; der Kern faellt fuer 0 auf
+        // den _-Zweig zurueck (Note aus der Zeile, Lautstaerke voll).
         assert_eq!(note_volume(0, 0, 100, 100, 0, 36, 36), (72, 127));
         assert_eq!(note_volume(50, 50, 100, 100, 0, 36, 36), (54, 127));
         assert_eq!(note_volume(0, 100, 100, 100, 0, 36, 36), (36, 127));
@@ -438,9 +533,11 @@ mod tests_note_volume {
 
     #[test]
     fn modus_fuenf_und_sechs_nehmen_die_spalte() {
+        // Beide steigen mit x; Modus 5 ist rechts laut, Modus 6 rechts leise.
         assert_eq!(note_volume(0, 0, 100, 100, 5, 36, 36).0, 36);
         assert_eq!(note_volume(100, 0, 100, 100, 5, 36, 36).0, 72);
-        assert_eq!(note_volume(0, 0, 100, 100, 6, 36, 36).0, 72);
+        assert_eq!(note_volume(0, 0, 100, 100, 6, 36, 36).0, 36);
+        assert_eq!(note_volume(100, 0, 100, 100, 6, 36, 36).0, 72);
         assert_eq!(note_volume(100, 0, 100, 100, 6, 36, 36).1, 0);
     }
 

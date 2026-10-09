@@ -207,6 +207,23 @@ pub extern "system" fn Java_org_jamcore_app_CameraBridge_nativeFrame(
     );
 }
 
+/// Legt ein fertiges RGBA-Bild als Standbild in den Framepuffer — der Weg
+/// für Standbilder aus dem `bilder/`-Ordner. Vorschau, Farbauswahl und Scan
+/// arbeiten danach genau wie beim Kamerabild.
+pub fn ruhebild_setzen(breite: usize, hoehe: usize, rgba: Vec<u8>) {
+    // Genau die erwartete Groesse: `ColorImage::from_rgba_unmultiplied` besteht
+    // auf exakter Laenge.
+    if breite == 0 || hoehe == 0 || rgba.len() != breite * hoehe * 4 {
+        return;
+    }
+    if let Ok(mut frame) = frame_slot().lock() {
+        frame.width = breite;
+        frame.height = hoehe;
+        frame.rgba = rgba;
+        frame.nummer += 1;
+    }
+}
+
 /// Rechnet drei YUV_420_888-Planes nach RGBA und legt das Bild in den
 /// Framepuffer. Kamera und Videodekoder teilen sich diesen Weg.
 pub(crate) fn ablegen(
