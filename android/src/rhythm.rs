@@ -51,6 +51,13 @@ pub struct RhythmPanel {
     /// Skalenfilter fuer gesetzte Toene (0 = aus).
     skala: usize,
     grundton: i32,
+    /// Notenrampe (Desktop-Taste 2).
+    rampe_anzahl: i32,
+    /// Sinus-Interpolation (Desktop D+3).
+    interp_schritte: i32,
+    interp_amplitude: f32,
+    interp_faktor: f32,
+    interp_kurve: i32,
 }
 
 impl Default for RhythmPanel {
@@ -83,6 +90,11 @@ impl RhythmPanel {
             instrument: 0,
             skala: 0,
             grundton: 60,
+            rampe_anzahl: 4,
+            interp_schritte: 1,
+            interp_amplitude: 12.0,
+            interp_faktor: 1.0,
+            interp_kurve: 3,
         }
     }
 
@@ -99,6 +111,66 @@ impl RhythmPanel {
     /// Das eine Tempo der App (Follow gewinnt) fuer das Rendern setzen.
     pub fn set_tempo(&mut self, bpm: f32) {
         self.render_bpm = bpm.clamp(20.0, 300.0);
+    }
+
+    /// Notenrampe wie Taste `2` im Desktop-Recorder: `n + 1` Noten von 59
+    /// aufwärts, gleichmäßig über den Zyklus verteilt.
+    fn rampe_anwenden(&mut self) {
+        let steps = self.pattern().steps_per_cycle().max(1);
+        let rampe = transformation::notenrampe(self.rampe_anzahl);
+        let instrument = self.instrument;
+        self.pattern_mut().clear();
+        for (t, pitch) in rampe {
+            let step = ((t * steps as f32).round() as i64).rem_euclid(steps as i64) as u16;
+            self.pattern_mut().insert(Note {
+                step,
+                instrument,
+                pitch: pitch.clamp(0, 127),
+                glide: false,
+            });
+        }
+        self.status = format!(
+            "Rampe: {} Noten (59 … {})",
+            self.pattern().notes().len(),
+            59 + self.rampe_anzahl
+        );
+    }
+
+    /// Sinus-Interpolation wie `D`+`3` im Desktop-Recorder: zwischen den
+    /// bestehenden Noten schwingende Zwischentöne einfügen.
+    fn interpolieren(&mut self) {
+        let steps = self.pattern().steps_per_cycle().max(1);
+        let noten: Vec<transformation::Klangpunkt> = self
+            .pattern()
+            .notes()
+            .iter()
+            .map(|n| (n.step as f32 / steps as f32, n.pitch))
+            .collect();
+        if noten.len() < 2 {
+            self.status = "Interpolation braucht mindestens zwei Noten.".to_string();
+            return;
+        }
+        let out = transformation::sinus_interpolieren(
+            &noten,
+            0,
+            noten.len() - 1,
+            self.interp_schritte.max(1),
+            self.interp_faktor,
+            self.interp_amplitude,
+            self.interp_kurve,
+        );
+        let instrument = self.instrument;
+        self.pattern_mut().clear();
+        for (t, pitch) in out {
+            let step = ((t * steps as f32).round() as i64).rem_euclid(steps as i64) as u16;
+            self.pattern_mut().insert(Note {
+                step,
+                instrument,
+                pitch: pitch.clamp(0, 127),
+                glide: false,
+            });
+        }
+        self.status = format!("Interpoliert: {} Noten", self.pattern().notes().len());
     }
 
     pub fn follow(&self) -> bool {
@@ -554,6 +626,35 @@ impl RhythmPanel {
                     self.pattern().steps_per_cycle()
                 );
                 info!("Schism-Pattern kopiert");
+            }
+        });
+        // Werkzeuge aus dem Recorder: Notenrampe (Taste 2) und
+        // Sinus-Interpolation (D+3).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Rampe");
+            ui.add(egui::DragValue::new(&mut self.rampe_anzahl).range(1..=31));
+            if ui.button("Rampe").clicked() {
+                self.rampe_anwenden();
+            }
+            ui.separator();
+            ui.label("Interp.");
+            ui.add(
+                egui::DragValue::new(&mut self.interp_schritte)
+                    .range(1..=8)
+                    .prefix("n "),
+            );
+            ui.add(
+                egui::DragValue::new(&mut self.interp_amplitude)
+                    .range(0.0..=24.0)
+                    .suffix(" HT"),
+            );
+            ui.add(egui::DragValue::new(&mut self.interp_faktor).range(0.5..=4.0));
+            let kurve = ["K1", "K2", "K3"][(self.interp_kurve.clamp(1, 3) - 1) as usize];
+            if ui.button(kurve).clicked() {
+                self.interp_kurve = self.interp_kurve.clamp(1, 3) % 3 + 1;
+            }
+            if ui.button("Interpolieren").clicked() {
+                self.interpolieren();
             }
         });
         ui.horizontal(|ui| {

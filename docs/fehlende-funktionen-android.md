@@ -1,4 +1,6 @@
-| 2 | ✅ | **WAV-Rendern** (vor dem Rendern auf Order 0/Row 0 und ohne Wiederholung wie ein frisch geladenes Modul; zweimal rendern ✓)# Was der Android-App fehlt (gegenüber dem Laptop-Rust-Paket)
+# Was der Android-App fehlt (gegenüber dem Laptop-Rust-Paket)
+
+Stand: 2026-10-09 · A und B umgesetzt, Gerätetests bestanden (siehe unten).
 
 Vergleich von `docs/funktionen-vor-der-portierung.md` (Stand `be627ca`, vor der
 Portierung) mit `docs/funktionen-android-app.md`. Jede Lücke ist am Code geprüft;
@@ -50,11 +52,11 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 | # | Status | Fehlt/Details |
 |---|---|---|
 | 1 | ⚠️ | **Tastatur-Aufnahmemodell** — bewusst ersetzt durch das Tastenfeld der Maske (jeder Druck = Schritt); die Ziffern-/Faktor-/RStep-Varianten fehlen |
-| 2 | ❌ | **Notenrampe** (`2`) fehlt |
+| 2 | ✅ | **Notenrampe** — Knopf „Rampe“ mit Anzahl im Rhythmus-Tab; Kern `transformation::notenrampe` (Test). Gerätetest: 4 Noten (59 … 63) im Raster |
 | 3 | ❌ | **remove_and_record** (`E`) fehlt |
 | 4 | ❌ | **fdx (`V`), modul1 (`M`)** fehlen |
 | 5 | ❌ | **Graph-Editor** (`G`) fehlt |
-| 6 | ❌ | **Transformationsketten K/D/B** — vorhanden: Transponieren, Umkehren, Q2/Q4, Glide, Instrument, Skalenfilter; offen: `scale_to_range_num`, `totalDi`, Indexverschiebung, Duplikate entfernen, Timestamp-Transformation, Notenlängen, Sinus-Pitch-Interpolation, `vmidi`, Mehrpattern-Interpolation |
+| 6 | ⚠️ | **Transformationsketten K/D/B** — vorhanden: Transponieren, Umkehren, Q2/Q4, Glide, Instrument, Skalenfilter; **neu: Sinus-Pitch-Interpolation (D+3)** (Kern `transformation::sinus_interpolieren` mit den Desktop-Tests, Knopf „Interpolieren“); offen: `scale_to_range_num`, `totalDi`, Indexverschiebung, Duplikate entfernen, Timestamp-Transformation, Notenlängen, `vmidi`, Mehrpattern-Interpolation |
 | 7 | ✅ | **Schism-Clipboard-Export** — `Pattern::to_schism()` mit der Desktop-Regression als Test (zeichengleich), Knopf „Schism kopieren“ im Rhythmus-Tab |
 | 8 | ✅ | **Renoise-XML einlesen** — Knopf „XML laden“ liest `patterns/pattern N.xml` (`Pattern::from_renoise_xml`) |
 | 9 | ✅ | **KeyEventRender.txt schreiben** — siehe rrn5 Nr. 7 (Step 7 erledigt) |
@@ -85,8 +87,8 @@ SDL-Audio (ersetzt durch `klang.rs`).
 
 ## Offene Punkte, nach Nutzen sortiert
 
-1. **Recorder-Ketten** + Graph-Editor + Notenrampe/remove_and_record
-   (pattern_recorder Nr. 2–6)
+1. **Recorder-Ketten** + Graph-Editor + remove_and_record/fdx/modul1
+   (pattern_recorder Nr. 3–6)
 2. **Bild-Follow** (rrn5 Nr. 15) und **Einzel-Slot-Wiedergabe** + Pattern-Dauer
    (pattern_recorder Nr. 10–11)
 

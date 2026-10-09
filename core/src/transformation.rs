@@ -294,3 +294,139 @@ mod tests_skala {
         assert_eq!(skala_toene(60, &PENTATONIK_DUR, 1).len(), 5);
     }
 }
+
+/// Zwischennote für die Sinus-Interpolation: Position (0.0 … 1.0) und Tonhöhe.
+pub type Klangpunkt = (f32, i32);
+
+/// Sinus-Interpolation zwischen zwei Noten (Portierung von
+/// `interpolateNotesWithSinusPitch` aus dem Desktop-Recorder).
+///
+/// Fügt zwischen `noten[start]` und `noten[end]` je Intervall
+/// `steps_pro_interval` Noten ein; deren Tonhöhe schwingt sinusförmig um die
+/// Startnote. `amplitude` ist die Auslenkung in Halbtönen, `faktor_pi`
+/// streckt die Phase, `kurve` formt die Hüllkurve: 1 = ansteigend,
+/// 2 = fallend, 3 = konstant.
+///
+/// Randfälle wie am Desktop: die erste Note steht immer im Ergebnis; ist der
+/// Bereich leer oder verkehrt, bleibt es bei ihr; Intervalle ohne Dauer
+/// werden übersprungen.
+pub fn sinus_interpolieren(
+    noten: &[Klangpunkt],
+    start: usize,
+    end: usize,
+    steps_pro_interval: i32,
+    faktor_pi: f32,
+    amplitude: f32,
+    kurve: i32,
+) -> Vec<Klangpunkt> {
+    let mut ergebnis: Vec<Klangpunkt> = Vec::new();
+    let Some(erste) = noten.first().copied() else {
+        return ergebnis;
+    };
+    ergebnis.push(erste);
+    if start >= end || end >= noten.len() {
+        return ergebnis;
+    }
+    let steps = (end - start) as f32;
+    let steps_add = (steps_pro_interval as f32 - steps_pro_interval as f32) / steps;
+    for i in start..end {
+        let (t_start, pitch) = noten[i];
+        let (t_end, _) = noten[i + 1];
+        let range = t_end - t_start;
+        if range <= 0.0 {
+            continue;
+        }
+        let anzahl = (steps_pro_interval as f32 + steps_add) as i32;
+        for j in 1..=anzahl {
+            let t = t_start + range * j as f32 / (anzahl + 1) as f32;
+            let normalisiert = (t - t_start) * (faktor_pi * std::f32::consts::PI) / range;
+            let sinus = normalisiert.sin();
+            let pitch_neu = match kurve {
+                1 => (sinus * amplitude * (t / noten[end].0) / noten[end].0) as i32 + pitch,
+                2 => (sinus * amplitude * (1.0 - (t / noten[end].0) / noten[end].0)) as i32 + pitch,
+                3 => (sinus * amplitude) as i32 + pitch,
+                _ => 0,
+            };
+            ergebnis.push((t, pitch_neu));
+        }
+        ergebnis.push(noten[i + 1]);
+    }
+    ergebnis
+}
+
+/// Notenrampe wie Taste `2` im Desktop-Recorder: `nval + 1` Noten von 59
+/// aufwärts, gleichmäßig über 0.0 … 1.0 verteilt (bei `nval = 0` eine Note).
+pub fn notenrampe(nval: i32) -> Vec<Klangpunkt> {
+    let n = nval.max(0);
+    (0..=n)
+        .map(|i| ((1.0 / n.max(1) as f32) * i as f32, 59 + i))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests_interpolation {
+    use super::*;
+
+    #[test]
+    fn sinus_interpolation_fuegt_zwischennoten_ein() {
+        // Desktop-Test `sinus_interpolate_inserts_between_notes`.
+        let noten = vec![(0.0, 60), (0.5, 62), (1.0, 64)];
+        let out = sinus_interpolieren(&noten, 0, 2, 1, 1.0, 0.0, 3);
+        assert_eq!(out.len(), 5);
+        assert!(
+            (out[1].0 - 0.25).abs() < 1e-6,
+            "Zeit der ersten Zwischennote"
+        );
+        assert!((out[3].0 - 0.75).abs() < 1e-6, "Zeit der zweiten");
+        assert_eq!(out[1].1, 60);
+        assert_eq!(out[3].1, 62);
+        assert_eq!(out[4].1, 64);
+        assert!(sinus_interpolieren(&[], 0, 0, 1, 1.0, 0.0, 3).is_empty());
+    }
+
+    #[test]
+    fn sinus_interpolation_verkraftet_verdrehten_bereich() {
+        // Desktop-Test `sinus_interpolate_degrades_gracefully_on_bad_range`.
+        let noten = vec![(0.0, 60), (1.0, 62)];
+        let out = sinus_interpolieren(&noten, 1, 0, 1, 1.0, 0.0, 3);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].1, 60);
+    }
+
+    #[test]
+    fn sinus_interpolation_ohne_amplitude_laesst_die_toene() {
+        let noten = vec![(0.0, 60), (1.0, 72)];
+        let out = sinus_interpolieren(&noten, 0, 1, 3, 1.0, 0.0, 3);
+        // 3 Zwischennoten + erste + letzte.
+        assert_eq!(out.len(), 5);
+        assert!(
+            out[1..4].iter().all(|(_, p)| *p == 60),
+            "Amplitude 0 laesst die Zwischennoten auf der Startnote"
+        );
+        assert_eq!(out[4], (1.0, 72), "die Endnote behaelt ihre Tonhoehe");
+    }
+
+    #[test]
+    fn sinus_interpolation_schwingt_mit_amplitude() {
+        let noten = vec![(0.0, 60), (1.0, 60)];
+        let out = sinus_interpolieren(&noten, 0, 1, 4, 1.0, 12.0, 3);
+        assert_eq!(out.len(), 6);
+        // sin(pi/5) … der erste Zwischenwert liegt ueber der Startnote.
+        assert!(out[1].1 > 60, "Auslenkung nach oben: {}", out[1].1);
+        // In der Mitte (j=2: sin(2pi/5) ≈ 0.95) am hoechsten.
+        assert!(out[2].1 > out[1].1);
+        assert!(out.iter().all(|(_, p)| (48..=72).contains(p)));
+    }
+
+    #[test]
+    fn notenrampe_wie_taste_2() {
+        let rampe = notenrampe(4);
+        assert_eq!(rampe.len(), 5, "nval + 1 Noten");
+        assert_eq!(rampe[0], (0.0, 59));
+        assert!((rampe[1].0 - 0.25).abs() < 1e-6);
+        assert_eq!(rampe[4], (1.0, 63));
+        // nval = 0 ergibt eine Note (Desktop: 1/1 * 0).
+        assert_eq!(notenrampe(0), vec![(0.0, 59)]);
+        assert_eq!(notenrampe(-3), vec![(0.0, 59)]);
+    }
+}
