@@ -430,7 +430,7 @@ impl JamApp {
                 self.bild.set_target(&host, &port);
                 let tempo = self.tempo_aktuell();
                 self.bild.set_bpm(tempo);
-                self.bild.ui(ui);
+                self.bild.ui(ui, self.rhythm.pattern_mut());
             }
             KombiTeil::Rhythmus => {
                 let tempo = self.tempo_aktuell();
@@ -556,7 +556,11 @@ impl JamApp {
         // Sweep-Dauer.
         let tempo = self.tempo_aktuell();
         self.bild.set_bpm(tempo);
-        egui::CentralPanel::default().show(ui, |ui| self.bild.ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Das Bild darf Scan-Treffer ins Rhythmus-Pattern schreiben
+            // (Bild-Follow, Desktop `L`/bpmo3).
+            self.bild.ui(ui, self.rhythm.pattern_mut());
+        });
     }
 
     fn view_mic(&mut self, ui: &mut egui::Ui) {

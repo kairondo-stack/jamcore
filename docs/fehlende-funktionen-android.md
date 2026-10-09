@@ -43,7 +43,7 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 | 12 | ❌ | **Pattern-XML aus den Scan-Treffern** (`g`) — der Tagebuch-Export zeigt den Masken-Ausschnitt (noch ohne Noten) |
 | 13 | ⚠️ | **Freilaufender Scan** — der Frei/Takt-Schalter ist weg; es gilt immer die Taktdauer (Minimum 1/36 Takt ist schnell, aber nicht frei) |
 | 14 | ⚠️ | **Notenbremse einstellbar** — bewusst fest 8/s (der Fader war ausdrücklich unerwünscht) |
-| 15 | ❌ | **Bild-Follow als KeyEvents** (`o`/`k`) fehlt |
+| 15 | ✅ | **Bild-Follow** — „ins Pattern" im Bild-Tab schreibt jeden Scan-Treffer als Note auf seinen Schritt (Desktop `L`/bpmo3, dort je Pixel); danach spielt „Rendern" bzw. „Slot spielen" das Raster. Gerätetest: 21760 Treffer → 4 Schritte im Raster |
 
 *Nicht übertragbar:* X11-Aufnahme, `MyImageShm`, drittes SDL-Fenster als Palette.
 
@@ -55,13 +55,13 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 | 2 | ✅ | **Notenrampe** — Knopf „Rampe“ mit Anzahl im Rhythmus-Tab; Kern `transformation::notenrampe` (Test). Gerätetest: 4 Noten (59 … 63) im Raster |
 | 3 | ⚠️ | **remove_and_record** — der Lösch-Teil ist da (Knopf „Bereich [von] [bis] löschen", Kern `Pattern::bereich_loeschen` mit Test; Gerätetest: „3 Noten gelöscht"); der interaktive Re-Record-Teil bleibt aus |
 | 4 | ❌ | **fdx (`V`), modul1 (`M`)** fehlen (Legacy-Funktionen ohne Touch-Entsprechung) |
-| 5 | ❌ | **Graph-Editor** (`G`) — nicht portiert: im Desktop selbst unfertig, Zweck laut Nutzer unklar („damals zu kompliziert") |
+| 5 | ❌ | **Graph-Editor** (`G`) — nicht portiert. Laut Code: Fenster mit **drei** Bändern (rot = Pitch-Kurve, **ungenutzt**; grün = Schrittweite; blau = abgetastete Schrittkurve), `F` interpoliert, `V` tastet ab; `graph_points_to_notes` macht aus der abgetasteten Kurve Noten, deren **Pitch die Schrittweite kodiert** (`60 + y/10`, Instrument 30). Diese Pitch-Werte modulieren im Recorder die Schrittweiten (`record`: `scl==1`-Paare → `indexnum`; `scale`: Dauer/pitch Teilschritte). Das Werkzeug ist im Desktop unfertig (obere Kurve wirkungslos, an Dialog-Maschinerie gebunden) → bewusst nicht portiert |
 | 6 | ⚠️ | **Transformationsketten K/D/B** — vorhanden: Transponieren, Umkehren, Q2/Q4, Glide, Instrument, Skalenfilter; **neu: Sinus-Pitch-Interpolation (D+3)** (Kern `transformation::sinus_interpolieren` mit den Desktop-Tests, Knopf „Interpolieren“); offen: `scale_to_range_num`, `totalDi`, Indexverschiebung, Duplikate entfernen, Timestamp-Transformation, Notenlängen, `vmidi`, Mehrpattern-Interpolation |
 | 7 | ✅ | **Schism-Clipboard-Export** — `Pattern::to_schism()` mit der Desktop-Regression als Test (zeichengleich), Knopf „Schism kopieren“ im Rhythmus-Tab |
 | 8 | ✅ | **Renoise-XML einlesen** — Knopf „XML laden“ liest `patterns/pattern N.xml` (`Pattern::from_renoise_xml`) |
 | 9 | ✅ | **KeyEventRender.txt schreiben** — siehe rrn5 Nr. 7 (Step 7 erledigt) |
 | 10 | ❌ | **Pattern-Dauer je Slot** (`P`) — es gibt eine globale Taktdauer |
-| 11 | ❌ | **Slot-Wiedergabe** (`H`, `Y`, `O`, `U`) — 8 Slots und „Rendern“ gibt es, keine Einzel-Slot-Wiedergabe |
+| 11 | ⚠️ | **Slot-Wiedergabe** — „Slot spielen" spielt den aktuellen Slot einmal, aufs 16tel quantisiert (Desktop `H`→`play4`; Gerätetest: Log „Slot 1 einmal gespielt"); die Desktop-Varianten `Y`/`O`/`U` (Pattern-Select, play2, Loops) fehlen |
 
 *Nicht übertragbar:* `ZeitfaktoSharedMemory`, xclip/xsel (Android hat eigenes Clipboard),
 SDL-Audio (ersetzt durch `klang.rs`).
@@ -87,10 +87,11 @@ SDL-Audio (ersetzt durch `klang.rs`).
 
 ## Offene Punkte, nach Nutzen sortiert
 
-1. **Recorder-Ketten** + Graph-Editor + remove_and_record/fdx/modul1
-   (pattern_recorder Nr. 3–6)
-2. **Bild-Follow** (rrn5 Nr. 15) und **Einzel-Slot-Wiedergabe** + Pattern-Dauer
-   (pattern_recorder Nr. 10–11)
+1. **Recorder-Ketten** (Rest): `scale_to_range_num`, `totalDi`, Indexverschiebung,
+   Duplikate entfernen, Timestamp-Transformation, Notenlängen, `vmidi`,
+   Mehrpattern-Interpolation; fdx/modul1 (Legacy) und der Graph-Editor bleiben
+   bewusst draußen
+2. **Pattern-Dauer je Slot** (`P`) — es gibt eine globale Taktdauer
 
 ## Gerätetest — am 2026-10-09 auf dem Pixel 10 Pro durchgeführt
 

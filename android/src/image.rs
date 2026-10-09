@@ -10,6 +10,7 @@
 
 use eframe::egui::{self, Color32, TextureOptions};
 
+use jamcore::grid::{Note, Pattern};
 use jamcore::livescan::{
     build_palette, note_allowed, note_volume, note_volume_farbe, pixel_matches, scale_rgb,
     scan_column, ScanFilter,
@@ -108,6 +109,10 @@ pub struct ImagePanel {
     finger: crate::touch::Mehrfinger,
     /// Harmonics-Filter (Akkord/Notenmengen) wie im Desktop-rrn5.
     harmonie: jamcore::harmonie::Harmonie,
+    /// Scan-Treffer ins Rhythmus-Pattern schreiben (Desktop: `L`/bpmo3).
+    scan_aufnahme: bool,
+    /// Wie viele Treffer dabei aufgenommen wurden.
+    aufgenommen: u64,
     /// Schrittzahl des letzten Bildes (die Maske haengt daran).
     schritte_letzte: u16,
     /// Start- und Endpunkt des Pattern-Ausschnitts der X-Auflösung (Schritte).
@@ -168,6 +173,8 @@ impl ImagePanel {
             bild_versatz: (0.0, 0.0),
             finger: crate::touch::Mehrfinger::neu(),
             harmonie: jamcore::harmonie::Harmonie::default(),
+            scan_aufnahme: false,
+            aufgenommen: 0,
             schritte_letzte: 0,
             abschnitt_von: 0,
             abschnitt_bis: u16::MAX,
@@ -601,7 +608,7 @@ impl ImagePanel {
     /// Beat). Notenwert aus der Zeile (oben hoch, unten tief). Die Takt-Maske
     /// (rrn5 `biialpha`) sperrt einzelne Spalten; ihr Wert skaliert zusaetzlich
     /// Farbe und Lautstaerke.
-    fn scan_schritt(&mut self, ctx: &egui::Context) {
+    fn scan_schritt(&mut self, ctx: &egui::Context, pattern: &mut Pattern) {
         if !self.scan_an {
             return;
         }
@@ -693,6 +700,21 @@ impl ImagePanel {
                         if !self.harmonie.note_erlaubt(note, x) {
                             continue;
                         }
+                        // Fuer den Bild-Follow: den Treffer ins Rhythmus-Pattern
+                        // schreiben (Desktop `L`/bpmo3; dort jedes Pixel, hier
+                        // eine Note je Schritt).
+                        if self.scan_aufnahme {
+                            let steps = pattern.steps_per_cycle().max(1) as i64;
+                            let step =
+                                ((x as i64 * steps) / wi.max(1) as i64).clamp(0, steps - 1) as u16;
+                            pattern.insert(Note {
+                                step,
+                                instrument: 0,
+                                pitch: note,
+                                glide: false,
+                            });
+                            self.aufgenommen += 1;
+                        }
                         noten.push((note, ((vol as f32 * alpha) as i32).clamp(0, 127)));
                         self.sweep_gezeichnet += 1;
                     }
@@ -730,7 +752,7 @@ impl ImagePanel {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         // ~20 Bilder je Sekunde reichen fuer die Vorschau und sparen Strom.
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
@@ -739,10 +761,10 @@ impl ImagePanel {
         egui::ScrollArea::vertical()
             .scroll_source(egui::scroll_area::ScrollSource::ALL)
             .id_salt("bild_inhalt")
-            .show(ui, |ui| self.inhalt(ui));
+            .show(ui, |ui| self.inhalt(ui, pattern));
     }
 
-    fn inhalt(&mut self, ui: &mut egui::Ui) {
+    fn inhalt(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         ui.horizontal(|ui| {
             if ui.button("Kamera an").clicked() {
                 self.kamera_an();
@@ -783,6 +805,10 @@ impl ImagePanel {
                 "Sweep: {} Noten, {} gezeichnet",
                 self.sweep_noten, self.sweep_gezeichnet
             ));
+            ui.checkbox(&mut self.scan_aufnahme, "ins Pattern");
+            if self.scan_aufnahme {
+                ui.label(format!("aufgenommen: {}", self.aufgenommen));
+            }
             if ui.button("Snapshot").clicked() {
                 self.snapshot_sichern();
             }
@@ -880,7 +906,7 @@ impl ImagePanel {
             }
         }
 
-        self.scan_schritt(ui.ctx());
+        self.scan_schritt(ui.ctx(), pattern);
 
         // Im Querformat liegt das Bild links und die Steuerung rechts in zwei
         // Spalten — untereinander wuerde die GUI die Hoehe fressen und das Bild

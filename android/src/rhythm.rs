@@ -306,9 +306,68 @@ impl RhythmPanel {
                 self.render_schritt = schritt;
                 self.render_laeuft = true;
                 self.status = format!("Rendern läuft ({anzahl} Noten, {bpm:.0} BPM)");
-                info!("rhythmus: Rendern gestartet ({anzahl} Noten)");
+                info!("Rendern gestartet ({anzahl} Noten)");
             }
             Err(e) => self.status = format!("Rendern-Thread: {e}"),
+        }
+    }
+
+    /// Spielt den aktuellen Slot **einmal** ab, auf die nächste 16tel des
+    /// eigenen Rasters quantisiert (Desktop: `H` → `play4`). Läuft parallel,
+    /// damit die Oberfläche bedienbar bleibt.
+    fn slot_spielen(&mut self) {
+        if self.render_laeuft {
+            self.rendern_stoppen();
+        }
+        let mut noten: Vec<(u16, i32)> = self
+            .pattern()
+            .notes()
+            .iter()
+            .map(|n| (n.step, n.pitch))
+            .collect();
+        if noten.is_empty() {
+            self.status = "Slot ist leer.".to_string();
+            return;
+        }
+        noten.sort_by_key(|(s, _)| *s);
+        let bpm = self.render_bpm.max(20.0);
+        let (host, port) = self.target.clone();
+        let basis = self.clock;
+        let schrittzeit = 60.0 / bpm / 4.0;
+        let anzahl = noten.len();
+        let ergebnis = std::thread::Builder::new()
+            .name("jam-slot".to_string())
+            .spawn(move || {
+                // Auf die naechste 16tel des eigenen Rasters warten.
+                let verstrichen = basis.elapsed().as_secs_f32();
+                let warten = schrittzeit - (verstrichen % schrittzeit);
+                if warten > 0.0 && warten < schrittzeit {
+                    std::thread::sleep(Duration::from_secs_f32(warten));
+                }
+                let out = OscOut::new(&host, port).ok();
+                let start = Instant::now();
+                for (step, pitch) in &noten {
+                    let ziel = *step as f32 * schrittzeit;
+                    let rest = ziel - start.elapsed().as_secs_f32();
+                    if rest > 0.0 {
+                        std::thread::sleep(Duration::from_secs_f32(rest));
+                    }
+                    crate::klang::spielen(*pitch);
+                    if let Some(o) = out.as_ref() {
+                        let _ = Renoise::new(o).note_on(7000, *pitch, 100);
+                    }
+                }
+            });
+        match ergebnis {
+            Ok(_) => {
+                self.status = format!(
+                    "Slot {} gespielt ({} Noten, quantisiert)",
+                    self.slot + 1,
+                    anzahl
+                );
+                info!("Slot {} einmal gespielt", self.slot + 1);
+            }
+            Err(e) => self.status = format!("Slot-Thread: {e}"),
         }
     }
 
@@ -321,7 +380,7 @@ impl RhythmPanel {
         }
         self.render_laeuft = false;
         self.status = "Rendern gestoppt.".to_string();
-        info!("rhythmus: Rendern gestoppt");
+        info!("Rendern gestoppt");
     }
 
     fn tick_own_clock(&mut self) {
@@ -713,6 +772,9 @@ impl RhythmPanel {
             ui.separator();
             if ui.button("Skalieren").clicked() {
                 self.skalieren();
+            }
+            if ui.button("Slot spielen").clicked() {
+                self.slot_spielen();
             }
         });
         ui.horizontal(|ui| {
