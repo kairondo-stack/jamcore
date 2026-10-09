@@ -326,6 +326,10 @@ impl eframe::App for JamApp {
             self.status = format!("Tempo übernommen: {bpm:.1} BPM");
             log::info!("Tempo uebernommen: {bpm:.1} BPM");
         }
+        // Das Modul des Players an den Rhythmus-Renderer durchreichen
+        // (Klangquelle „Modul-Samples").
+        self.rhythm
+            .set_modul_quelle(self.player.as_ref().map(|p| p.modul_quelle()));
         match self.tab {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),

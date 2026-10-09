@@ -24,6 +24,15 @@ const CELL: f32 = 22.0;
 const BLOCK: u16 = 8;
 const DEFAULT_BPM: f32 = 128.0;
 
+/// Woher der Klang des gerenderten Notenmaterials kommt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Klangquelle {
+    /// Samples/Instrumente des geladenen Moduls (ext-API), sonst Tongenerator.
+    Modul,
+    /// Immer der Tongenerator mit gewaehlter Wellenform.
+    Welle,
+}
+
 pub struct RhythmPanel {
     slots: Vec<Pattern>,
     slot: usize,
@@ -61,6 +70,12 @@ pub struct RhythmPanel {
     /// Schrittbereich zum Loeschen (wie „E"/remove im Recorder).
     bereich_von: u16,
     bereich_bis: u16,
+    /// Klangquelle fuer gerenderte Noten.
+    klangquelle: Klangquelle,
+    /// Wellenform des Tongenerators.
+    welle: jamcore::klang::Welle,
+    /// Handgriff auf das Modul des Players (von JamApp gesetzt).
+    modul_quelle: Option<crate::player::ModulQuelle>,
 }
 
 impl Default for RhythmPanel {
@@ -100,6 +115,9 @@ impl RhythmPanel {
             interp_kurve: 3,
             bereich_von: 0,
             bereich_bis: STEP_COUNT - 1,
+            klangquelle: Klangquelle::Modul,
+            welle: jamcore::klang::Welle::Sinus,
+            modul_quelle: None,
         }
     }
 
@@ -111,6 +129,24 @@ impl RhythmPanel {
             host.trim().to_string(),
             port.trim().parse().unwrap_or(DEFAULT_BASE_PORT),
         );
+    }
+
+    /// Handgriff auf das Player-Modul setzen (JamApp, jedes Frame).
+    pub fn set_modul_quelle(&mut self, quelle: Option<crate::player::ModulQuelle>) {
+        self.modul_quelle = quelle;
+    }
+
+    /// Eine Note klingen lassen: Modul-Sample (wenn moeglich) oder Tongenerator.
+    /// Ausserhalb von Threads; fuer die Threads wird die Logik dort wiederholt.
+    fn note_klingen(&self, pitch: i32) {
+        if self.klangquelle == Klangquelle::Modul {
+            if let Some(quelle) = self.modul_quelle.as_ref() {
+                if quelle.note_spielen(30, pitch, 0.8).is_some() {
+                    return;
+                }
+            }
+        }
+        crate::klang::spielen_welle(pitch, self.welle);
     }
 
     /// Das eine Tempo der App (Follow gewinnt) fuer das Rendern setzen.
@@ -262,6 +298,9 @@ impl RhythmPanel {
         let (host, port) = self.target.clone();
         let bpm = self.render_bpm.max(20.0);
         let transport = self.transport_mit;
+        let klangquelle = self.klangquelle;
+        let welle = self.welle;
+        let modul = self.modul_quelle.clone();
         let stopp = Arc::new(AtomicBool::new(false));
         let schritt = Arc::new(AtomicU16::new(0));
         let stopp_c = Arc::clone(&stopp);
@@ -280,7 +319,14 @@ impl RhythmPanel {
                     let start = Instant::now();
                     for (s, pitch) in &noten {
                         if *s == i {
-                            crate::klang::spielen(*pitch);
+                            let gespielt = klangquelle == Klangquelle::Modul
+                                && modul
+                                    .as_ref()
+                                    .and_then(|q| q.note_spielen(30, *pitch, 0.8))
+                                    .is_some();
+                            if !gespielt {
+                                crate::klang::spielen_welle(*pitch, welle);
+                            }
                             if let Some(o) = out.as_ref() {
                                 let _ = Renoise::new(o).note_on(7000, *pitch, 100);
                             }
@@ -333,6 +379,9 @@ impl RhythmPanel {
         let bpm = self.render_bpm.max(20.0);
         let (host, port) = self.target.clone();
         let basis = self.clock;
+        let klangquelle = self.klangquelle;
+        let welle = self.welle;
+        let modul = self.modul_quelle.clone();
         let schrittzeit = 60.0 / bpm / 4.0;
         let anzahl = noten.len();
         let ergebnis = std::thread::Builder::new()
@@ -352,7 +401,14 @@ impl RhythmPanel {
                     if rest > 0.0 {
                         std::thread::sleep(Duration::from_secs_f32(rest));
                     }
-                    crate::klang::spielen(*pitch);
+                    let gespielt = klangquelle == Klangquelle::Modul
+                        && modul
+                            .as_ref()
+                            .and_then(|q| q.note_spielen(30, *pitch, 0.8))
+                            .is_some();
+                    if !gespielt {
+                        crate::klang::spielen_welle(*pitch, welle);
+                    }
                     if let Some(o) = out.as_ref() {
                         let _ = Renoise::new(o).note_on(7000, *pitch, 100);
                     }
@@ -536,7 +592,7 @@ impl RhythmPanel {
                     glide: false,
                 });
                 self.play(pitch, self.velocity);
-                crate::klang::spielen(pitch);
+                self.note_klingen(pitch);
                 self.status = format!(
                     "Aufnahme: Schritt {} <- {} ({} Noten)",
                     ziel + 1,
@@ -561,8 +617,9 @@ impl RhythmPanel {
         };
         if added {
             self.play(pitch, self.velocity);
-            // Der Ton klingt auch lokal (im Demo-Video hörbar).
-            crate::klang::spielen(pitch);
+            // Der Ton klingt auch lokal (im Demo-Video hoerbar) — mit der
+            // gewaehlten Klangquelle.
+            self.note_klingen(pitch);
             self.status = format!(
                 "Schritt {}: {} ({} Noten)",
                 step + 1,
@@ -777,6 +834,43 @@ impl RhythmPanel {
                 self.slot_spielen();
             }
         });
+        // Klangquelle für das gerenderte Material: Modul-Samples oder
+        // Tongenerator mit Wellenform.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Klang");
+            if ui
+                .selectable_label(self.klangquelle == Klangquelle::Modul, "Modul-Samples")
+                .clicked()
+            {
+                self.klangquelle = Klangquelle::Modul;
+            }
+            if ui
+                .selectable_label(self.klangquelle == Klangquelle::Welle, "Tongenerator")
+                .clicked()
+            {
+                self.klangquelle = Klangquelle::Welle;
+            }
+            if self.klangquelle == Klangquelle::Welle && ui.button(self.welle.name()).clicked() {
+                let alle = jamcore::klang::Welle::ALLE;
+                let idx = alle.iter().position(|w| *w == self.welle).unwrap_or(0);
+                self.welle = alle[(idx + 1) % alle.len()];
+            }
+            if self.klangquelle == Klangquelle::Modul && self.modul_quelle.is_none() {
+                ui.label(
+                    egui::RichText::new("kein Modul geladen — es klingt der Tongenerator")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "Achtung: Samples und Instrumente von Modulen sind urheberrechtlich geschützt \
+                 — vor einer Wiederverwendung (Aufnahme, Export, Weitergabe) die Rechte klären.",
+            )
+            .small()
+            .color(Color32::DARK_GRAY),
+        );
         ui.horizontal(|ui| {
             ui.label(format!("Schritt {}/{}", self.current_step + 1, STEP_COUNT));
             ui.label(format!("Noten: {}", self.pattern().notes().len()));

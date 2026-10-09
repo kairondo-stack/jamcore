@@ -45,7 +45,37 @@ pub struct Player {
     path: String,
 }
 
+/// Klonbarer Zugriff auf das Modul eines Players, damit andere Panels
+/// (z. B. der Rhythmus-Renderer) Noten mit den **Samples/Instrumenten** des
+/// Moduls anspielen können (`interactive.play_note`).
+///
+/// **Urheberrecht:** Samples und Instrumente eines Moduls sind geschützt; das
+/// Mitspielen ist ok, die Wiederverwendung (Export/Veröffentlichen) nicht ohne
+/// Erlaubnis.
+#[derive(Clone)]
+pub struct ModulQuelle {
+    shared: Arc<Shared>,
+}
+
+impl ModulQuelle {
+    /// Note mit dem Modulinstrument anspielen; `None`, wenn das Modul gerade
+    /// nicht gerendert wird (still) oder kein Kanal frei ist.
+    pub fn note_spielen(&self, instrument: i32, note: i32, volume: f32) -> Option<i32> {
+        if !self.shared.running.load(Ordering::Relaxed) {
+            return None;
+        }
+        let modul = self.shared.module.lock().ok()?;
+        modul.note_spielen(instrument, note, volume)
+    }
+}
+
 impl Player {
+    /// Handgriff für andere Panels (siehe [`ModulQuelle`]).
+    pub fn modul_quelle(&self) -> ModulQuelle {
+        ModulQuelle {
+            shared: Arc::clone(&self.shared),
+        }
+    }
     pub fn play(path: &Path, looping: bool, sample_rate: c_int) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let module = Mod::from_bytes(bytes)?;

@@ -11,6 +11,53 @@ pub struct openmpt_module {
     _private: [u8; 0],
 }
 
+/// Undurchsichtiger Handle der ext-Schnittstelle (libopenmpt_ext.h).
+#[repr(C)]
+pub struct openmpt_module_ext {
+    _private: [u8; 0],
+}
+
+/// Funktionszeiger der ext-Schnittstelle „interactive". Die Reihenfolge stammt
+/// eins zu eins aus `libopenmpt_ext.h` — sie darf nicht veraendert werden,
+/// sonst zeigt etwa `play_note` ins Leere. Genutzt werden nur die letzten
+/// beiden Felder.
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct openmpt_module_ext_interface_interactive {
+    pub set_current_speed: Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int) -> c_int>,
+    pub set_current_tempo: Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int) -> c_int>,
+    pub set_tempo_factor: Option<unsafe extern "C" fn(*mut openmpt_module_ext, f64) -> c_int>,
+    pub get_tempo_factor: Option<unsafe extern "C" fn(*mut openmpt_module_ext) -> f64>,
+    pub set_pitch_factor: Option<unsafe extern "C" fn(*mut openmpt_module_ext, f64) -> c_int>,
+    pub get_pitch_factor: Option<unsafe extern "C" fn(*mut openmpt_module_ext) -> f64>,
+    pub set_global_volume: Option<unsafe extern "C" fn(*mut openmpt_module_ext, f64) -> c_int>,
+    pub get_global_volume: Option<unsafe extern "C" fn(*mut openmpt_module_ext) -> f64>,
+    pub set_channel_volume:
+        Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int, f64) -> c_int>,
+    pub get_channel_volume: Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int) -> f64>,
+    pub set_channel_mute_status:
+        Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int, c_int) -> c_int>,
+    pub get_channel_mute_status:
+        Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int) -> c_int>,
+    pub set_instrument_mute_status:
+        Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int, c_int) -> c_int>,
+    pub get_instrument_mute_status:
+        Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int) -> c_int>,
+    pub play_note:
+        Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int, c_int, f64, f64) -> i32>,
+    pub stop_note: Option<unsafe extern "C" fn(*mut openmpt_module_ext, c_int) -> c_int>,
+}
+
+impl Default for openmpt_module_ext_interface_interactive {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Fehler-Callback der ext-API (nicht benutzt, bleibt null).
+#[allow(non_camel_case_types)]
+pub type openmpt_error_func = *const c_void;
+
 #[allow(non_camel_case_types)]
 pub type openmpt_log_func = Option<unsafe extern "C" fn(msg: *const c_char, user: *mut c_void)>;
 #[allow(non_camel_case_types)]
@@ -19,6 +66,29 @@ pub type openmpt_unknown_cb =
 
 #[link(name = "openmpt")]
 extern "C" {
+    pub fn openmpt_module_ext_create_from_memory(
+        filedata: *const u8,
+        filesize: usize,
+        logfunc: openmpt_log_func,
+        loguser: *mut c_void,
+        errfunc: openmpt_error_func,
+        erruser: *mut c_void,
+        error: *mut c_int,
+        error_message: *mut *const c_char,
+        ctls: *const c_void,
+    ) -> *mut openmpt_module_ext;
+
+    pub fn openmpt_module_ext_destroy(mod_ext: *mut openmpt_module_ext);
+
+    pub fn openmpt_module_ext_get_module(mod_ext: *mut openmpt_module_ext) -> *mut openmpt_module;
+
+    pub fn openmpt_module_ext_get_interface(
+        mod_ext: *mut openmpt_module_ext,
+        interface_id: *const c_char,
+        interface: *mut c_void,
+        interface_size: usize,
+    ) -> c_int;
+
     pub fn openmpt_module_create_from_memory(
         filedata: *const u8,
         filesize: usize,
@@ -52,6 +122,7 @@ extern "C" {
     pub fn openmpt_module_get_num_patterns(mod_: *mut openmpt_module) -> c_int;
     pub fn openmpt_module_get_num_orders(mod_: *mut openmpt_module) -> c_int;
     pub fn openmpt_module_get_num_samples(mod_: *mut openmpt_module) -> c_int;
+    pub fn openmpt_module_get_num_instruments(mod_: *mut openmpt_module) -> c_int;
     pub fn openmpt_module_get_order_pattern(mod_: *mut openmpt_module, order: c_int) -> c_int;
     pub fn openmpt_module_get_pattern_num_rows(mod_: *mut openmpt_module, pattern: c_int) -> c_int;
     pub fn openmpt_module_get_current_order(mod_: *mut openmpt_module) -> c_int;
@@ -79,6 +150,10 @@ extern "C" {
 /// Android rendert daraus, deshalb ist Mod dort Send.
 pub struct Mod {
     pub ptr: *mut openmpt_module,
+    /// ext-Handle nur zum Aufraeumen und fuer die interactive-Schnittstelle.
+    ext: *mut openmpt_module_ext,
+    /// Funktionszeiger (play_note/stop_note); leer, wenn libopenmpt sie nicht anbietet.
+    interactive: Box<openmpt_module_ext_interface_interactive>,
     #[allow(dead_code)]
     bytes: Vec<u8>,
 }
@@ -92,20 +167,46 @@ impl Mod {
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, String> {
-        let ptr = unsafe {
-            openmpt_module_create_from_memory(
+        // Ueber die ext-API laden, damit die interactive-Schnittstelle
+        // verfuegbar ist (Sample-Anspielen mit `play_note`).
+        let ext = unsafe {
+            openmpt_module_ext_create_from_memory(
                 bytes.as_ptr(),
                 bytes.len(),
                 None,
                 std::ptr::null_mut(),
                 std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
             )
         };
-        if ptr.is_null() {
-            Err("libopenmpt konnte das Modul nicht laden".to_string())
-        } else {
-            Ok(Mod { ptr, bytes })
+        if ext.is_null() {
+            return Err("libopenmpt konnte das Modul nicht laden".to_string());
         }
+        let ptr = unsafe { openmpt_module_ext_get_module(ext) };
+        if ptr.is_null() {
+            unsafe { openmpt_module_ext_destroy(ext) };
+            return Err("libopenmpt: kein Basismodul".to_string());
+        }
+        let mut interactive = Box::<openmpt_module_ext_interface_interactive>::default();
+        let ok = unsafe {
+            openmpt_module_ext_get_interface(
+                ext,
+                c"interactive".as_ptr(),
+                &mut *interactive as *mut _ as *mut c_void,
+                std::mem::size_of::<openmpt_module_ext_interface_interactive>(),
+            )
+        };
+        // ok == 0: Schnittstelle fehlt; note_spielen liefert dann None.
+        let _ = ok;
+        Ok(Mod {
+            ptr,
+            ext,
+            interactive,
+            bytes,
+        })
     }
 
     /// Rendert `frames` Frames nach links/rechts. Gibt 0 zurück, wenn das
@@ -207,6 +308,10 @@ impl Mod {
         unsafe { openmpt_module_get_num_samples(self.ptr) }
     }
 
+    pub fn num_instruments(&self) -> i32 {
+        unsafe { openmpt_module_get_num_instruments(self.ptr) }
+    }
+
     pub fn current_tempo(&self) -> i32 {
         unsafe { openmpt_module_get_current_tempo(self.ptr) }
     }
@@ -267,12 +372,53 @@ impl Mod {
             title
         }
     }
+
+    /// Gültige Instrumentnummer: Wunsch auf den vorhandenen Bereich legen
+    /// (Module haben oft weniger Instrumente als der Desktop-Recorder nutzt).
+    pub fn instrument_waehlen(&self, wunsch: i32) -> i32 {
+        let anzahl = if self.num_instruments() > 0 {
+            self.num_instruments()
+        } else {
+            self.num_samples()
+        };
+        if anzahl <= 0 {
+            0
+        } else {
+            wunsch.rem_euclid(anzahl)
+        }
+    }
+
+    /// Spielt eine Note mit dem Instrument/Sample des Moduls (ext-Schnittstelle
+    /// `interactive.play_note`). Liefert den Kanal oder `None`, wenn kein Kanal
+    /// frei ist oder die Schnittstelle fehlt.
+    ///
+    /// **Urheberrecht:** Die Samples gehören ihren Rechteinhabern; das Anspielen
+    /// zum Mitspielen ist ok, eine Wiederverwendung (Export/Veröffentlichung)
+    /// muss vorher geklärt werden.
+    pub fn note_spielen(&self, instrument: i32, note: i32, volume: f32) -> Option<i32> {
+        let funktion = self.interactive.play_note?;
+        let instrument = self.instrument_waehlen(instrument);
+        let note = note.clamp(0, 119);
+        let volume = (volume.clamp(0.0, 1.0) as f64).clamp(0.0, 1.0);
+        let kanal = unsafe { funktion(self.ext, instrument, note, volume, 0.0) };
+        (kanal >= 0).then_some(kanal)
+    }
+
+    /// Eine zuvor per [`Mod::note_spielen`] gestartete Note beenden.
+    pub fn note_stoppen(&self, kanal: i32) {
+        if let Some(funktion) = self.interactive.stop_note {
+            unsafe {
+                funktion(self.ext, kanal);
+            }
+        }
+    }
 }
 
 impl Drop for Mod {
     fn drop(&mut self) {
         unsafe {
-            openmpt_module_destroy(self.ptr);
+            // Das ext-Handle besitzt das Basismodul und raeumt es mit auf.
+            openmpt_module_ext_destroy(self.ext);
         }
     }
 }

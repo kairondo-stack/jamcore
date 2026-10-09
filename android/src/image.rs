@@ -36,9 +36,6 @@ const BILD_ANTEIL_H: f32 = 0.55;
 /// sonst frisst die GUI die Höhe und das Bild wird winzig. Das Bild bekommt
 /// dort gut die Hälfte der Fläche.
 const BILD_ANTEIL_H_QUER: f32 = 0.62;
-/// Schrittzahl wird auf volle 8er gerundet, damit kleine Layoutschwankungen die
-/// Maske nicht verändern.
-const SCHRITT_RUNDE: f32 = 8.0;
 
 ///
 /// Gibt es als freie Funktion, weil sie an zwei Stellen gebraucht wird.
@@ -94,8 +91,12 @@ pub struct ImagePanel {
     /// Takt-Maske (rrn5 `biialpha`): Spalten an/ab, ohne die Zeilen mit alpha 0.
     maske_an: bool,
     maske: ScanMaske,
-    /// Schrittzahl einfrieren (sonst folgt sie der Bildbreite mal Zoom).
-    schritte_fest: bool,
+    /// Vom Nutzer gewaehlte Schrittzahl (X-Aufloesung = Patternlaenge);
+    /// der Zoom skaliert nur die Anzeige.
+    schritte_wahl: u16,
+    /// Takt-Anteil a/b, aus dem die Schrittzahl entsteht (1/1 = 16).
+    bruch_a: u16,
+    bruch_b: u16,
     /// Taktdauer des Sweeps in Takten (Fader mit /2 x2 /3 x3), f64 wie im Kern.
     pub takte: f64,
     /// Zoom des Bildes als Anteil der verfuegbaren Breite.
@@ -113,8 +114,8 @@ pub struct ImagePanel {
     scan_aufnahme: bool,
     /// Wie viele Treffer dabei aufgenommen wurden.
     aufgenommen: u64,
-    /// Schrittzahl des letzten Bildes (die Maske haengt daran).
-    schritte_letzte: u16,
+    /// Schrittzahl beim letzten Zeichnen (fuer das Nachziehen der Maske).
+    letzte_schritte: u16,
     /// Start- und Endpunkt des Pattern-Ausschnitts der X-Auflösung (Schritte).
     abschnitt_von: u16,
     abschnitt_bis: u16,
@@ -165,7 +166,9 @@ impl ImagePanel {
             radieren: false,
             maske_an: false,
             maske: ScanMaske::neu(16, Aufloesung::Sync),
-            schritte_fest: false,
+            schritte_wahl: 16,
+            bruch_a: 1,
+            bruch_b: 1,
             takte: jamcore::takte::VORGABE,
             bild_zoom: 1.0,
             scan_links: 0.0,
@@ -175,7 +178,7 @@ impl ImagePanel {
             harmonie: jamcore::harmonie::Harmonie::default(),
             scan_aufnahme: false,
             aufgenommen: 0,
-            schritte_letzte: 0,
+            letzte_schritte: 0,
             abschnitt_von: 0,
             abschnitt_bis: u16::MAX,
             maske_pinsel: None,
@@ -440,15 +443,9 @@ impl ImagePanel {
         self.textur_setzen(ctx, w, h, &bild);
     }
 
-    /// Schrittzahl (X-Auflösung) des zuletzt gezeigten Bildes.
+    /// Gewaehlte Schrittzahl: X-Aufloesung = Patternlaenge, mindestens 4.
     pub fn schritte(&self) -> u16 {
-        // Solange der Bild-Tab noch nie gezeichnet wurde, ist die Schrittzahl
-        // 0; dann gilt die Vorgabe, damit der Export im Tagebuch schon stimmt.
-        if self.schritte_letzte == 0 {
-            jamcore::grid::STEPS_PER_CYCLE
-        } else {
-            self.schritte_letzte
-        }
+        self.schritte_wahl.max(4)
     }
 
     /// Ein Harmonie-Band aus der Quintenzirkel-Auswahl anhängen. Das vorige
@@ -577,16 +574,10 @@ impl ImagePanel {
         jamcore::grid::Pattern::mit_abschnitt(self.abschnitt_von, bis, schritte)
     }
 
-    /// Schrittzahl für die aktuelle Anzeigebreite: X-Auflösung mal Zoom, auf
-    /// volle 8er gerundet — das ist auch die Patternlänge. Folgt damit der
-    /// Displaygröße: im Querformat sind es mehr Schritte. Eingefroren, wenn
-    /// „Schritte festhalten" gesetzt ist.
-    fn schrittzahl(&self, platz: f32) -> u16 {
-        if self.schritte_fest && self.schritte_letzte > 0 {
-            return self.schritte_letzte;
-        }
-        let roh = (platz * self.bild_zoom / SCHRITT_RUNDE).floor().max(1.0);
-        (roh * SCHRITT_RUNDE).round().clamp(8.0, 4096.0) as u16
+    /// Schrittzahl ist die vom Nutzer gewaehlte X-Aufloesung; die Anzeige
+    /// (Zoom, Breite) aendert sie nicht mehr.
+    fn schrittzahl(&self, _platz: f32) -> u16 {
+        self.schritte()
     }
 
     /// Anteil der Höhe, den das Bild im Querformat bekommt. Im Hochformat
@@ -618,7 +609,7 @@ impl ImagePanel {
         let Some((w, h, live)) = camera::letztes_bild() else {
             return;
         };
-        let schritte = self.schritte_letzte.max(1) as i32;
+        let schritte = self.schritte().max(1) as i32;
         let (wi, hi) = (w as i32, h as i32);
         // Ein voller Durchlauf dauert die eingestellte Taktdauer.
         let schritt_ns = (jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64) * 1.0e9
@@ -892,16 +883,11 @@ impl ImagePanel {
             platz
         };
         let schritte = self.schrittzahl(links);
-        if schritte != self.schritte_letzte {
-            // Deckte der Pattern-Abschnitt das ganze bisherige Bild ab, waechst
-            // er mit (Drehen, Zoom); ein bewusst gewaehlter Ausschnitt bleibt.
-            let ganz_alt = self.schritte_letzte.saturating_sub(1);
-            let war_ganz = self.schritte_letzte > 0
-                && self.abschnitt_von == 0
-                && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= ganz_alt);
+        if schritte != self.letzte_schritte {
+            // Schrittzahl geaendert: Maske nachziehen (neue Spalten offen).
             self.maske.resync_offen(schritte as usize);
-            self.schritte_letzte = schritte;
-            if war_ganz {
+            self.letzte_schritte = schritte;
+            if self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= schritte.saturating_sub(1) {
                 self.abschnitt_bis = schritte.saturating_sub(1);
             }
         }
@@ -1092,19 +1078,43 @@ impl ImagePanel {
         );
     }
 
-    /// Schrittzahl festhalten und die ganze Maske setzen.
+    /// Schrittzahl wählen (Zahlenfeld **und** Takt-Anteil a/b) und die Maske setzen.
     fn zeile_schritte(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .checkbox(&mut self.schritte_fest, "Schritte festhalten")
-            .changed()
-            && self.schritte_fest
-        {
-            log::info!("Schritte festgehalten bei {}", self.schritte_letzte);
-        }
+        // Zahlenfeld: direkte Schrittzahl (X-Auflösung = Patternlänge).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Schritte");
+            if ui
+                .add(egui::DragValue::new(&mut self.schritte_wahl).range(4..=4096))
+                .changed()
+            {
+                log::info!("Schritte gewaehlt: {}", self.schritte());
+            }
+            // Takt-Anteil a/b statt Kopfrechnen: 1/1 = ein Takt (16 Schritte).
+            ui.label("Takt");
+            let a = ui.add(egui::DragValue::new(&mut self.bruch_a).range(1..=64));
+            ui.label("/");
+            let b = ui.add(egui::DragValue::new(&mut self.bruch_b).range(1..=64));
+            if a.changed() || b.changed() {
+                let nenner = self.bruch_b.max(1) as f32;
+                let anteil = self.bruch_a.max(1) as f32 / nenner;
+                self.schritte_wahl = ((16.0 * anteil).round() as i64).clamp(4, 4096) as u16;
+                log::info!(
+                    "Schritte aus {}/{} Takt: {}",
+                    self.bruch_a,
+                    self.bruch_b,
+                    self.schritte()
+                );
+            }
+            ui.label(
+                egui::RichText::new(format!("{} Schritte", self.schritte()))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
         // Start- und Endpunkt des Pattern-Ausschnitts: welcher Teil des Bildes
         // ins Pattern kommt — und damit dessen Länge (wie „Width?" und „Start?"
         // im Desktop-Recorder).
-        let ganz = self.schritte_letzte.saturating_sub(1);
+        let ganz = self.schritte().saturating_sub(1);
         if self.abschnitt_bis == u16::MAX {
             self.abschnitt_bis = ganz;
         }
@@ -1162,14 +1172,11 @@ impl ImagePanel {
                     .color(Color32::GRAY),
             );
         });
-        let gesperrt = gesperrte_spalten(&self.maske, self.schritte_letzte.max(1) as usize);
+        let gesperrt = gesperrte_spalten(&self.maske, self.schritte().max(1) as usize);
         ui.label(
-            egui::RichText::new(format!(
-                "{} von {} gesperrt",
-                gesperrt, self.schritte_letzte
-            ))
-            .small()
-            .color(Color32::GRAY),
+            egui::RichText::new(format!("{} von {} gesperrt", gesperrt, self.schritte()))
+                .small()
+                .color(Color32::GRAY),
         );
     }
 

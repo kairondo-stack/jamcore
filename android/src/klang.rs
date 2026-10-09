@@ -8,7 +8,7 @@ use std::os::raw::c_int;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
-use jamcore::klang::{frequenz, sinus_puffer};
+use jamcore::klang::{frequenz, puffer_welle, Welle};
 use log::info;
 
 const RATE: c_int = 44100;
@@ -19,13 +19,13 @@ const ENCODING_PCM_16BIT: i32 = 2;
 const MODE_STREAM: i32 = 1;
 
 pub struct Spieler {
-    tx: Sender<i32>,
+    tx: Sender<(i32, Welle)>,
 }
 
 static SPIELER: OnceLock<Mutex<Option<Spieler>>> = OnceLock::new();
 
-/// Spielt eine MIDI-Note kurz an (nicht blockierend, Fehler nur im Log).
-pub fn spielen(midi: i32) {
+/// Spielt eine MIDI-Note mit gewaehlter Wellenform kurz an.
+pub fn spielen_welle(midi: i32, welle: Welle) {
     let slot = SPIELER.get_or_init(|| Mutex::new(None));
     let mut guard = match slot.lock() {
         Ok(g) => g,
@@ -41,7 +41,7 @@ pub fn spielen(midi: i32) {
         }
     }
     if let Some(spieler) = guard.as_ref() {
-        let _ = spieler.tx.send(midi);
+        let _ = spieler.tx.send((midi, welle));
     }
 }
 
@@ -50,7 +50,7 @@ fn starten() -> Result<Spieler, String> {
     let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }
         .map_err(|e| format!("JavaVM: {e}"))?;
     let vm = std::sync::Arc::new(vm);
-    let (tx, rx) = channel::<i32>();
+    let (tx, rx) = channel::<(i32, Welle)>();
     std::thread::Builder::new()
         .name("jam-klang".to_string())
         .spawn(move || {
@@ -63,11 +63,11 @@ fn starten() -> Result<Spieler, String> {
     Ok(Spieler { tx })
 }
 
-fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<i32>) -> Result<(), String> {
+fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<(i32, Welle)>) -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let (track, array) = create_track(&mut env)?;
-    while let Ok(midi) = rx.recv() {
-        let puffer = sinus_puffer(frequenz(midi), RATE as u32, LAENGE_MS);
+    while let Ok((midi, welle)) = rx.recv() {
+        let puffer = puffer_welle(frequenz(midi), RATE as u32, LAENGE_MS, welle);
         // Stereo PCM16 little-endian, beide Kanäle gleich.
         let mut bytes: Vec<i8> = Vec::with_capacity(puffer.len() * 4);
         for s in &puffer {
