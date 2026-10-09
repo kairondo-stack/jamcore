@@ -105,12 +105,14 @@ pub fn bereiche(
             let breite = ui.available_width();
             ui.allocate_ui(egui::vec2(breite, hoehe), |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .id_salt("kombi_bereich_oben")
                     .show(ui, |ui| zeichnen(ui, oben));
             });
             ui.separator();
             ui.allocate_ui(egui::vec2(breite, hoehe), |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .id_salt("kombi_bereich_unten")
                     .show(ui, |ui| zeichnen(ui, unten));
             });
@@ -121,11 +123,13 @@ pub fn bereiche(
                 .default_size((ui.available_width() * 0.5).max(200.0))
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource::ALL)
                         .id_salt("kombi_bereich_links")
                         .show(ui, |ui| zeichnen(ui, oben));
                 });
             egui::CentralPanel::default().show(ui, |ui| {
                 egui::ScrollArea::vertical()
+                    .scroll_source(egui::scroll_area::ScrollSource::ALL)
                     .id_salt("kombi_bereich_rechts")
                     .show(ui, |ui| zeichnen(ui, unten));
             });

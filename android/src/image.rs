@@ -11,14 +11,43 @@
 use eframe::egui::{self, Color32, TextureOptions};
 
 use jamcore::livescan::{
-    build_palette, next_column, note_allowed, note_volume, pixel_matches, scan_column, ScanFilter,
+    build_palette, note_allowed, note_volume, pixel_matches, scale_rgb, scan_column, ScanFilter,
 };
 use jamcore::osc::{OscOut, Renoise};
+use jamcore::scanmask::{Aufloesung, ScanMaske};
 
 use crate::camera;
 use crate::video;
 
 const TOLERANZ_STANDARD: i32 = 24;
+/// Notenbremse fest (der Fader dafür ist weg).
+const MAX_NOTEN_PRO_SEK: u32 = 8;
+/// Kleinster und groesster Zoomfaktor des Bildes.
+const ZOOM_MIN: f32 = 0.2;
+const ZOOM_MAX: f32 = 4.0;
+/// Höhe der Maskenleiste oben im Bild in Punkten.
+const LEISTE_H: f32 = 18.0;
+/// Der Bildteil nimmt höchstens so viel Höhe, damit die Regler unten sichtbar
+/// bleiben (Querformat) — ohne dass man scrollen muss.
+const BILD_ANTEIL_H: f32 = 0.55;
+/// Im Querformat liegt links das Bild, rechts die Steuerung in zwei Spalten —
+/// sonst frisst die GUI die Höhe und das Bild wird winzig. Das Bild bekommt
+/// dort gut die Hälfte der Fläche.
+const BILD_ANTEIL_H_QUER: f32 = 0.62;
+/// Schrittzahl wird auf volle 8er gerundet, damit kleine Layoutschwankungen die
+/// Maske nicht verändern.
+const SCHRITT_RUNDE: f32 = 8.0;
+
+///
+/// Gibt es als freie Funktion, weil sie an zwei Stellen gebraucht wird.
+fn gesperrte_spalten(maske: &ScanMaske, schritte: usize) -> usize {
+    maske
+        .abschnitte(schritte)
+        .iter()
+        .filter(|(_, _, alpha)| *alpha <= 0.0)
+        .map(|(von, bis, _)| bis - von)
+        .sum()
+}
 
 pub struct ImagePanel {
     texture: Option<egui::TextureHandle>,
@@ -32,8 +61,6 @@ pub struct ImagePanel {
     bg: (u8, u8, u8),
     /// Toleranz je Kanal (wie rrange/grange/brange im Desktop).
     toleranz: (i32, i32, i32),
-    /// Sweep-Schrittweite (iadd im Desktop).
-    schritt: i32,
     treffer: u64,
     status: String,
     /// noteadjust-Modus des Scans (0 = Zeile, 2/3 = y, 5/6 = x).
@@ -47,18 +74,36 @@ pub struct ImagePanel {
     mal_masse: (usize, usize),
     /// Radieren: Treffer aus dem Merker loeschen statt merken.
     radieren: bool,
-    /// Takt-Maske (biialpha): welche der 16 Sweep-Abschnitte durchkommen.
+    /// Takt-Maske (rrn5 `biialpha`): Spalten an/ab, ohne die Zeilen mit alpha 0.
     maske_an: bool,
-    maske: [bool; 16],
+    maske: ScanMaske,
+    /// Schrittzahl einfrieren (sonst folgt sie der Bildbreite mal Zoom).
+    schritte_fest: bool,
+    /// Taktdauer des Sweeps in Takten (Fader mit /2 x2 /3 x3), f64 wie im Kern.
+    pub takte: f64,
+    /// Zoom des Bildes als Anteil der verfuegbaren Breite.
+    bild_zoom: f32,
+    /// Scan-Bereich als Anteile der Bildbreite (rrn5: Alt+D/Alt+C).
+    scan_links: f32,
+    scan_rechts: f32,
+    /// Verschiebung des Bildes im Kasten in Punkten (drei Finger).
+    bild_versatz: (f32, f32),
+    /// Mehrfinger (zwei Finger Zoom, drei Finger verschieben).
+    finger: crate::touch::Mehrfinger,
+    /// Schrittzahl des letzten Bildes (die Maske haengt daran).
+    schritte_letzte: u16,
+    /// Start- und Endpunkt des Pattern-Ausschnitts der X-Auflösung (Schritte).
+    abschnitt_von: u16,
+    abschnitt_bis: u16,
+    /// Wert, den der Finger gerade in die Maske malt (sonst flackert es).
+    maske_pinsel: Option<bool>,
     /// Live-Scan (S7e): Sweep ueber die Spalten, Treffer als OSC-Noten.
     scan_an: bool,
-    scan_takt: bool,
     scan_bpm: f32,
     scan_x: i32,
     scan_puffer: Option<(usize, usize, Vec<u8>)>,
     scan_naechste_spalte: std::time::Instant,
     scan_letzte_note: std::time::Instant,
-    scan_max_noten: u32,
     sweep_noten: u64,
     sweep_gezeichnet: u64,
     host: String,
@@ -87,7 +132,6 @@ impl ImagePanel {
             sel: None,
             bg: (0, 0, 0),
             toleranz: (TOLERANZ_STANDARD, TOLERANZ_STANDARD, TOLERANZ_STANDARD),
-            schritt: 2,
             treffer: 0,
             status: "Kamera starten, dann ins Bild tippen (halten = einfrieren).".to_string(),
             note_modus: 0,
@@ -97,15 +141,24 @@ impl ImagePanel {
             mal_masse: (0, 0),
             radieren: false,
             maske_an: false,
-            maske: [true; 16],
+            maske: ScanMaske::neu(16, Aufloesung::Sync),
+            schritte_fest: false,
+            takte: jamcore::takte::VORGABE,
+            bild_zoom: 1.0,
+            scan_links: 0.0,
+            scan_rechts: 1.0,
+            bild_versatz: (0.0, 0.0),
+            finger: crate::touch::Mehrfinger::neu(),
+            schritte_letzte: 0,
+            abschnitt_von: 0,
+            abschnitt_bis: u16::MAX,
+            maske_pinsel: None,
             scan_an: false,
-            scan_takt: false,
             scan_bpm: 120.0,
             scan_x: 0,
             scan_puffer: None,
             scan_naechste_spalte: std::time::Instant::now(),
             scan_letzte_note: std::time::Instant::now(),
-            scan_max_noten: 8,
             sweep_noten: 0,
             sweep_gezeichnet: 0,
             host: jamcore::osc::DEFAULT_HOST.to_string(),
@@ -191,7 +244,7 @@ impl ImagePanel {
         self.port = port.trim().to_string();
     }
 
-    /// Tempo fuer den Takt-Scan von aussen setzen (Session-Follow).
+    /// Tempo fuer den Takt-Scan von aussen setzen (Session-Follow oder globale BPM).
     pub fn set_bpm(&mut self, bpm: f32) {
         self.scan_bpm = bpm.clamp(20.0, 300.0);
     }
@@ -201,10 +254,17 @@ impl ImagePanel {
             self.host.clone(),
             self.port.parse().unwrap_or(jamcore::osc::DEFAULT_BASE_PORT),
         );
-        match OscOut::new(&host, port)
-            .and_then(|out| Renoise::new(&out).note_on(7000, note, volume))
-        {
-            Ok(used) => log::info!("bild: Scan-Note {note} -> {host}:{used}"),
+        // Wie im Desktop-rrn5: zur Note laeuft der MIDI-Trigger (Port 7002) mit,
+        // damit Renoise auch MIDI-Instrumente anspricht.
+        match OscOut::new(&host, port).and_then(|out| {
+            let renoise = Renoise::new(&out);
+            let used = renoise.note_on(7000, note, volume)?;
+            if let Err(e) = renoise.trigger_midi(7002, volume) {
+                log::warn!("MIDI-Trigger: {e}");
+            }
+            Ok(used)
+        }) {
+            Ok(used) => log::info!("Scan-Note {note} -> {host}:{used}"),
             Err(e) => self.status = format!("OSC-Fehler: {e}"),
         }
     }
@@ -317,11 +377,155 @@ impl ImagePanel {
         self.textur_setzen(ctx, w, h, &bild);
     }
 
+    /// Schrittzahl (X-Auflösung) des zuletzt gezeigten Bildes.
+    pub fn schritte(&self) -> u16 {
+        // Solange der Bild-Tab noch nie gezeichnet wurde, ist die Schrittzahl
+        // 0; dann gilt die Vorgabe, damit der Export im Tagebuch schon stimmt.
+        if self.schritte_letzte == 0 {
+            jamcore::grid::STEPS_PER_CYCLE
+        } else {
+            self.schritte_letzte
+        }
+    }
+
+    /// Pfad der Austauschdatei mit dem Desktop-Recorder.
+    /// Geprüfter Scan-Bereich (Anteile der Breite) — wie im Kern: beide Grenzen
+    /// endlich, geklemmt, rechts > links, sonst die volle Breite.
+    fn bereich(&self) -> (f32, f32) {
+        if !(self.scan_links.is_finite() && self.scan_rechts.is_finite()) {
+            return (0.0, 1.0);
+        }
+        let links = self.scan_links.clamp(0.0, 1.0);
+        let rechts = self.scan_rechts.clamp(0.0, 1.0);
+        if rechts > links {
+            (links, rechts)
+        } else {
+            (0.0, 1.0)
+        }
+    }
+
+    /// Pfad einer Austauschdatei im App-Ordner (KeyEventRender.txt, Snapshot …).
+    fn app_datei(&self, name: &str) -> Option<std::path::PathBuf> {
+        let app = crate::current_app().ok()?;
+        let basis = crate::insets::external_files_dir(&app)?;
+        Some(std::path::PathBuf::from(basis).join(name))
+    }
+
+    fn keyevent_pfad(&self) -> Option<std::path::PathBuf> {
+        self.app_datei("KeyEventRender.txt")
+    }
+
+    /// Letztes Kamerabild als BMP sichern (Desktop-rrn5: Taste `l` →
+    /// `frame4save.bmp`).
+    fn snapshot_sichern(&mut self) {
+        let Some((w, h, rgba)) = camera::letztes_bild() else {
+            self.status = "Kein Bild für den Snapshot.".to_string();
+            return;
+        };
+        let Some(pfad) = self.app_datei("frame4save.bmp") else {
+            self.status = "Kein App-Ordner für den Snapshot.".to_string();
+            return;
+        };
+        let bmp = jamcore::bmp::bmp_aus_rgba(w, h, &rgba);
+        match std::fs::write(&pfad, &bmp) {
+            Ok(()) => {
+                self.status = format!("Snapshot -> {} ({}x{})", pfad.display(), w, h);
+                log::info!("Snapshot gesichert: {}", pfad.display());
+            }
+            Err(e) => self.status = format!("Snapshot-Fehler: {e}"),
+        }
+    }
+
+    /// Maske als `KeyEventRender.txt` schreiben (Desktop: `s` `0`).
+    fn keyevent_sichern(&mut self) {
+        let Some(pfad) = self.keyevent_pfad() else {
+            self.status = "Kein App-Ordner für die Datei.".to_string();
+            return;
+        };
+        let text = self.maske.als_keyevent(self.schritte().max(1) as usize);
+        match std::fs::write(&pfad, &text) {
+            Ok(()) => {
+                self.status = format!("Maske -> {} ({} Zeilen)", pfad.display(), self.schritte());
+                log::info!("KeyEventRender.txt gesichert: {}", pfad.display());
+            }
+            Err(e) => self.status = format!("Datei-Fehler: {e}"),
+        }
+    }
+
+    /// Maske aus `KeyEventRender.txt` lesen (Desktop: `space`). Spalten hinter
+    /// der Datei sind gesperrt (wie im rrn5), Spalten hinter der aktuellen
+    /// X-Auflösung fallen weg.
+    fn keyevent_laden(&mut self) {
+        let Some(pfad) = self.keyevent_pfad() else {
+            self.status = "Kein App-Ordner für die Datei.".to_string();
+            return;
+        };
+        match std::fs::read_to_string(&pfad) {
+            Ok(text) => {
+                let schritte = self.schritte().max(1) as usize;
+                // Die Datei bestimmt die Maske; der Rest bis zur groessten
+                // Aufloesung bleibt gesperrt — genau wie im rrn5, wo Spalten
+                // hinter der Datei 0.0 liefern. Ohne dieses Auffuellen wuerde
+                // spaeteres Wachsen (Zoom, Querformat) die Spalten oeffnen.
+                self.maske = ScanMaske::aus_keyevent(&text);
+                self.maske.resync(jamcore::grid::MAX_SCHRITTE as usize);
+                let gesperrt = gesperrte_spalten(&self.maske, schritte);
+                self.status = format!(
+                    "Maske aus {} ({} Schritte, {} gesperrt)",
+                    pfad.display(),
+                    schritte,
+                    gesperrt
+                );
+                log::info!("KeyEventRender.txt geladen: {}", pfad.display());
+            }
+            Err(e) => self.status = format!("Datei fehlt/kaputt: {e}"),
+        }
+    }
+
+    /// Pattern aus dem gewählten Abschnitt der X-Auflösung: Start- und Endpunkt
+    /// bestimmen, welcher Teil des Bildes ins Pattern kommt (und damit dessen
+    /// Länge). Wird im Tagebuch für den Export gebraucht.
+    pub fn abschnitt_pattern(&self) -> jamcore::grid::Pattern {
+        let schritte = self.schritte();
+        let bis = if self.abschnitt_bis == u16::MAX {
+            schritte.saturating_sub(1)
+        } else {
+            self.abschnitt_bis.min(schritte.saturating_sub(1))
+        };
+        jamcore::grid::Pattern::mit_abschnitt(self.abschnitt_von, bis, schritte)
+    }
+
+    /// Schrittzahl für die aktuelle Anzeigebreite: X-Auflösung mal Zoom, auf
+    /// volle 8er gerundet — das ist auch die Patternlänge. Folgt damit der
+    /// Displaygröße: im Querformat sind es mehr Schritte. Eingefroren, wenn
+    /// „Schritte festhalten" gesetzt ist.
+    fn schrittzahl(&self, platz: f32) -> u16 {
+        if self.schritte_fest && self.schritte_letzte > 0 {
+            return self.schritte_letzte;
+        }
+        let roh = (platz * self.bild_zoom / SCHRITT_RUNDE).floor().max(1.0);
+        (roh * SCHRITT_RUNDE).round().clamp(8.0, 4096.0) as u16
+    }
+
+    /// Anteil der Höhe, den das Bild im Querformat bekommt. Im Hochformat
+    /// reicht [`BILD_ANTEIL_H`], im Querformat ist kaum Höhe da — dort muss das
+    /// Bild kleiner sein, damit **alle** Steuerzeilen darunter ohne Scrollen
+    /// sichtbar sind.
+    fn bild_anteil(platz: f32, flaeche: f32) -> f32 {
+        if platz > flaeche {
+            BILD_ANTEIL_H_QUER
+        } else {
+            BILD_ANTEIL_H
+        }
+    }
+
     /// Ein Sweep-Schritt: Spalten scannen, Treffer als OSC-Noten senden.
     ///
-    /// Wie im Desktop-rrn5: "frei" laeuft mit fester Spaltenrate, "Takt" macht
-    /// einen vollen Durchlauf in einem Beat. Notenwert aus der Zeile
-    /// (oben hoch, unten tief), Lautstaerke 127, Rate ueber `scan_max_noten`.
+    /// Wie im Desktop-rrn5: Der Sweep läuft über die X-Auflösung (Schritte), ein
+    /// voller Durchlauf dauert so viele Takte, wie der Fader sagt (Vorgabe: ein
+    /// Beat). Notenwert aus der Zeile (oben hoch, unten tief). Die Takt-Maske
+    /// (rrn5 `biialpha`) sperrt einzelne Spalten; ihr Wert skaliert zusaetzlich
+    /// Farbe und Lautstaerke.
     fn scan_schritt(&mut self, ctx: &egui::Context) {
         if !self.scan_an {
             return;
@@ -332,16 +536,12 @@ impl ImagePanel {
         let Some((w, h, live)) = camera::letztes_bild() else {
             return;
         };
+        let schritte = self.schritte_letzte.max(1) as i32;
         let (wi, hi) = (w as i32, h as i32);
-        let schritt = self.schritt.max(1);
-        let schritte = ((wi + schritt - 1) / schritt).max(1) as i64;
-        let spalten_ns: i64 = if self.scan_takt {
-            // Ein voller Sweep dauert einen Beat; die Spaltenzahl richtet
-            // sich nach der Schrittweite, sonst waere der Sweep zu kurz.
-            ((60.0 / self.scan_bpm.max(20.0) * 1.0e9) as i64 / schritte).max(1)
-        } else {
-            2_500_000
-        };
+        // Ein voller Durchlauf dauert die eingestellte Taktdauer.
+        let schritt_ns = (jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64) * 1.0e9
+            / schritte as f64) as i64;
+        let schritt_ns = schritt_ns.clamp(200_000, 2_000_000_000) as u64;
         let budget = std::time::Duration::from_millis(10);
         let start = std::time::Instant::now();
         let filter = ScanFilter {
@@ -357,27 +557,34 @@ impl ImagePanel {
         } else {
             None
         };
-        let mut noten: Vec<i32> = Vec::new();
+        let mut noten: Vec<(i32, i32)> = Vec::new();
         while start.elapsed() < budget {
             let jetzt = std::time::Instant::now();
             if jetzt < self.scan_naechste_spalte {
-                std::thread::sleep(self.scan_naechste_spalte - jetzt);
-                continue;
+                // Nicht schlafen: bei grossen Taktzeiten waere das Sekunden im
+                // UI-Thread. Stattdessen neu zeichnen lassen, wenn die naechste
+                // Spalte dran ist.
+                ctx.request_repaint_after(self.scan_naechste_spalte - jetzt);
+                break;
             }
             if self.scan_x == 0 {
                 // Sweep beginnt: Puffer leeren (nur die Treffer leuchten).
                 self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
             }
-            let x = self.scan_x.clamp(0, wi - 1);
-            // Takt-Maske (biialpha): abschnittsweise entscheiden, welche
-            // Spalten durchkommen. Sechzehn Abschnitte ueber die Breite.
+            let schritt = self.scan_x.clamp(0, schritte - 1);
+            // Schritt auf die Kameraspalte abbilden — im gewaehlten Bereich
+            // (rrn5: Split-Grenzen links/rechts).
+            let x = jamcore::livescan::spalte_im_bereich(
+                schritt,
+                schritte,
+                self.scan_links,
+                self.scan_rechts,
+                wi,
+            );
+            // Takt-Maske (rrn5 `biialpha`): 0.0 sperrt die Spalte, sonst
+            // skaliert der Wert Farbe und Lautstaerke.
             let alpha = if self.maske_an {
-                let abschnitt = ((x * 16) / wi.max(1)).clamp(0, 15) as usize;
-                if self.maske[abschnitt] {
-                    1.0
-                } else {
-                    0.0
-                }
+                self.maske.alpha(schritt, schritte as usize)
             } else {
                 1.0
             };
@@ -388,43 +595,50 @@ impl ImagePanel {
             };
             if let Some((_, _, puffer)) = self.scan_puffer.as_mut() {
                 for (y, r, g, b) in &treffer {
-                    let idx = (*y as usize) * w + x as usize;
+                    let idx = (*y as usize) * w + x.max(0) as usize;
                     let idx = idx * 4;
                     if idx + 2 < puffer.len() {
-                        // "gezeichnet": Treffer in ihrer Farbe in den Puffer.
-                        puffer[idx] = *r;
-                        puffer[idx + 1] = *g;
-                        puffer[idx + 2] = *b;
+                        // "gezeichnet": Treffer in ihrer Farbe in den Puffer,
+                        // mit der Masken-Amplitude gedimmt.
+                        let (dr, dg, db) = scale_rgb(*r, *g, *b, alpha);
+                        puffer[idx] = dr;
+                        puffer[idx + 1] = dg;
+                        puffer[idx + 2] = db;
                         puffer[idx + 3] = 255;
                         // Note/Lautstaerke nach dem gewaehlten Zuordnungsmodus
                         // (wie noteadjust im Desktop-rrn5).
-                        let (note, _vol) = note_volume(x, *y, wi, hi, self.note_modus, 36, 36);
-                        noten.push(note);
+                        let (note, vol) = note_volume(x, *y, wi, hi, self.note_modus, 36, 36);
+                        noten.push((note, ((vol as f32 * alpha) as i32).clamp(0, 127)));
                         self.sweep_gezeichnet += 1;
                     }
                 }
             }
-            for note in noten.drain(..) {
-                if note_allowed(self.scan_letzte_note.elapsed(), self.scan_max_noten) {
+            for (note, vol) in noten.drain(..) {
+                if note_allowed(self.scan_letzte_note.elapsed(), MAX_NOTEN_PRO_SEK) {
                     self.scan_letzte_note = std::time::Instant::now();
-                    self.note_senden(note, 127);
+                    self.note_senden(note, vol);
                     self.sweep_noten += 1;
                 }
             }
-            let next = next_column(x, 0, wi, schritt);
-            if next == 0 {
+            let naechster = schritt + 1;
+            if naechster >= schritte {
+                // Sweep zu Ende: Protokoll, Zaehler zuruecksetzen, und der
+                // naechste Durchlauf startet wieder bei Schritt 0.
                 log::info!(
-                    "bild: Sweep beendet, {} Noten, {} gezeichnet ({})",
+                    "Sweep beendet, {} Noten, {} gezeichnet, {} ({:.2} s)",
                     self.sweep_noten,
                     self.sweep_gezeichnet,
-                    if self.scan_takt { "Takt" } else { "frei" }
+                    jamcore::takte::text(self.takte),
+                    jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64)
                 );
                 self.sweep_noten = 0;
                 self.sweep_gezeichnet = 0;
                 self.scan_puffer = None;
+                self.scan_x = 0;
+            } else {
+                self.scan_x = naechster;
             }
-            self.scan_x = next;
-            self.scan_naechste_spalte += std::time::Duration::from_nanos(spalten_ns.max(1) as u64);
+            self.scan_naechste_spalte += std::time::Duration::from_nanos(schritt_ns);
         }
         if let Some((w, h, puffer)) = self.scan_puffer.clone() {
             self.textur_setzen(ctx, w, h, &puffer);
@@ -435,7 +649,15 @@ impl ImagePanel {
         // ~20 Bilder je Sekunde reichen fuer die Vorschau und sparen Strom.
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
+        // Alles in eine ScrollArea: im Querformat ist sonst unter dem Bild
+        // nichts mehr erreichbar, weil das Bild den ganzen Platz nimmt.
+        egui::ScrollArea::vertical()
+            .scroll_source(egui::scroll_area::ScrollSource::ALL)
+            .id_salt("bild_inhalt")
+            .show(ui, |ui| self.inhalt(ui));
+    }
 
+    fn inhalt(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Kamera an").clicked() {
                 self.kamera_an();
@@ -453,18 +675,9 @@ impl ImagePanel {
                 self.scan_an = !self.scan_an;
                 self.scan_puffer = None;
                 self.scan_x = 0;
-                self.status = format!(
-                    "Scan {} ({}), {} Noten/s",
-                    if self.scan_an { "an" } else { "aus" },
-                    if self.scan_takt { "Takt" } else { "frei" },
-                    self.scan_max_noten
-                );
-            }
-            if ui
-                .button(if self.scan_takt { "Takt" } else { "frei" })
-                .clicked()
-            {
-                self.scan_takt = !self.scan_takt;
+                // Ohne Ruecksetzen wuerde der erste Schritt sofort „aufholen“.
+                self.scan_naechste_spalte = std::time::Instant::now();
+                self.status = format!("Scan {}", if self.scan_an { "an" } else { "aus" });
             }
             let modi: [u8; 5] = [0, 2, 3, 5, 6];
             let namen = [
@@ -478,18 +691,13 @@ impl ImagePanel {
             if ui.button(namen[idx]).clicked() {
                 self.note_modus = modi[(idx + 1) % modi.len()];
             }
-            ui.label("Noten/s");
-            ui.add(egui::Slider::new(&mut self.scan_max_noten, 1..=30));
-            ui.label("Schritt");
-            ui.add(egui::Slider::new(&mut self.schritt, 1..=4));
-            if self.scan_takt {
-                ui.label("BPM");
-                ui.add(egui::Slider::new(&mut self.scan_bpm, 60.0..=180.0));
-            }
             ui.label(format!(
                 "Sweep: {} Noten, {} gezeichnet",
                 self.sweep_noten, self.sweep_gezeichnet
             ));
+            if ui.button("Snapshot").clicked() {
+                self.snapshot_sichern();
+            }
         });
         // Dekodierfehler aus Java einmal je Sekunde sichtbar machen.
         if self.video_laeuft && self.video_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
@@ -557,81 +765,301 @@ impl ImagePanel {
             }
         }
 
-        self.scan_schritt(ui.ctx());
-
-        let (w, h) = self.textur_masse;
-        if let Some(texture) = self.texture.clone() {
-            if w > 0 && h > 0 {
-                let platz = ui.available_width();
-                let skala = platz / w as f32;
-                let groesse = egui::vec2(platz, h as f32 * skala);
-                let response = ui.add(
-                    egui::Image::new(egui::load::SizedTexture::new(texture.id(), groesse))
-                        .sense(egui::Sense::click_and_drag()),
-                );
-
-                // Finger gedrueckt = Linksklick: einfrieren + Farbe waehlen.
-                let gedrueckt = response.is_pointer_button_down_on();
-                if gedrueckt {
-                    if self.eingefroren.is_none() {
-                        self.eingefroren = camera::letztes_bild();
-                    }
-                    if let Some(pos) = response.interact_pointer_pos() {
-                        let rel = pos - response.rect.min;
-                        let px = (rel.x / skala) as usize;
-                        let py = (rel.y / skala) as usize;
-                        if let Some(farbe) = self.farbe_an(px, py) {
-                            if self.sel != Some(farbe) {
-                                self.sel = Some(farbe);
-                                self.markieren(ui.ctx());
-                                self.status = format!(
-                                    "Auswahl RGB({}, {}, {}) - {} Pixel in Toleranz",
-                                    farbe.0, farbe.1, farbe.2, self.treffer
-                                );
-                                log::info!(
-                                    "bild: Auswahl RGB({}, {}, {}), {} Pixel (Toleranz {:?})",
-                                    farbe.0,
-                                    farbe.1,
-                                    farbe.2,
-                                    self.treffer,
-                                    self.toleranz
-                                );
-                            }
-                        }
-                    }
-                } else if self.eingefroren.is_some() {
-                    // Loslassen: Freeze beenden, Markierung bleibt stehen.
-                    self.eingefroren = None;
-                }
-            }
+        // X-Aufloesung (Schrittzahl) aus der Anzeigebreite mal Zoom — ist
+        // zugleich die Patternlaenge. Die Maske waechst mit. Die Bildbreite
+        // steht **vor** dem Scan fest (Querformat: linke Spalte), sonst
+        // rechnen Scan und Maskenleiste mit verschiedenen Schrittzahlen.
+        let platz = ui.available_width();
+        let flaeche = ui.available_height().max(160.0);
+        let quer = platz > flaeche;
+        let links = if quer {
+            (platz * 0.46).max(240.0)
         } else {
-            ui.colored_label(Color32::GRAY, "Keine Vorschau (Kamera an?)");
+            platz
+        };
+        let schritte = self.schrittzahl(links);
+        if schritte != self.schritte_letzte {
+            // Deckte der Pattern-Abschnitt das ganze bisherige Bild ab, waechst
+            // er mit (Drehen, Zoom); ein bewusst gewaehlter Ausschnitt bleibt.
+            let ganz_alt = self.schritte_letzte.saturating_sub(1);
+            let war_ganz = self.schritte_letzte > 0
+                && self.abschnitt_von == 0
+                && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= ganz_alt);
+            self.maske.resync_offen(schritte as usize);
+            self.schritte_letzte = schritte;
+            if war_ganz {
+                self.abschnitt_bis = schritte.saturating_sub(1);
+            }
         }
 
+        self.scan_schritt(ui.ctx());
+
+        // Im Querformat liegt das Bild links und die Steuerung rechts in zwei
+        // Spalten — untereinander wuerde die GUI die Hoehe fressen und das Bild
+        // winzig werden.
+        if quer {
+            let hoehe = flaeche;
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui(egui::vec2(links, hoehe), |ui| {
+                    self.bild_zeichnen(ui, links, hoehe, schritte);
+                });
+                ui.separator();
+                ui.allocate_ui(egui::vec2(platz - links - 8.0, hoehe), |ui| {
+                    egui::ScrollArea::vertical()
+                        .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                        .id_salt("bild_steuerung")
+                        .show(ui, |ui| {
+                            // `ui.columns` teilt die Breite wirklich auf und beschneidet
+                            // jede Spalte auf ihre Haelfte — mit blossen
+                            // `allocate_ui`-Kasten ragen die Zeilen sonst
+                            // in die Nachbarspalte hinein und ueberlappen.
+                            ui.columns(2, |cols| {
+                                self.steuerung_teile(&mut cols[0], 0);
+                                self.steuerung_teile(&mut cols[1], 1);
+                            });
+                        });
+                });
+            });
+            return;
+        }
+
+        self.bild_zeichnen(ui, platz, flaeche, schritte);
+        self.steuerung(ui);
+    }
+
+    /// Wie viele Zeilen die Steuerung hat. Jede Zeile ist schmal genug für eine
+    /// Spalte; im Querformat wechseln sie zwischen zwei Spalten ab.
+    const STEUERUNG_ZEILEN: usize = 9;
+
+    /// Eine Zeile der Steuerung. Jede Zeile ist schmal genug für eine Spalte;
+    /// im Querformat wechseln sie sich zwischen zwei Spalten ab.
+    fn steuerungs_zeile(&mut self, ui: &mut egui::Ui, zeile: usize) {
+        match zeile {
+            0 => self.zeile_zoom(ui),
+            1 => self.zeile_takte(ui),
+            2 => self.zeile_bpm(ui),
+            3 => self.zeile_maske(ui),
+            4 => self.zeile_schritte(ui),
+            5 => self.zeile_toleranz(ui),
+            6 => self.zeile_auswahl(ui),
+            7 => self.zeile_malen(ui),
+            8 => self.zeile_kanal(ui),
+            _ => {}
+        }
+    }
+
+    /// Alle Regler unterhalb des Bildes (Hochformat, eine Spalte).
+    fn steuerung(&mut self, ui: &mut egui::Ui) {
+        for zeile in 0..Self::STEUERUNG_ZEILEN {
+            self.steuerungs_zeile(ui, zeile);
+        }
+    }
+
+    /// Zeilen 0, 2, 4 … in die linke, 1, 3, 5 … in die rechte Spalte.
+    fn steuerung_teile(&mut self, ui: &mut egui::Ui, spalte: usize) {
+        let mut zeile = spalte;
+        while zeile < Self::STEUERUNG_ZEILEN {
+            self.steuerungs_zeile(ui, zeile);
+            zeile += 2;
+        }
+    }
+
+    /// Zoom mit den Bildknöpfen (Breite/Höhe/Mitte).
+    fn zeile_zoom(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label("Auswahl:");
-            match self.sel {
-                Some((r, g, b)) => {
-                    let (rect, _) =
-                        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
-                    ui.painter()
-                        .rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
-                    ui.label(format!("RGB({r}, {g}, {b})"));
-                }
-                None => {
-                    ui.label("noch keine");
-                }
+            ui.label("Zoom");
+            let mut prozent = (self.bild_zoom * 100.0).round();
+            if ui
+                .add(
+                    egui::Slider::new(&mut prozent, 20.0..=400.0)
+                        .suffix(" %")
+                        .logarithmic(true),
+                )
+                .changed()
+            {
+                self.bild_zoom = (prozent / 100.0) as f32;
             }
-            ui.label(format!("markiert: {}", self.treffer));
-            if ui.button("Auswahl löschen").clicked() {
-                self.sel = None;
-                self.treffer = 0;
-                // Live-Anzeige wieder freigeben (naechster Frame kommt).
+        });
+        // Scan-Bereich wie Alt+D/Alt+C im Desktop-rrn5: nur hier laeuft der Sweep.
+        // Zwei schmale Zahlenfelder — Slider waeren in der halben Spalte zu breit.
+        ui.horizontal(|ui| {
+            ui.label("Bereich");
+            let mut von = (self.scan_links * 100.0).round();
+            let mut bis = (self.scan_rechts * 100.0).round();
+            let a = ui.add(
+                egui::DragValue::new(&mut von)
+                    .range(0.0..=100.0)
+                    .suffix(" %"),
+            );
+            let b = ui.add(
+                egui::DragValue::new(&mut bis)
+                    .range(0.0..=100.0)
+                    .suffix(" %"),
+            );
+            if a.changed() || b.changed() {
+                self.scan_links = (von / 100.0).clamp(0.0, 1.0);
+                self.scan_rechts = (bis / 100.0).clamp(0.0, 1.0);
+            }
+            if ui.button("ganz").clicked() {
+                self.scan_links = 0.0;
+                self.scan_rechts = 1.0;
             }
         });
         ui.horizontal(|ui| {
-            // Hauptregler setzt alle drei Kanaele; darunter fein je Kanal
-            // (wie rrange/grange/brange im Desktop-rrn5).
+            if ui.button("Breite").clicked() {
+                self.bild_zoom = 1.0;
+                self.bild_versatz = (0.0, 0.0);
+            }
+            if ui.button("Höhe").clicked() {
+                let (w, h) = self.textur_masse;
+                let verhaeltnis = if h > 0 && w > 0 {
+                    h as f32 / w as f32
+                } else {
+                    0.75
+                };
+                let platz = ui.available_width();
+                let flaeche = ui.available_height().max(160.0);
+                let passend =
+                    flaeche * Self::bild_anteil(platz, flaeche) / (platz * verhaeltnis).max(1.0);
+                self.bild_zoom = passend.clamp(ZOOM_MIN, ZOOM_MAX);
+                self.bild_versatz = (0.0, 0.0);
+            }
+            if ui.button("Mitte").clicked() {
+                self.bild_versatz = (0.0, 0.0);
+            }
+        });
+    }
+
+    /// Taktdauer: ÷2 ×2 ÷3 ×3 und die Dauer in Sekunden.
+    fn zeile_takte(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Takte:");
+            if ui.button("÷2").clicked() {
+                self.takte = jamcore::takte::teile(self.takte, 2.0);
+            }
+            if ui.button("×2").clicked() {
+                self.takte = jamcore::takte::vielfache(self.takte, 2.0);
+            }
+            if ui.button("÷3").clicked() {
+                self.takte = jamcore::takte::teile(self.takte, 3.0);
+            }
+            if ui.button("×3").clicked() {
+                self.takte = jamcore::takte::vielfache(self.takte, 3.0);
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "{} = {:.2} s bei {:.0} BPM",
+                jamcore::takte::text(self.takte),
+                jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64),
+                self.scan_bpm
+            ))
+            .small(),
+        );
+    }
+
+    /// BPM des Sweeps.
+    fn zeile_bpm(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("BPM");
+            ui.add(egui::Slider::new(&mut self.scan_bpm, 30.0..=300.0));
+        });
+    }
+
+    /// Takt-Maske an/aus (rrn5 `b`).
+    fn zeile_maske(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.maske_an, "Maske");
+        ui.label(
+            egui::RichText::new("grün = durch, rot = gesperrt")
+                .small()
+                .color(Color32::GRAY),
+        );
+    }
+
+    /// Schrittzahl festhalten und die ganze Maske setzen.
+    fn zeile_schritte(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(&mut self.schritte_fest, "Schritte festhalten")
+            .changed()
+            && self.schritte_fest
+        {
+            log::info!("Schritte festgehalten bei {}", self.schritte_letzte);
+        }
+        // Start- und Endpunkt des Pattern-Ausschnitts: welcher Teil des Bildes
+        // ins Pattern kommt — und damit dessen Länge (wie „Width?" und „Start?"
+        // im Desktop-Recorder).
+        let ganz = self.schritte_letzte.saturating_sub(1);
+        if self.abschnitt_bis == u16::MAX {
+            self.abschnitt_bis = ganz;
+        }
+        let mut von = self.abschnitt_von.min(ganz);
+        let mut ende = self.abschnitt_bis.min(ganz).max(von);
+        if ui
+            .horizontal(|ui| {
+                ui.label("Pattern");
+                let a = ui.add(egui::DragValue::new(&mut von).range(0..=ganz));
+                let b = ui.add(egui::DragValue::new(&mut ende).range(von..=ganz));
+                a.changed() || b.changed()
+            })
+            .inner
+        {
+            self.abschnitt_von = von.min(ende);
+            self.abschnitt_bis = ende;
+            log::info!(
+                "Pattern-Abschnitt {}..{}",
+                self.abschnitt_von,
+                self.abschnitt_bis
+            );
+        }
+        ui.horizontal(|ui| {
+            if ui.button("ganzes Bild").clicked() {
+                self.abschnitt_von = 0;
+                self.abschnitt_bis = ganz;
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} Schritte",
+                    self.abschnitt_bis.saturating_sub(self.abschnitt_von) + 1
+                ))
+                .small()
+                .color(Color32::GRAY),
+            );
+            if ui.button("alle an").clicked() {
+                self.maske.setze_alle(true);
+            }
+            if ui.button("alle aus").clicked() {
+                self.maske.setze_alle(false);
+            }
+        });
+        // Austausch mit dem Desktop-Recorder: dieselbe Datei, die rrn5 mit
+        // `space` liest und der Recorder mit `s` `0` schreibt.
+        ui.horizontal(|ui| {
+            if ui.button("Datei sichern").clicked() {
+                self.keyevent_sichern();
+            }
+            if ui.button("Datei laden").clicked() {
+                self.keyevent_laden();
+            }
+            ui.label(
+                egui::RichText::new("KeyEventRender.txt")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
+        let gesperrt = gesperrte_spalten(&self.maske, self.schritte_letzte.max(1) as usize);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} von {} gesperrt",
+                gesperrt, self.schritte_letzte
+            ))
+            .small()
+            .color(Color32::GRAY),
+        );
+    }
+
+    /// Toleranz und Hintergrundfarbe.
+    fn zeile_toleranz(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
             let mut tol = self.toleranz.0.max(self.toleranz.1).max(self.toleranz.2);
             if ui
                 .add(egui::Slider::new(&mut tol, 0..=80).text("Toleranz"))
@@ -643,70 +1071,244 @@ impl ImagePanel {
                     self.markieren(&ctx);
                 }
             }
-            ui.label("Hintergrund (übersprungen):");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Hintergrund:");
             let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
             let (r, g, b) = self.bg;
             ui.painter()
                 .rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
         });
+    }
+
+    /// Farbauswahl aus dem Bild.
+    fn zeile_auswahl(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            // Malen/Merken und Palette-Scan wie das zweite Fenster im Desktop.
-            ui.checkbox(&mut self.malen_an, "Malen (merken)");
-            ui.checkbox(&mut self.radieren, "Radieren");
-            ui.checkbox(&mut self.palette_scan, "Palette-Scan");
-            if self.mal_masse != (0, 0) {
-                let farben = build_palette(
-                    &self.mal_puffer,
-                    self.mal_masse.0 * self.mal_masse.1,
-                    self.bg,
-                );
-                ui.label(format!("gemerkt: {} Farben", farben.len()));
+            ui.label("Auswahl:");
+            match self.sel {
+                Some((r, g, b)) => {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                    ui.painter()
+                        .rect_filled(rect, 3.0, Color32::from_rgb(r, g, b));
+                    ui.label(egui::RichText::new(format!("{r},{g},{b}")).small());
+                }
+                None => {
+                    ui.label(egui::RichText::new("keine").small().color(Color32::GRAY));
+                }
             }
-            if ui.button("Merker löschen").clicked() {
+        });
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{} Pixel", self.treffer)).small());
+            if ui.button("löschen").clicked() {
+                self.sel = None;
+                self.treffer = 0;
+            }
+        });
+    }
+
+    /// Malen, Radieren, Palette-Scan und der Merker.
+    fn zeile_malen(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.malen_an, "Malen");
+            ui.checkbox(&mut self.radieren, "Radieren");
+        });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.palette_scan, "Palette");
+            if ui.button("Merker weg").clicked() {
                 self.mal_puffer.clear();
                 self.mal_masse = (0, 0);
             }
         });
-        ui.horizontal(|ui| {
+        if self.mal_masse != (0, 0) {
+            let farben = build_palette(
+                &self.mal_puffer,
+                self.mal_masse.0 * self.mal_masse.1,
+                self.bg,
+            );
+            ui.label(
+                egui::RichText::new(format!("{} Farben gemerkt", farben.len()))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
+    }
+
+    /// R/G/B fein (wie rrange/grange/brange im Desktop-rrn5).
+    fn zeile_kanal(&mut self, ui: &mut egui::Ui) {
+        for index in 0..3 {
+            let (name, wert) = match index {
+                0 => ("R", &mut self.toleranz.0),
+                1 => ("G", &mut self.toleranz.1),
+                _ => ("B", &mut self.toleranz.2),
+            };
             let mut geaendert = false;
-            for (name, wert) in [
-                ("R", &mut self.toleranz.0),
-                ("G", &mut self.toleranz.1),
-                ("B", &mut self.toleranz.2),
-            ] {
+            ui.horizontal(|ui| {
                 ui.label(name);
-                geaendert |= ui.add(egui::Slider::new(wert, 0..=80)).changed();
-            }
+                geaendert = ui.add(egui::Slider::new(wert, 0..=80)).changed();
+            });
             if geaendert && self.sel.is_some() {
                 let ctx = ui.ctx().clone();
                 self.markieren(&ctx);
             }
-        });
-        ui.horizontal(|ui| {
-            // Takt-Maske (biialpha): Rhythmische Abschnitte des Sweeps an/aus.
-            ui.checkbox(&mut self.maske_an, "Takt-Maske");
-            ui.label(
-                egui::RichText::new("Abschnitte: grün = kommt durch")
-                    .small()
-                    .color(Color32::GRAY),
+        }
+    }
+
+    /// Bild mit Zoom (zwei Finger), Verschiebung (drei Finger) und Maskenleiste.
+    fn bild_zeichnen(&mut self, ui: &mut egui::Ui, platz: f32, flaeche: f32, schritte: u16) {
+        // Mehrfinger: zwei Finger zoomen, drei Finger verschieben.
+        if let Some((zoom, pan)) = self.finger.schritt(ui).geste {
+            self.bild_zoom = (self.bild_zoom * zoom).clamp(ZOOM_MIN, ZOOM_MAX);
+            self.bild_versatz.0 += pan.0;
+            self.bild_versatz.1 += pan.1;
+            log::info!(
+                "gesten: {} Finger, Zoom {zoom:.2}, Weg ({:.0}, {:.0}), jetzt {:.0} %",
+                self.finger.finger(),
+                pan.0,
+                pan.1,
+                self.bild_zoom * 100.0
             );
-        });
-        if self.maske_an {
-            ui.horizontal(|ui| {
-                for i in 0..16usize {
-                    let (rect, resp) =
-                        ui.allocate_exact_size(egui::vec2(16.0, 22.0), egui::Sense::click());
-                    let farbe = if self.maske[i] {
-                        Color32::from_rgb(90, 200, 120)
-                    } else {
-                        Color32::from_rgb(45, 48, 58)
-                    };
-                    ui.painter().rect_filled(rect, 2.0, farbe);
-                    if resp.clicked() {
-                        self.maske[i] = !self.maske[i];
+        }
+        let (w, h) = self.textur_masse;
+        let Some(texture) = self.texture.clone() else {
+            ui.colored_label(Color32::GRAY, "Keine Vorschau (Kamera an?)");
+            return;
+        };
+        if w == 0 || h == 0 {
+            ui.colored_label(Color32::GRAY, "Keine Vorschau (Kamera an?)");
+            return;
+        }
+        let verhaeltnis = h as f32 / w as f32;
+        // Bildgroesse in Punkten; bei Zoom 1 passt es in die Breite.
+        let bild_b = platz * self.bild_zoom;
+        let bild_h = bild_b * verhaeltnis;
+        // Der Kasten ist hoechstens so hoch wie der Anteil der Flaeche, damit die
+        // Regler darunter im Querformat sichtbar bleiben.
+        let kasten_h = bild_h
+            .min(flaeche * Self::bild_anteil(platz, flaeche))
+            .max(60.0);
+        let kasten = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(platz, kasten_h));
+        // Bild mittig im Kasten, plus Verschiebung.
+        // Das Bild bleibt im Kasten: verschoben werden darf nur, was wirklich
+        // ueber den Rand hinausragt.
+        let max_vx = ((bild_b - platz) / 2.0).max(0.0);
+        let max_vy = ((bild_h - kasten_h) / 2.0).max(0.0);
+        self.bild_versatz.0 = self.bild_versatz.0.clamp(-max_vx, max_vx);
+        self.bild_versatz.1 = self.bild_versatz.1.clamp(-max_vy, max_vy);
+        let bild_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                kasten.center().x - bild_b / 2.0 + self.bild_versatz.0,
+                kasten.center().y - bild_h / 2.0 + self.bild_versatz.1,
+            ),
+            egui::vec2(bild_b, bild_h),
+        );
+        let skala = bild_b / w as f32;
+        let (_, response) = ui.allocate_exact_size(kasten.size(), egui::Sense::click_and_drag());
+        {
+            // Auf den Kasten beschnitten: Zoom darf ueber den Rand hinausgehen.
+            let painter = ui.painter().with_clip_rect(kasten);
+            painter.rect_filled(kasten, 0.0, Color32::from_rgb(12, 12, 14));
+            painter.image(
+                texture.id(),
+                bild_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
+        let finger_unten = response.is_pointer_button_down_on()
+            || response.dragged_by(egui::PointerButton::Primary);
+
+        // Die Leiste deckt nur den Scan-Bereich ab — dort, wo der Sweep laeuft.
+        let (bereich_links, bereich_rechts) = self.bereich();
+        let leiste = egui::Rect::from_min_size(
+            egui::pos2(
+                bild_rect.min.x + bereich_links * bild_b,
+                bild_rect.min.y.max(kasten.min.y),
+            ),
+            egui::vec2((bereich_rechts - bereich_links) * bild_b, LEISTE_H),
+        );
+        let sichtbar = leiste.intersect(kasten);
+        if sichtbar.width() > 1.0 {
+            let painter = ui.painter().with_clip_rect(sichtbar);
+            painter.rect_filled(sichtbar, 0.0, Color32::from_black_alpha(150));
+            for (von, bis, alpha) in self.maske.abschnitte(schritte as usize) {
+                let n = schritte.max(1) as f32;
+                let x0 = leiste.min.x + von as f32 / n * leiste.width();
+                let x1 = leiste.min.x + bis as f32 / n * leiste.width();
+                let farbe = if alpha > 0.0 {
+                    Color32::from_rgba_unmultiplied(60, 205, 115, (alpha * 255.0) as u8)
+                } else {
+                    Color32::from_rgb(120, 40, 45)
+                };
+                let stueck = egui::Rect::from_min_size(
+                    egui::pos2(x0, sichtbar.min.y + 1.0),
+                    egui::vec2((x1 - x0).max(0.5), (sichtbar.height() - 2.0).max(2.0)),
+                );
+                painter.rect_filled(stueck, 0.0, farbe);
+            }
+        }
+
+        if let Some(pos) = response.interact_pointer_pos() {
+            if sichtbar.contains(pos) {
+                // Finger in der Leiste: Spalte umschalten und beim Wischen den
+                // Wert weiterschreiben; der Anteil zaehlt im Scan-Bereich.
+                // Der rechte Rand gehoert noch zur letzten Spalte.
+                let letzte = schritte.max(1) as f32 - 1.0;
+                let anteil = (((pos.x - leiste.min.x) / leiste.width().max(1.0))
+                    * schritte.max(1) as f32)
+                    .floor()
+                    .clamp(0.0, letzte) as i32;
+                if let Some(eintrag) = self.maske.eintrag_fuer_x(anteil, schritte as usize) {
+                    if self.maske_pinsel.is_none() {
+                        self.maske_pinsel =
+                            Some(self.maske.alpha(anteil, schritte as usize) <= 0.0);
+                    }
+                    let durch = self.maske_pinsel.unwrap_or(true);
+                    if (self.maske.alpha(anteil, schritte as usize) > 0.0) != durch {
+                        self.maske.setze(eintrag, durch);
+                        self.status = format!(
+                            "Maske: Schritt {anteil} {} (von {})",
+                            if durch { "an" } else { "aus" },
+                            schritte
+                        );
+                        log::info!(
+                            "maske Schritt {anteil}/{} {}",
+                            schritte,
+                            if durch { "an" } else { "aus" }
+                        );
                     }
                 }
-            });
+            } else if finger_unten && bild_rect.contains(pos) {
+                // Finger im Bild: einfrieren + Farbe waehlen.
+                if self.eingefroren.is_none() {
+                    self.eingefroren = camera::letztes_bild();
+                }
+                let px = ((pos.x - bild_rect.min.x) / skala) as usize;
+                let py = ((pos.y - bild_rect.min.y) / skala) as usize;
+                if let Some(farbe) = self.farbe_an(px, py) {
+                    if self.sel != Some(farbe) {
+                        self.sel = Some(farbe);
+                        self.markieren(ui.ctx());
+                        self.status = format!(
+                            "Auswahl RGB({}, {}, {}) - {} Pixel in Toleranz",
+                            farbe.0, farbe.1, farbe.2, self.treffer
+                        );
+                        log::info!(
+                            "Auswahl RGB({}, {}, {}), {} Pixel (Toleranz {:?})",
+                            farbe.0,
+                            farbe.1,
+                            farbe.2,
+                            self.treffer,
+                            self.toleranz
+                        );
+                    }
+                }
+            }
+        }
+        if !finger_unten {
+            // Loslassen: Pinsel und Freeze beenden, die Anzeige bleibt.
+            self.maske_pinsel = None;
+            self.eingefroren = None;
         }
     }
 }

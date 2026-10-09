@@ -1,10 +1,9 @@
-//! Takt-Maske: Tastenfeld mit Wischgesten.
+//! Takt-Maske: Tastenfeld, jeder Tastendruck ein Schritt.
 //!
-//! Wie die Graphen-Maske des Desktop-Recorders (dort stückweise linear), hier
-//! zusätzlich mit Beschleunigungsprofil: Tippen auf eine Taste schreibt ihren
-//! Wert auf den ersten Schritt; Wischen über mehrere Tasten legt sie auf
-//! Schritte, deren Abstände sich aus den Wischproben ergeben (linear,
-//! beschleunigend oder bremsend – `jamcore::maske`).
+//! Tippen auf eine Taste belegt den nächsten Schritt. Ein Wisch zählt **nur**
+//! die Taste, bei der er anfängt, und die, bei der er aufhört. Eine gehaltene
+//! Taste plus eine zweite ergibt zwei Schritte hintereinander (jeder neu
+//! aufgesetzte Finger ist ein Tastendruck).
 //!
 //! Zwei Feldarten:
 //! - **Je Wert**: eine Taste je Wert, 0..=wert_max (z.B. 0..128 = 129 Tasten);
@@ -13,9 +12,10 @@
 //!   0 (Pause) bis wert_max verteilt.
 
 use eframe::egui::{self, Color32, RichText};
-use jamcore::grid::{Note, Pattern, STEPS_PER_CYCLE as STEP_COUNT};
-use jamcore::maske::{profil_aus_geschwindigkeiten, schritt_positionen, Verteilung};
+use jamcore::grid::{Note, Pattern};
 use log::info;
+
+use crate::touch::Mehrfinger;
 
 /// Regenbogenfarbe fuer den Touch-Verlauf (0.0 = rot, 1.0 = violett).
 fn regenbogen(anteil: f32) -> Color32 {
@@ -36,13 +36,15 @@ pub struct MaskePanel {
     reihen: usize,
     wert_max: i32,
     status: String,
-    /// Wischproben: (x, y, Zeit in Sekunden).
-    proben: Vec<(f32, f32, f32)>,
-    letzter_wisch: Option<(usize, Verteilung)>,
-    /// Getouchte Tasten in Reihenfolge (Index und Mitte) fuer den Regenbogen.
+    /// Getastete Felder in Druckreihenfolge (Index und Mitte) fuer den Regenbogen.
     spur: Vec<(usize, egui::Pos2)>,
-    /// Noten des letzten Wischs (Schritt, Wert) fuer die Schrittweiten-Leiste.
-    wisch_noten: Vec<(u16, i32)>,
+    /// Der zuletzt gesetzte Schritt, damit „Taste halten + andere" den
+    /// **nächsten** Schritt belegt.
+    naechster_schritt: u16,
+    /// Mehrfinger: jeder neu aufgesetzte Finger ist ein weiterer Tastendruck.
+    finger: Mehrfinger,
+    /// Erst- und Endtaste je Finger (Fingernummer -> (Start, Ende)).
+    wisch: std::collections::HashMap<u64, (Option<usize>, Option<usize>)>,
 }
 
 impl Default for MaskePanel {
@@ -58,11 +60,11 @@ impl MaskePanel {
             spalten: 8,
             reihen: 4,
             wert_max: 32,
-            status: "Taste tippen = Note; über Tasten wischen = Schritte setzen.".to_string(),
-            proben: Vec::new(),
-            letzter_wisch: None,
+            status: "Taste tippen = nächster Schritt; halten + andere Taste = danach.".to_string(),
             spur: Vec::new(),
-            wisch_noten: Vec::new(),
+            naechster_schritt: 0,
+            finger: Mehrfinger::neu(),
+            wisch: std::collections::HashMap::new(),
         }
     }
 
@@ -124,107 +126,37 @@ impl MaskePanel {
         (index < self.tasten_anzahl()).then_some(index)
     }
 
-    /// Wertet den Wisch aus und schreibt die Noten in das Pattern.
-    fn wisch_auswerten(&mut self, rect: egui::Rect, pattern: &mut Pattern) {
-        let proben = std::mem::take(&mut self.proben);
-        let tasten: Vec<usize> = proben
-            .iter()
-            .filter_map(|(x, y, _)| self.taste_unter(rect, egui::pos2(*x, *y)))
-            .collect();
-        let mut reihenfolge: Vec<usize> = Vec::new();
-        for taste in tasten {
-            if reihenfolge.last() != Some(&taste) {
-                reihenfolge.push(taste);
-            }
+    /// Setzt einen Schritt mit dem Wert der Taste und rückt den Schrittzähler vor.
+    fn druck_schritt(&mut self, taste: usize, pos: egui::Pos2, pattern: &mut Pattern) {
+        let wert = self.wert_der_taste(taste);
+        let schritt = self.naechster_schritt % pattern.steps_per_cycle().max(1);
+        self.naechster_schritt = self.naechster_schritt.wrapping_add(1);
+        self.spur.push((taste, pos));
+        if wert > 0 {
+            pattern.insert(Note {
+                step: schritt,
+                instrument: 0,
+                pitch: wert,
+                glide: false,
+            });
+            info!(
+                "druck: taste {} -> schritt {} (wert {wert})",
+                taste + 1,
+                schritt + 1
+            );
+            self.status = format!(
+                "Taste {} -> Schritt {} (Wert {wert})",
+                taste + 1,
+                schritt + 1
+            );
+        } else {
+            info!(
+                "druck: taste {} -> schritt {} (pause)",
+                taste + 1,
+                schritt + 1
+            );
+            self.status = format!("Taste {} ist Pause (Schritt {}).", taste + 1, schritt + 1);
         }
-
-        if reihenfolge.is_empty() {
-            self.status = "Nichts getroffen.".to_string();
-            return;
-        }
-        // Touch-Verlauf fuer die Anzeige (Regenbogen + Linien).
-        self.spur.clear();
-        self.wisch_noten.clear();
-        for taste in &reihenfolge {
-            self.spur.push((*taste, self.zentrum(rect, *taste)));
-        }
-        if reihenfolge.len() == 1 {
-            // Tippen: Wert auf Schritt 1 des Rasters.
-            let wert = self.wert_der_taste(reihenfolge[0]);
-            if wert > 0 {
-                pattern.insert(Note {
-                    step: 0,
-                    instrument: 0,
-                    pitch: wert,
-                    glide: false,
-                });
-                self.wisch_noten.push((0, wert));
-                self.status = format!(
-                    "Taste {} -> Note {} auf Schritt 1",
-                    reihenfolge[0] + 1,
-                    wert
-                );
-            } else {
-                self.status = format!("Taste {} ist Pause (0).", reihenfolge[0] + 1);
-            }
-            return;
-        }
-
-        // Wisch: Geschwindigkeitsprofil aus den Proben.
-        let geschwindigkeiten: Vec<f32> = proben
-            .windows(2)
-            .map(|w| {
-                let dx = w[1].0 - w[0].0;
-                let dy = w[1].1 - w[0].1;
-                let dt = (w[1].2 - w[0].2).max(1e-3);
-                (dx * dx + dy * dy).sqrt() / dt
-            })
-            .collect();
-        let profil = profil_aus_geschwindigkeiten(&geschwindigkeiten);
-
-        // Die durchstrichenen Tasten auf die 16 Schritte legen: Abstände nach
-        // Profil, Werte von den Tasten. Pausen (0) lassen Lücken.
-        let anzahl = reihenfolge.len();
-        let positionen = schritt_positionen(anzahl as u32, profil);
-        let mut punkte: Vec<f32> = Vec::with_capacity(anzahl + 2);
-        punkte.push(0.0);
-        punkte.extend(positionen);
-        punkte.push(1.0);
-        let mut belegt = 0i32;
-        let mut zuletzt = -2i32;
-        for (i, taste) in reihenfolge.iter().enumerate() {
-            let anteil = punkte.get(i + 1).copied().unwrap_or(1.0);
-            let mut schritt = (anteil * (STEP_COUNT - 1) as f32).round() as i32;
-            if schritt <= zuletzt {
-                schritt = zuletzt + 1;
-            }
-            zuletzt = schritt;
-            let wert = self.wert_der_taste(*taste);
-            if wert > 0 && (0..STEP_COUNT as i32).contains(&schritt) {
-                pattern.insert(Note {
-                    step: schritt as u16,
-                    instrument: 0,
-                    pitch: wert,
-                    glide: false,
-                });
-                self.wisch_noten.push((schritt as u16, wert));
-                belegt += 1;
-            }
-        }
-        let name = match profil {
-            Verteilung::Linear => "linear",
-            Verteilung::Beschleunigend => "beschleunigend",
-            Verteilung::Bremsend => "bremsend",
-        };
-        self.letzter_wisch = Some((anzahl, profil));
-        self.status = format!(
-            "Wisch: {} Tasten, {} ({belegt} Noten gesetzt)",
-            anzahl, name
-        );
-        info!(
-            "maske: Wisch {} Tasten, Profil {name}, {belegt} Noten",
-            anzahl
-        );
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
@@ -349,37 +281,46 @@ impl MaskePanel {
             );
         }
 
-        // Proben sammeln, während der Finger auf dem Feld ist.
-        if response.is_pointer_button_down_on() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let jetzt = ui.input(|i| i.time) as f32;
-                let neu = match self.proben.last() {
-                    Some((x, y, _)) => (pos.x - x).abs() + (pos.y - y).abs() > 2.0,
-                    None => true,
-                };
-                if neu {
-                    self.proben.push((pos.x, pos.y, jetzt));
-                }
+        // Alles laeuft ueber die Touch-Ereignisse: so zaehlt ein Finger genau einmal.
+        // Aufsetzen = erster Schritt, Loslassen = der Schritt, bei dem der Wisch
+        // endet. Damit ist „Taste halten und eine andere druecken" automatisch
+        // „naechster Schritt".
+        let rahmen = self.finger.schritt(ui);
+        for (id, pos) in rahmen.starts {
+            let taste = self.taste_unter(rect, pos);
+            self.wisch.insert(id, (taste, taste));
+        }
+        for (id, pos) in rahmen.zuege {
+            let treffer = self.taste_unter(rect, pos);
+            if let Some(gespeichert) = self.wisch.get_mut(&id) {
+                gespeichert.1 = treffer.or(gespeichert.1);
             }
         }
-        if response.drag_stopped() {
-            self.wisch_auswerten(rect, pattern);
-        } else if response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let jetzt = ui.input(|i| i.time) as f32;
-                // Beim reinen Tippen dieselbe Taste als einzelne Probe.
-                self.proben.push((pos.x, pos.y, jetzt));
-                self.wisch_auswerten(rect, pattern);
+        for (id, _) in rahmen.endes {
+            let Some((start, ende)) = self.wisch.remove(&id) else {
+                continue;
+            };
+            let Some(start) = start else {
+                continue;
+            };
+            let ende = ende.unwrap_or(start);
+            self.spur.clear();
+            for taste in [Some(start), if ende == start { None } else { Some(ende) }]
+                .into_iter()
+                .flatten()
+            {
+                let pos = self.zentrum(rect, taste);
+                self.druck_schritt(taste, pos, pattern);
             }
         }
 
-        // Schrittweiten-Leiste: die Wisch-Noten auf den 16 Schritten, mit den
-        // Abständen dazwischen (Werte über den Punkten, +Schritte darunter).
-        if !self.wisch_noten.is_empty() {
+        // Schrittanzeige: die gesetzten Schritte mit ihrem Wert.
+        let schritte = pattern.steps_per_cycle().max(2);
+        if !pattern.is_empty() {
             let (leiste, painter) =
-                ui.allocate_painter(egui::vec2(breite, 52.0), egui::Sense::hover());
+                ui.allocate_painter(egui::vec2(breite, 44.0), egui::Sense::hover());
             let rect = leiste.rect;
-            let mitte = rect.center().y;
+            let mitte = rect.center().y + 6.0;
             painter.line_segment(
                 [
                     egui::pos2(rect.left(), mitte),
@@ -387,58 +328,36 @@ impl MaskePanel {
                 ],
                 egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
             );
-            for s in 0..STEP_COUNT {
-                let x = rect.left() + rect.width() * s as f32 / (STEP_COUNT - 1) as f32;
+            for s in 0..schritte {
+                let x = rect.left() + rect.width() * s as f32 / (schritte - 1) as f32;
                 painter.line_segment(
                     [egui::pos2(x, mitte - 3.0), egui::pos2(x, mitte + 3.0)],
                     egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
                 );
             }
-            let n = self.wisch_noten.len();
-            for (k, (step, wert)) in self.wisch_noten.iter().enumerate() {
-                let x = rect.left() + rect.width() * *step as f32 / (STEP_COUNT - 1) as f32;
-                let anteil = if n <= 1 {
-                    0.0
-                } else {
-                    k as f32 / (n - 1) as f32
-                };
-                let farbe = regenbogen(anteil);
-                painter.circle_filled(egui::pos2(x, mitte), 6.0, farbe);
+            for note in pattern.notes() {
+                let x = rect.left() + rect.width() * note.step as f32 / (schritte - 1) as f32;
+                painter.circle_filled(egui::pos2(x, mitte), 6.0, Color32::from_rgb(90, 200, 255));
                 painter.text(
-                    egui::pos2(x, mitte - 18.0),
+                    egui::pos2(x, mitte - 16.0),
                     egui::Align2::CENTER_CENTER,
-                    format!("{wert}"),
+                    format!("{}", note.pitch),
                     egui::FontId::proportional(10.0),
                     Color32::from_rgb(225, 225, 230),
                 );
-                if k > 0 {
-                    let vor = self.wisch_noten[k - 1].0;
-                    let x_vor = rect.left() + rect.width() * vor as f32 / (STEP_COUNT - 1) as f32;
-                    let diff = *step as i32 - vor as i32;
-                    painter.text(
-                        egui::pos2((x + x_vor) / 2.0, mitte + 18.0),
-                        egui::Align2::CENTER_CENTER,
-                        format!("+{diff}"),
-                        egui::FontId::proportional(10.0),
-                        Color32::from_rgb(150, 150, 158),
-                    );
-                }
             }
         }
 
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
-        if let Some((anzahl, profil)) = self.letzter_wisch {
-            let name = match profil {
-                Verteilung::Linear => "linear",
-                Verteilung::Beschleunigend => "beschleunigend",
-                Verteilung::Bremsend => "bremsend",
-            };
-            ui.label(format!("Letzter Wisch: {anzahl} Tasten, {name}"));
-        }
+        ui.label(format!(
+            "Nächster Schritt: {}",
+            self.naechster_schritt.wrapping_add(1)
+        ));
         ui.label(
             RichText::new(
-                "Tippen auf eine Taste schreibt ihren Wert; Wischen über mehrere Tasten \
-                 legt sie mit den Schrittabständen des Wischprofils ins Raster.",
+                "Jede Taste belegt den nächsten Schritt. Ein Wisch zählt nur die Taste, \
+                 bei der er anfängt, und die, bei der er aufhört; eine gehaltene Taste \
+                 plus eine zweite ergibt zwei Schritte hintereinander.",
             )
             .small()
             .color(Color32::DARK_GRAY),

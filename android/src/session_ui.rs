@@ -78,7 +78,7 @@ impl SessionPanel {
         let beat_raster = naechster_beat(z.beat, self.quantum);
         let warten = wartezeit_bis_beat(z.beat, self.quantum, z.bpm);
         ui.label(format!(
-            "Beat {:.3} → nächster Rasterpunkt {:.0} (in {:.2} s) · Peers: {} · Transport: {}",
+            "Beat {:.3} -> nächster Rasterpunkt {:.0} (in {:.2} s) · Peers: {} · Transport: {}",
             z.beat,
             beat_raster,
             warten,

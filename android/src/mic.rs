@@ -438,8 +438,11 @@ pub struct MicPanel {
     taps: Vec<Instant>,
     gemessen: Option<f32>,
     status: String,
+    /// Ziel von aussen gesetzt (eine Eingabe fuer OSC und Tempo).
     host: String,
     port: String,
+    /// Beim „Übernehmen" gemeldet, damit JamApp es einmal uebernimmt.
+    uebernommen: Option<f32>,
 }
 
 impl Default for MicPanel {
@@ -459,7 +462,14 @@ impl MicPanel {
             status: "Bereit. Mikrofon an, dann klatschen oder Musik spielen.".to_string(),
             host: jamcore::osc::DEFAULT_HOST.to_string(),
             port: jamcore::osc::DEFAULT_BASE_PORT.to_string(),
+            uebernommen: None,
         }
+    }
+
+    /// Ziel von aussen setzen — eine Eingabe für OSC und Tempo.
+    pub fn set_target(&mut self, host: &str, port: &str) {
+        self.host = host.trim().to_string();
+        self.port = port.trim().to_string();
     }
 
     fn target(&self) -> (String, u16) {
@@ -555,7 +565,8 @@ impl MicPanel {
         }
     }
 
-    fn uebernehmen(&mut self) {
+    /// Das gemessene Tempo uebernehmen (an Renoise schicken und merken).
+    pub fn uebernehmen(&mut self) {
         let Some(bpm) = self.bpm() else {
             self.status = "Kein Tempo erkannt.".to_string();
             return;
@@ -565,11 +576,18 @@ impl MicPanel {
         match result {
             Ok(used) => {
                 self.gemessen = Some(bpm);
+                self.uebernommen = Some(bpm);
                 self.status = format!("{bpm:.1} BPM -> {host}:{used}");
                 info!("jamandroid::mic: BPM {bpm:.1} -> Port {used}");
             }
             Err(e) => self.status = format!("OSC-Fehler: {e}"),
         }
+    }
+
+    /// Das zuletzt uebernommene Tempo; wird nach dem Lesen verworfen, damit
+    /// `JamApp` es genau einmal uebernimmt.
+    pub fn uebernommenes_tempo(&mut self) -> Option<f32> {
+        self.uebernommen.take()
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -672,11 +690,13 @@ impl MicPanel {
             }
         }
 
-        ui.horizontal(|ui| {
-            ui.label("Ziel für Übernehmen:");
-            ui.text_edit_singleline(&mut self.host);
-            ui.text_edit_singleline(&mut self.port);
-        });
+        // Das Ziel steht einmal im OSC-Tab (eine IP-Eingabe für OSC und Tempo),
+        // hier nur als Text — sonst müsste man es zweimal eintippen.
+        ui.label(
+            RichText::new(format!("Ziel: {}:{}", self.host, self.port))
+                .small()
+                .color(Color32::GRAY),
+        );
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
         ui.label(
             RichText::new(

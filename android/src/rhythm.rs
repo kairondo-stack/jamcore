@@ -96,6 +96,11 @@ impl RhythmPanel {
         );
     }
 
+    /// Das eine Tempo der App (Follow gewinnt) fuer das Rendern setzen.
+    pub fn set_tempo(&mut self, bpm: f32) {
+        self.render_bpm = bpm.clamp(20.0, 300.0);
+    }
+
     pub fn follow(&self) -> bool {
         self.follow
     }
@@ -460,6 +465,29 @@ impl RhythmPanel {
         }
     }
 
+    fn load_xml(&mut self) {
+        let Some(dir) = self.pattern_dir() else {
+            self.status = "Kein App-Verzeichnis fuer Patterns.".to_string();
+            return;
+        };
+        let path = std::path::Path::new(&dir).join(format!("pattern {}.xml", self.slot));
+        match std::fs::read_to_string(&path) {
+            Ok(content) => match Pattern::from_renoise_xml(&content, STEP_COUNT) {
+                Ok(loaded) => {
+                    *self.pattern_mut() = loaded;
+                    self.status = format!(
+                        "{} Noten aus {}",
+                        self.pattern().notes().len(),
+                        path.display()
+                    );
+                    info!("XML geladen: {}", path.display());
+                }
+                Err(e) => self.status = format!("XML kaputt: {e}"),
+            },
+            Err(e) => self.status = format!("XML fehlt: {e}"),
+        }
+    }
+
     fn load_csv(&mut self) {
         let Some(dir) = self.pattern_dir() else {
             self.status = "Kein App-Verzeichnis fuer Patterns.".to_string();
@@ -501,6 +529,31 @@ impl RhythmPanel {
                         self.pattern().notes().len()
                     );
                 }
+            }
+        });
+        // Austausch/Export gleich oben: im Querformat ist unten kein Platz,
+        // ein Scrollen waere auf dem Touchscreen unzuverlaessig.
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("CSV sichern").clicked() {
+                self.save_csv();
+            }
+            if ui.button("CSV laden").clicked() {
+                self.load_csv();
+            }
+            if ui.button("XML schreiben").clicked() {
+                self.save_xml();
+            }
+            if ui.button("XML laden").clicked() {
+                self.load_xml();
+            }
+            if ui.button("Schism kopieren").clicked() {
+                let schism = self.pattern().to_schism();
+                ui.ctx().copy_text(schism.clone());
+                self.status = format!(
+                    "Schism-Pattern ({} Zeilen) in der Zwischenablage",
+                    self.pattern().steps_per_cycle()
+                );
+                info!("Schism-Pattern kopiert");
             }
         });
         ui.horizontal(|ui| {
@@ -685,17 +738,6 @@ impl RhythmPanel {
             ui.add_space(4.0);
         }
 
-        ui.horizontal(|ui| {
-            if ui.button("CSV sichern").clicked() {
-                self.save_csv();
-            }
-            if ui.button("CSV laden").clicked() {
-                self.load_csv();
-            }
-            if ui.button("XML schreiben").clicked() {
-                self.save_xml();
-            }
-        });
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
         ui.label(
             RichText::new("CSV (Desktop-Format) und Clipboard-XML liegen im App-Ordner patterns/.")

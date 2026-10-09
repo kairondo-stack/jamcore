@@ -17,6 +17,7 @@ mod player;
 mod quint;
 mod rhythm;
 mod session_ui;
+mod touch;
 mod video;
 
 use std::path::PathBuf;
@@ -78,6 +79,11 @@ struct JamApp {
     kombi_unten: KombiTeil,
     diary: diary::DiaryPanel,
     maske: maske::MaskePanel,
+    /// **Ein** BPM für Tempo-Tab, Takt-Scan, Rendern und Tagebuch. Mit aktivem
+    /// Link-Follow gewinnt das Session-Tempo (siehe `tempo_aktuell`).
+    tempo_bpm: f32,
+    /// Tempo-Teiler fuer Renoise-Port 7001 (wie rrn5 send_bpm; 1.0 = aus).
+    tempo_teiler: f32,
     last_peak: f32,
     last_report: Instant,
     /// S2b-Spike: Link-Session halten und regelmaessig ihren Zustand loggen.
@@ -112,6 +118,8 @@ impl Default for JamApp {
             kombi_unten: KombiTeil::Rhythmus,
             diary: diary::DiaryPanel::default(),
             maske: maske::MaskePanel::default(),
+            tempo_bpm: 128.0,
+            tempo_teiler: 1.0,
             last_peak: 0.0,
             last_report: Instant::now(),
             link: {
@@ -147,7 +155,7 @@ impl JamApp {
                 }
             });
             if let Some(px) = found {
-                log::info!("jamandroid: systemleisten {px:?}px");
+                log::info!("systemleisten {px:?}px");
                 self.insets_px = Some(px);
             }
             self.insets_px
@@ -178,7 +186,7 @@ impl JamApp {
             self.selected = None;
         }
         log::info!(
-            "jamandroid: {} Modul(e) in {} Verzeichnis(s)",
+            "{} Modul(e) in {} Verzeichnis(s)",
             self.modules.len(),
             dirs.len()
         );
@@ -310,6 +318,11 @@ impl eframe::App for JamApp {
             ui.add_space(4.0);
         });
 
+        if let Some(bpm) = self.mic.uebernommenes_tempo() {
+            self.tempo_bpm = bpm;
+            self.status = format!("Tempo übernommen: {bpm:.1} BPM");
+            log::info!("Tempo uebernommen: {bpm:.1} BPM");
+        }
         match self.tab {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),
@@ -327,6 +340,13 @@ impl eframe::App for JamApp {
 }
 
 impl JamApp {
+    /// Das **eine** Tempo der App: mit aktivem Link-Follow das Session-Tempo,
+    /// sonst der im OSC-Tab eingestellte Wert. Bild-Scan, Rendern und Tagebuch
+    /// benutzen alle diese Zahl.
+    fn tempo_aktuell(&self) -> f32 {
+        jamcore::session::tempo_gesamt(self.session.folgen(), self.session.tempo(), self.tempo_bpm)
+    }
+
     fn view_ueberblick(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.label(
@@ -376,7 +396,12 @@ impl JamApp {
     }
 
     fn view_maske(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| self.maske.ui(ui, self.rhythm.pattern_mut()));
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                .id_salt("maske_inhalt")
+                .show(ui, |ui| self.maske.ui(ui, self.rhythm.pattern_mut()));
+        });
     }
 
     /// Kombi-Ansicht: zwei Module gleichzeitig (im Hochformat untereinander,
@@ -400,17 +425,24 @@ impl JamApp {
             KombiTeil::Bild => {
                 let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
                 self.bild.set_target(&host, &port);
-                if self.session.folgen() {
-                    self.bild.set_bpm(self.session.tempo() as f32);
-                }
+                let tempo = self.tempo_aktuell();
+                self.bild.set_bpm(tempo);
                 self.bild.ui(ui);
             }
-            KombiTeil::Rhythmus => self.rhythm.ui(ui),
+            KombiTeil::Rhythmus => {
+                let tempo = self.tempo_aktuell();
+                self.rhythm.set_tempo(tempo);
+                self.rhythm.ui(ui);
+            }
             KombiTeil::Maske => self.maske.ui(ui, self.rhythm.pattern_mut()),
-            KombiTeil::Tempo => self.mic.ui(ui),
+            KombiTeil::Tempo => {
+                let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+                self.mic.set_target(&host, &port);
+                self.mic.ui(ui);
+            }
             KombiTeil::Session => self.session_block(ui),
             KombiTeil::Tagebuch => {
-                let bpm = self.mic.bpm();
+                let bpm = Some(self.tempo_aktuell());
                 let noten = self.rhythm.pattern().clone();
                 self.diary.ui(ui, bpm, &noten);
             }
@@ -423,9 +455,39 @@ impl JamApp {
     }
 
     fn view_tagebuch(&mut self, ui: &mut egui::Ui) {
-        let bpm = self.mic.bpm();
+        // Das eine Tempo (Follow gewinnt) statt der letzten Mikrofonmessung.
+        let bpm = Some(self.tempo_aktuell());
         let noten = self.rhythm.pattern().clone();
-        egui::CentralPanel::default().show(ui, |ui| self.diary.ui(ui, bpm, &noten));
+        // Der Bild-Export liegt zuklappbar **über** dem Tagebuch: darunter füllt
+        // die Einträge-Liste die ganze Fläche, sonst wäre er unsichtbar.
+        let abschnitt = self.bild.abschnitt_pattern();
+        let abschnitt_schritte = self.bild.schritte();
+        egui::Panel::top("tagebuch_bild_pattern").show(ui, |ui| {
+            egui::CollapsingHeader::new("Bild-Pattern (Start/Ende aus dem Bild-Tab)")
+                .id_salt("bild_pattern_kopf")
+                .show(ui, |ui| {
+                    ui.label(format!(
+                        "X-Auflösung {} Schritte, Ausschnitt ergibt {} Schritte",
+                        abschnitt_schritte,
+                        abschnitt.steps_per_cycle()
+                    ));
+                    let xml = abschnitt.to_renoise_xml();
+                    let mut xml_text = xml.clone();
+                    ui.add(
+                        egui::TextEdit::multiline(&mut xml_text)
+                            .desired_rows(8)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if ui.button("Renoise-XML kopieren").clicked() {
+                        ui.ctx().copy_text(xml.clone());
+                        self.status = "Renoise-XML in die Zwischenablage.".to_string();
+                    }
+                    ui.label(format!("CSV (normiert 0..1):\n{}", abschnitt.to_csv()));
+                });
+        });
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.diary.ui(ui, bpm, &noten);
+        });
     }
 
     fn view_session(&mut self, ui: &mut egui::Ui) {
@@ -479,38 +541,99 @@ impl JamApp {
     fn view_bild(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.bild.set_target(&host, &port);
-        if self.session.folgen() {
-            self.bild.set_bpm(self.session.tempo() as f32);
-        }
+        // Das eine Tempo (Follow gewinnt) — der Takt-Scan rechnet daraus die
+        // Sweep-Dauer.
+        let tempo = self.tempo_aktuell();
+        self.bild.set_bpm(tempo);
         egui::CentralPanel::default().show(ui, |ui| self.bild.ui(ui));
     }
 
     fn view_mic(&mut self, ui: &mut egui::Ui) {
-        // Das Ziel stellt der Tempo-Tab selbst ein; ein Ueberschreiben aus dem
-        // OSC-Tab heraus wuerde Eingaben bei jedem Frame unmoeglich machen.
+        // Das Ziel steht einmal im OSC-Tab; der Tempo-Tab bekommt es hier
+        // durchgereicht (sonst müsste die IP zweimal eingetippt werden).
+        let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+        self.mic.set_target(&host, &port);
         egui::CentralPanel::default().show(ui, |ui| self.mic.ui(ui));
     }
 
     fn view_rhythm(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.rhythm.set_target(&host, &port);
+        // Rendern benutzt dasselbe Tempo wie der Takt-Scan.
+        let tempo = self.tempo_aktuell();
+        self.rhythm.set_tempo(tempo);
         if self.rhythm.follow() {
             if let Some(player) = self.player.as_ref() {
                 self.rhythm.set_follow_step(player.grid_step(4));
             }
         }
-        egui::CentralPanel::default().show(ui, |ui| self.rhythm.ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                .id_salt("rhythmus_inhalt")
+                .show(ui, |ui| self.rhythm.ui(ui));
+        });
+    }
+
+    /// Das eine Tempo an Renoise schicken (`/renoise/song/bpm`).
+    fn tempo_senden(&mut self) {
+        let bpm = self.tempo_aktuell();
+        let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+        let port = port.parse().unwrap_or(jamcore::osc::DEFAULT_BASE_PORT);
+        // Wie im Desktop-rrn5: 7000 bekommt das Tempo, 7001 das gefaltete
+        // (nur wenn der Teiler etwas aendert).
+        let (basis, gefaltet) = jamcore::osc::bpm_und_teiler(bpm, self.tempo_teiler);
+        let ergebnis = jamcore::osc::OscOut::new(&host, port).and_then(|out| {
+            let renoise = jamcore::osc::Renoise::new(&out);
+            let verwendet = renoise.bpm(7000, basis)?;
+            if let Some(gefaltet) = gefaltet {
+                if let Err(e) = renoise.bpm(7001, gefaltet) {
+                    log::warn!("Tempo-Teiler: {e}");
+                }
+            }
+            Ok(verwendet)
+        });
+        match ergebnis {
+            Ok(used) => {
+                self.status = match gefaltet {
+                    Some(gefaltet) => {
+                        format!(
+                            "Tempo {basis:.1} BPM -> {host}:{used}, {gefaltet:.1} BPM -> Port+1"
+                        )
+                    }
+                    None => format!("Tempo {basis:.1} BPM -> {host}:{used}"),
+                };
+                log::info!("Tempo {basis:.1} BPM -> {host}:{used}");
+            }
+            Err(e) => self.status = format!("OSC-Fehler: {e}"),
+        }
     }
 
     fn view_osc(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.label("Ziel (Renoise oder bundle_udp auf dem Laptop):");
+            ui.label("Ziel (Renoise oder bundle_udp auf dem Laptop) — einmal für OSC und Tempo:");
             ui.horizontal(|ui| {
-                ui.label("Host");
+                ui.label("IP");
                 ui.text_edit_singleline(&mut self.osc.host);
                 ui.label("Port");
                 ui.text_edit_singleline(&mut self.osc.port);
             });
+            ui.separator();
+            ui.label("Tempo (gilt für Tempo-Tab, Takt-Scan, Rendern und Tagebuch):");
+            let mut bpm = self.tempo_bpm;
+            if ui.add(egui::Slider::new(&mut bpm, 30.0..=300.0)).changed() {
+                self.tempo_bpm = bpm;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Teiler (Port 7001)");
+                ui.add(egui::Slider::new(&mut self.tempo_teiler, 0.25..=4.0).logarithmic(true));
+                if ui.button("1:1").clicked() {
+                    self.tempo_teiler = 1.0;
+                }
+            });
+            if ui.button("Tempo senden").clicked() {
+                self.tempo_senden();
+            }
             ui.horizontal(|ui| {
                 if ui.button("Verbinden").clicked() {
                     self.osc.connect();
@@ -581,16 +704,18 @@ impl JamApp {
             });
             ui.separator();
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                let modules = self.modules.clone();
-                for (index, path) in modules.iter().enumerate() {
-                    let selected = self.selected == Some(index);
-                    if ui.selectable_label(selected, file_name(path)).clicked() {
-                        self.selected = Some(index);
-                        self.play_selected();
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                .show(ui, |ui| {
+                    let modules = self.modules.clone();
+                    for (index, path) in modules.iter().enumerate() {
+                        let selected = self.selected == Some(index);
+                        if ui.selectable_label(selected, file_name(path)).clicked() {
+                            self.selected = Some(index);
+                            self.play_selected();
+                        }
                     }
-                }
-            });
+                });
 
             if self.modules.is_empty() {
                 ui.separator();
@@ -616,7 +741,7 @@ impl JamApp {
                 if self.last_report.elapsed().as_secs_f32() > 2.0 {
                     self.last_report = Instant::now();
                     log::info!(
-                        "jamandroid: rms peak={:.4} pos={:.1}s order={} row={} frames={}",
+                        "rms peak={:.4} pos={:.1}s order={} row={} frames={}",
                         self.last_peak,
                         pos,
                         order,
@@ -627,6 +752,16 @@ impl JamApp {
                 }
                 if player.finished() {
                     ui.colored_label(egui::Color32::YELLOW, "Modul am Ende");
+                }
+                // Modul-Info und Samples wie im Desktop-it_live.
+                for (name, wert) in player.info_paare() {
+                    ui.label(format!("{name}: {wert}"));
+                }
+                let samples = player.sample_namen(64);
+                if !samples.is_empty() {
+                    ui.collapsing(format!("Samples ({})", samples.len()), |ui| {
+                        ui.label(samples.join(", "));
+                    });
                 }
             } else {
                 ui.label("Nichts abgespielt.");
@@ -641,7 +776,7 @@ fn android_main(app: android_activity::AndroidApp) {
     android_logger::init_once(
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
-    log::info!("jamandroid: android_main gestartet");
+    log::info!("android_main gestartet");
     let options = eframe::NativeOptions {
         android_app: Some(app.clone()),
         ..Default::default()
@@ -651,5 +786,5 @@ fn android_main(app: android_activity::AndroidApp) {
     let _ = APP.set(Mutex::new(Some(app)));
     jam_app.scan_modules();
     let _ = eframe::run_native("JamCore", options, Box::new(|_cc| Ok(Box::new(jam_app))));
-    log::info!("jamandroid: beendet");
+    log::info!("beendet");
 }

@@ -103,6 +103,55 @@ impl Player {
         })
     }
 
+    /// Titel, Künstler, Typ und Länge (nicht leere Werte), wie sie libopenmpt
+    /// meldet. Rein lesend über den Modul-Mutex.
+    pub fn info_paare(&self) -> Vec<(String, String)> {
+        let Ok(module) = self.shared.module.lock() else {
+            return Vec::new();
+        };
+        let mut paare = Vec::new();
+        for (schluessel, name) in [
+            ("title", "Titel"),
+            ("artist", "Künstler"),
+            ("type_long", "Format"),
+        ] {
+            let wert = module.metadata(schluessel);
+            if !wert.trim().is_empty() {
+                paare.push((name.to_string(), wert));
+            }
+        }
+        paare.push((
+            "Länge".to_string(),
+            format!("{:.1} s", module.duration_seconds()),
+        ));
+        paare.push((
+            "Aufbau".to_string(),
+            format!(
+                "{} Orders, {} Patterns, {} Kanäle, {} Samples",
+                module.num_orders(),
+                module.num_patterns(),
+                module.num_channels(),
+                module.num_samples()
+            ),
+        ));
+        paare
+    }
+
+    /// Namen der Samples (leere übersprungen), höchstens `max`.
+    pub fn sample_namen(&self, max: usize) -> Vec<String> {
+        let Ok(module) = self.shared.module.lock() else {
+            return Vec::new();
+        };
+        let mut namen = Vec::new();
+        for index in 0..module.num_samples().min(max as i32) {
+            let name = module.sample_name(index);
+            if !name.trim().is_empty() {
+                namen.push(name);
+            }
+        }
+        namen
+    }
+
     pub fn frames(&self) -> u64 {
         self.shared.frames.load(Ordering::Relaxed)
     }
