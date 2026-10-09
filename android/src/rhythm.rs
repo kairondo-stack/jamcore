@@ -315,6 +315,7 @@ impl RhythmPanel {
                     }
                 }
                 let mut i: u16 = 0;
+                let mut klang_gemeldet = false;
                 while !stopp_c.load(Ordering::Relaxed) {
                     let start = Instant::now();
                     for (s, pitch) in &noten {
@@ -325,7 +326,14 @@ impl RhythmPanel {
                                     .and_then(|q| q.note_spielen(30, *pitch, 0.8))
                                     .is_some();
                             if !gespielt {
+                                if !klang_gemeldet {
+                                    info!("Klang: Tongenerator ({})", welle.name());
+                                    klang_gemeldet = true;
+                                }
                                 crate::klang::spielen_welle(*pitch, welle);
+                            } else if !klang_gemeldet {
+                                info!("Klang: Modul-Samples");
+                                klang_gemeldet = true;
                             }
                             if let Some(o) = out.as_ref() {
                                 let _ = Renoise::new(o).note_on(7000, *pitch, 100);
