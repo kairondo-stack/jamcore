@@ -41,11 +41,17 @@ pub fn wav_stereo(links: &[f32], rechts: &[f32], rate: u32) -> Vec<u8> {
 /// Meldet den Beginn jeder vierten Beat-Phrase (`Some(creative)`), sonst
 /// `None` — Portierung von `BeatTracker::observe` aus dem Desktop-it_live.
 /// `rpb` sind die Rows je Beat des laufenden Patterns.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct BeatTracker {
     prev_row: i32,
     beat_count: u32,
     creative: u8,
+}
+
+impl Default for BeatTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BeatTracker {
@@ -89,19 +95,16 @@ pub fn order_mit_pattern(order_patterns: &[i32], ziel: i32, nach: i32) -> Option
 
 /// Rendert eine taktkompatible Variation als WAV (Portierung von
 /// `render_variation`): alle vier Beats wird die Order auf das Pattern
-/// `(creative - 1) % 8` umgeschaltet, sofern es später noch vorkommt; die
+/// `creative % 8` umgeschaltet, sofern es später noch vorkommt; die
 /// Zeile bleibt erhalten.
 pub fn wav_variation(modul: &Mod, sekunden: f64, rate: u32) -> Vec<u8> {
     let rate = if rate == 0 { 44100 } else { rate };
     let chunk = 512usize;
     let gesamt = ((sekunden.max(0.1) * rate as f64) as usize).max(chunk);
-    let rpb = {
-        let wert = modul.rows_per_beat(modul.current_pattern());
-        if wert <= 0 {
-            32
-        } else {
-            wert
-        }
+    // Desktop-Vorgabe: 32, wenn libopenmpt keine Angabe macht.
+    let rpb = match modul.rows_per_beat(modul.current_pattern()) {
+        wert if wert > 0 => wert,
+        _ => 32,
     };
     let order_patterns: Vec<i32> = (0..modul.num_orders())
         .map(|o| modul.order_pattern(o))
@@ -124,7 +127,9 @@ pub fn wav_variation(modul: &Mod, sekunden: f64, rate: u32) -> Vec<u8> {
         let cur_row = modul.current_row();
         let cur_order = modul.current_order();
         if let Some(creative) = tracker.observe(cur_row, rpb) {
-            let ziel = ((creative as i32 - 1).rem_euclid(8)) as i32;
+            // Wie im Desktop: `order_patterns[(creative) % 8]`, und dort ist
+            // `order_patterns` die Liste 0..8 — also `creative % 8`.
+            let ziel = (creative % 8) as i32;
             if let Some(o) = order_mit_pattern(&order_patterns, ziel, cur_order) {
                 modul.set_order(o, cur_row);
             }

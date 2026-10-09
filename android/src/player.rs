@@ -225,9 +225,17 @@ impl Player {
             .module
             .lock()
             .map_err(|_| "Modul gesperrt".to_string())?;
+        // Wie ein frisch geladenes Modul im Desktop-it_live: von vorn und ohne
+        // Wiederholung rendern — sonst haengt das Ergebnis an der Abspiel-
+        // position und ein zweiter Klick ueberschreibt die Datei mit nichts.
+        modul.set_order(0, 0);
+        modul.set_repeat_count(0);
         let rate = self.shared.sample_rate.max(8000) as u32;
         let bytes = jamcore::wav::wav_variation(&modul, sekunden, rate);
         let frames = bytes.len().saturating_sub(44) / 4;
+        if frames == 0 {
+            return Err("Modul lieferte keine Audiodaten".to_string());
+        }
         std::fs::write(pfad, &bytes).map_err(|e| e.to_string())?;
         info!("WAV geschrieben: {pfad} ({frames} Frames, {sekunden:.0} s)");
         Ok(frames)

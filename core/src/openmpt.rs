@@ -127,6 +127,11 @@ impl Mod {
         read.min(count)
     }
 
+    /// Wiederholungszahl setzen (0 = einmal, -1 = endlos).
+    pub fn set_repeat_count(&self, count: i32) -> bool {
+        (unsafe { openmpt_module_set_repeat_count(self.ptr, count) }) != 0
+    }
+
     pub fn set_repeat_forever(&self) {
         unsafe {
             openmpt_module_set_repeat_count(self.ptr, -1);
@@ -171,8 +176,10 @@ impl Mod {
         unsafe { openmpt_module_get_current_pattern(self.ptr) }
     }
 
+    /// Rows je Beat eines Patterns; 0 heißt „unbekannt“ (der Aufrufer
+    /// entscheidet ueber eine Vorgabe, wie im Desktop-it_live: 32).
     pub fn rows_per_beat(&self, pattern: i32) -> i32 {
-        unsafe { openmpt_module_get_pattern_rows_per_beat(self.ptr, pattern) }.max(1)
+        unsafe { openmpt_module_get_pattern_rows_per_beat(self.ptr, pattern) }
     }
 
     /// Anzahl der Zeilen eines Patterns (für den Struktur-Dump).
