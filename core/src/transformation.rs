@@ -430,3 +430,54 @@ mod tests_interpolation {
         assert_eq!(notenrampe(-3), vec![(0.0, 59)]);
     }
 }
+
+/// Skaliert Noten linear auf ein Zeitfenster: die erste Note landet auf
+/// `von`, die letzte auf `bis` (Portierung der Kernschleife von
+/// `scale_to_range` aus dem Desktop-Recorder). Eine einzelne Note bleibt auf
+/// dem Startpunkt.
+pub fn skalieren_auf_bereich(noten: &[Klangpunkt], von: f32, bis: f32) -> Vec<Klangpunkt> {
+    let Some(erste) = noten.first().copied() else {
+        return Vec::new();
+    };
+    let letzte = noten.last().copied().unwrap_or(erste);
+    let alte_spanne = letzte.0 - erste.0;
+    let faktor = if alte_spanne != 0.0 {
+        (bis - von) / alte_spanne
+    } else {
+        0.0
+    };
+    noten
+        .iter()
+        .map(|(t, pitch)| (von + (t - erste.0) * faktor, *pitch))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests_bereich {
+    use super::*;
+
+    #[test]
+    fn skalieren_streckt_auf_das_fenster() {
+        let noten = vec![(0.25, 60), (0.5, 62), (0.75, 64)];
+        let out = skalieren_auf_bereich(&noten, 0.1, 0.9);
+        assert!((out[0].0 - 0.1).abs() < 1e-6, "erste auf von");
+        assert!((out[2].0 - 0.9).abs() < 1e-6, "letzte auf bis");
+        assert!((out[1].0 - 0.5).abs() < 1e-6, "Mitte bleibt Mitte");
+        assert_eq!(out[1].1, 62, "Toene bleiben");
+    }
+
+    #[test]
+    fn skalieren_mit_gleichem_fenster_aendert_nichts() {
+        let noten = vec![(0.0, 60), (1.0, 72)];
+        let out = skalieren_auf_bereich(&noten, 0.0, 1.0);
+        assert_eq!(out, noten);
+    }
+
+    #[test]
+    fn skalieren_randfaelle() {
+        assert!(skalieren_auf_bereich(&[], 0.0, 1.0).is_empty());
+        // Einzelne Note: keine Spanne -> sie bleibt auf dem Startpunkt.
+        let out = skalieren_auf_bereich(&[(0.5, 60)], 0.0, 1.0);
+        assert_eq!(out, vec![(0.0, 60)]);
+    }
+}

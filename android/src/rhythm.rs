@@ -58,6 +58,9 @@ pub struct RhythmPanel {
     interp_amplitude: f32,
     interp_faktor: f32,
     interp_kurve: i32,
+    /// Schrittbereich zum Loeschen (wie „E"/remove im Recorder).
+    bereich_von: u16,
+    bereich_bis: u16,
 }
 
 impl Default for RhythmPanel {
@@ -95,6 +98,8 @@ impl RhythmPanel {
             interp_amplitude: 12.0,
             interp_faktor: 1.0,
             interp_kurve: 3,
+            bereich_von: 0,
+            bereich_bis: STEP_COUNT - 1,
         }
     }
 
@@ -138,6 +143,48 @@ impl RhythmPanel {
 
     /// Sinus-Interpolation wie `D`+`3` im Desktop-Recorder: zwischen den
     /// bestehenden Noten schwingende Zwischentöne einfügen.
+    /// Alle Noten im Schrittbereich löschen (Desktop: `E`/remove-Teil).
+    fn bereich_loeschen_anwenden(&mut self) {
+        let (von, bis) = (self.bereich_von, self.bereich_bis);
+        let geloescht = self.pattern_mut().bereich_loeschen(von, bis);
+        self.status = format!(
+            "{geloescht} Noten gelöscht (Schritte {}–{})",
+            von + 1,
+            bis + 1
+        );
+    }
+
+    /// Noten auf den ganzen Zyklus strecken (Desktop: `scale_to_range`).
+    fn skalieren(&mut self) {
+        let steps = self.pattern().steps_per_cycle().max(1);
+        let noten: Vec<transformation::Klangpunkt> = self
+            .pattern()
+            .notes()
+            .iter()
+            .map(|n| (n.step as f32 / steps as f32, n.pitch))
+            .collect();
+        if noten.len() < 2 {
+            self.status = "Skalieren braucht mindestens zwei Noten.".to_string();
+            return;
+        }
+        let out = transformation::skalieren_auf_bereich(&noten, 0.0, 1.0);
+        let instrument = self.instrument;
+        self.pattern_mut().clear();
+        for (t, pitch) in out {
+            let step = ((t * steps as f32).round() as i64).rem_euclid(steps as i64) as u16;
+            self.pattern_mut().insert(Note {
+                step,
+                instrument,
+                pitch: pitch.clamp(0, 127),
+                glide: false,
+            });
+        }
+        self.status = format!(
+            "Auf den Zyklus gestreckt: {} Noten",
+            self.pattern().notes().len()
+        );
+    }
+
     fn interpolieren(&mut self) {
         let steps = self.pattern().steps_per_cycle().max(1);
         let noten: Vec<transformation::Klangpunkt> = self
@@ -655,6 +702,17 @@ impl RhythmPanel {
             }
             if ui.button("Interpolieren").clicked() {
                 self.interpolieren();
+            }
+            ui.separator();
+            ui.label("Bereich");
+            ui.add(egui::DragValue::new(&mut self.bereich_von).range(0..=STEP_COUNT - 1));
+            ui.add(egui::DragValue::new(&mut self.bereich_bis).range(0..=STEP_COUNT - 1));
+            if ui.button("löschen").clicked() {
+                self.bereich_loeschen_anwenden();
+            }
+            ui.separator();
+            if ui.button("Skalieren").clicked() {
+                self.skalieren();
             }
         });
         ui.horizontal(|ui| {

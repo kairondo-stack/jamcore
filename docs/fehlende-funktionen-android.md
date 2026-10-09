@@ -53,9 +53,9 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 |---|---|---|
 | 1 | ⚠️ | **Tastatur-Aufnahmemodell** — bewusst ersetzt durch das Tastenfeld der Maske (jeder Druck = Schritt); die Ziffern-/Faktor-/RStep-Varianten fehlen |
 | 2 | ✅ | **Notenrampe** — Knopf „Rampe“ mit Anzahl im Rhythmus-Tab; Kern `transformation::notenrampe` (Test). Gerätetest: 4 Noten (59 … 63) im Raster |
-| 3 | ❌ | **remove_and_record** (`E`) fehlt |
-| 4 | ❌ | **fdx (`V`), modul1 (`M`)** fehlen |
-| 5 | ❌ | **Graph-Editor** (`G`) fehlt |
+| 3 | ⚠️ | **remove_and_record** — der Lösch-Teil ist da (Knopf „Bereich [von] [bis] löschen", Kern `Pattern::bereich_loeschen` mit Test; Gerätetest: „3 Noten gelöscht"); der interaktive Re-Record-Teil bleibt aus |
+| 4 | ❌ | **fdx (`V`), modul1 (`M`)** fehlen (Legacy-Funktionen ohne Touch-Entsprechung) |
+| 5 | ❌ | **Graph-Editor** (`G`) — nicht portiert: im Desktop selbst unfertig, Zweck laut Nutzer unklar („damals zu kompliziert") |
 | 6 | ⚠️ | **Transformationsketten K/D/B** — vorhanden: Transponieren, Umkehren, Q2/Q4, Glide, Instrument, Skalenfilter; **neu: Sinus-Pitch-Interpolation (D+3)** (Kern `transformation::sinus_interpolieren` mit den Desktop-Tests, Knopf „Interpolieren“); offen: `scale_to_range_num`, `totalDi`, Indexverschiebung, Duplikate entfernen, Timestamp-Transformation, Notenlängen, `vmidi`, Mehrpattern-Interpolation |
 | 7 | ✅ | **Schism-Clipboard-Export** — `Pattern::to_schism()` mit der Desktop-Regression als Test (zeichengleich), Knopf „Schism kopieren“ im Rhythmus-Tab |
 | 8 | ✅ | **Renoise-XML einlesen** — Knopf „XML laden“ liest `patterns/pattern N.xml` (`Pattern::from_renoise_xml`) |

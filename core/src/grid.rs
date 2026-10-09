@@ -158,6 +158,16 @@ impl Pattern {
         self.notes.clear();
     }
 
+    /// Alle Noten im Schrittbereich `von..=bis` löschen (Portierung des
+    /// „remove“-Teils von `remove_and_record`; der Desktop fragt die Grenzen
+    /// interaktiv ab).
+    pub fn bereich_loeschen(&mut self, von: u16, bis: u16) -> usize {
+        let (von, bis) = (von.min(bis), von.max(bis));
+        let vorher = self.notes.len();
+        self.notes.retain(|n| n.step < von || n.step > bis);
+        vorher - self.notes.len()
+    }
+
     /// Zeit des Schritts in Zyklen (0.0 bis 1.0), Format des Desktop-CSV.
     pub fn timestamp(&self, step: u16) -> f32 {
         (step % self.steps_per_cycle) as f32 / self.steps_per_cycle as f32
@@ -555,6 +565,18 @@ mod tests {
         let xml = p.to_renoise_xml();
         assert!(xml.contains("index=\"0\""), "{xml}");
         assert!(xml.contains("index=\"16\""), "letzter Schritt: {xml}");
+    }
+
+    #[test]
+    fn bereich_loeschen_trifft_nur_den_bereich() {
+        let mut p = pattern_with(&[(0, 36), (3, 60), (4, 62), (8, 64), (15, 72)]);
+        let geloescht = p.bereich_loeschen(3, 8);
+        assert_eq!(geloescht, 3, "Schritte 3, 4 und 8");
+        let steps: Vec<u16> = p.notes().iter().map(|n| n.step).collect();
+        assert_eq!(steps, vec![0, 15]);
+        // Verdrehte Grenzen werden getauscht, leerer Bereich loescht nichts.
+        assert_eq!(p.bereich_loeschen(9, 2), 0);
+        assert_eq!(p.notes().len(), 2);
     }
 
     #[test]
