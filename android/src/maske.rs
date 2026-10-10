@@ -63,6 +63,13 @@ pub struct Aufzeichnung {
     pub tempo: Vec<f32>,
 }
 
+impl Aufzeichnung {
+    /// Als Kern-`Tipp` fuer [`jamcore::schrittweite::timestamps`].
+    pub fn als_tipp(&self) -> jamcore::schrittweite::Tipp {
+        jamcore::schrittweite::Tipp::new(self.zeit, self.indexnum)
+    }
+}
+
 pub struct MaskePanel {
     feldart: Feldart,
     spalten: usize,
@@ -75,8 +82,14 @@ pub struct MaskePanel {
     finger: Mehrfinger,
     /// Erst- und Endtaste je Finger (Fingernummer -> (Start, Ende)).
     wisch: std::collections::HashMap<u64, (Option<usize>, Option<usize>)>,
-    /// Aufgezeichnete Folge (Zeitabstaende) — das, was der Bild-Scan mapped.
+    /// Die aufgezeichnete Folge (Zeitabstaende) — das, was der Bild-Scan mapped.
     folge: Vec<Aufzeichnung>,
+    /// Die **aufgeklappte** Folge: die Handdruecke plus die Zwischenschritte
+    /// aus den Schrittweiten-Abschnitten. Das ist das, was der Desktop am Ende
+    /// als `notes4` hat — nicht nur die getippten Toene. Ohne sie zeigte die
+    /// Maske „Zeitpunkte: 0“, waehrend die Zwischenschritte nur beim Umrechnen
+    /// auf die Bildspalen kurz auftauchten und wieder verschwanden.
+    zwischenschritte: Vec<f32>,
     /// Nach „Ende" ist die Folge festgehalten: ein weiterer Felddruck darf sie
     /// nicht wegschmeissen. Erst „neu" (oder „leeren") nimmt wieder auf.
     fest: bool,
@@ -115,6 +128,7 @@ impl MaskePanel {
             finger: Mehrfinger::neu(),
             wisch: std::collections::HashMap::new(),
             folge: Vec::new(),
+            zwischenschritte: Vec::new(),
             fest: false,
             anker: None,
             wege: std::collections::HashMap::new(),
@@ -166,8 +180,26 @@ impl MaskePanel {
             indexnum,
             tempo,
         });
+        // Die Zwischenschritte sofort ausklappen und ablegen, wie der
+        // pattern_recorder es mit `notes4` tut (nicht erst beim Umrechnen auf
+        // die Bildspalten — sonst sind sie nach dem Bild-Tab weg).
+        self.zwischenschritte = jamcore::schrittweite::timestamps(
+            &self
+                .folge
+                .iter()
+                .map(Aufzeichnung::als_tipp)
+                .collect::<Vec<_>>(),
+        );
         let anzahl = self.folge.len();
-        self.status = format!("{anzahl} Zeitpunkte, {zeit:.1} s");
+        let gesamt = self.zwischenschritte.len();
+        self.status = format!("{anzahl} Toene, {gesamt} Zeitpunkte, {zeit:.1} s");
+        info!(
+            "aufgeklappt: {anzahl} Toene -> {gesamt} Zeitpunkte ({:?})",
+            self.zwischenschritte
+                .iter()
+                .map(|z| (z * 100.0).round() / 100.0)
+                .collect::<Vec<_>>()
+        );
     }
 
     fn tasten_anzahl(&self) -> usize {
@@ -260,6 +292,7 @@ impl MaskePanel {
             }
             if ui.button("leeren").clicked() {
                 self.folge.clear();
+                self.zwischenschritte.clear();
                 self.spur.clear();
                 self.fest = false;
                 self.anker = None;
@@ -435,6 +468,7 @@ impl MaskePanel {
             if neu {
                 self.anker = Some(std::time::Instant::now());
                 self.folge.clear();
+                self.zwischenschritte.clear();
                 self.spur.clear();
                 info!("Masken-Aufnahme durch ersten Tipp gestartet");
             }
@@ -505,11 +539,16 @@ impl MaskePanel {
                     egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
                 );
             }
-            let erste = self.folge[0].zeit.max(1e-4);
-            let spanne = (self.folge[self.folge.len() - 1].zeit - erste).max(1e-4);
+            let punkte = if self.zwischenschritte.is_empty() {
+                self.folge.iter().map(|a| a.zeit).collect::<Vec<f32>>()
+            } else {
+                self.zwischenschritte.clone()
+            };
+            let erste = punkte[0].max(1e-4);
+            let spanne = (punkte[punkte.len() - 1] - erste).max(1e-4);
             let mut vorher: Option<egui::Pos2> = None;
-            for a in &self.folge {
-                let anteil = ((a.zeit - erste) / spanne).clamp(0.0, 1.0);
+            for (i, &z) in punkte.iter().enumerate() {
+                let anteil = ((z - erste) / spanne).clamp(0.0, 1.0);
                 let x = rect.left() + rect.width() * anteil;
                 let p = egui::pos2(x, mitte);
                 if let Some(v) = vorher {
@@ -520,23 +559,36 @@ impl MaskePanel {
                         egui::Stroke::new(2.0, Color32::from_rgb(90, 200, 255)),
                     );
                 }
-                painter.circle_filled(p, 5.0, Color32::from_rgb(120, 230, 160));
-                // Feldwert ueber dem Punkt, Abstand zum vorherigen darunter.
-                painter.text(
-                    egui::pos2(x, mitte - 14.0),
-                    egui::Align2::CENTER_CENTER,
-                    format!("{}", a.indexnum as i32),
-                    egui::FontId::proportional(10.0),
-                    Color32::from_rgb(225, 225, 230),
+                // Handdruck = grosser Punkt mit Feldwert, Zwischenschritt =
+                // kleiner Punkt. So sieht man, was getippt wurde und was die
+                // Schrittweite dazwischen erzeugt hat.
+                let handdruck = self.folge.get(i).is_some_and(|a| a.zeit == z);
+                let radius = if handdruck { 5.0 } else { 2.5 };
+                painter.circle_filled(
+                    p,
+                    radius,
+                    if handdruck {
+                        Color32::from_rgb(120, 230, 160)
+                    } else {
+                        Color32::from_rgb(90, 200, 255)
+                    },
                 );
+                if handdruck {
+                    painter.text(
+                        egui::pos2(x, mitte - 14.0),
+                        egui::Align2::CENTER_CENTER,
+                        format!("{}", self.folge[i].indexnum as i32),
+                        egui::FontId::proportional(10.0),
+                        Color32::from_rgb(225, 225, 230),
+                    );
+                }
                 vorher = Some(p);
             }
-            // Die Abstaende als Text: bei gedrueckter Breite zaehlt die Zahl
-            // mehr als die Zeichnung.
-            let abstaende: Vec<String> = self
-                .folge
+            // Die Abstaende **aller** Zeitpunkte als Text: bei gedrueckter
+            // Breite zaehlt die Zahl mehr als die Zeichnung.
+            let abstaende: Vec<String> = punkte
                 .windows(2)
-                .map(|w| format!("{:.2}", w[1].zeit - w[0].zeit))
+                .map(|w| format!("{:.2}", w[1] - w[0]))
                 .collect();
             if !abstaende.is_empty() {
                 painter.text(
@@ -560,7 +612,11 @@ impl MaskePanel {
                 }
             }
         });
-        ui.label(format!("Zeitpunkte: {}", self.folge.len()));
+        ui.label(format!(
+            "Toene: {} — Zeitpunkte mit Zwischenschritten: {}",
+            self.folge.len(),
+            self.zwischenschritte.len()
+        ));
         ui.label(
             RichText::new(
                 "Der Feldwert ist das Indexnum (Unterteilungen je Schritt): die \
