@@ -22,6 +22,13 @@ use log::info;
 
 use crate::touch::Mehrfinger;
 
+/// Ab dieser Pause zwischen zwei Felddruecken beginnt die Aufnahme neu.
+/// Also: schneller als dieser Abstand gehoert die Folge zusammen, langsamer
+/// beginnt eine neue. Ohne diese Grenze lief die Aufnahme die ganze Sitzung
+/// durch — der erste Tipp kam dann bei den Sekunden seit dem App-Start an
+/// (gemessen 548 s) statt bei 0.
+pub const NEU_AFTER_SEKUNDEN: f32 = 8.0;
+
 /// Unter- und Obergrenze des Zoom vom Tastenfeld (Prozent, wie im Bild-Tab).
 pub const ZOOM_MIN: f32 = 0.2;
 /// Siehe [`ZOOM_MIN`].
@@ -412,9 +419,23 @@ impl MaskePanel {
             self.spurpunkt.insert(id, (pos, std::time::Instant::now()));
             // Der allererste Druckoeffnet die Aufnahme: der C++-Recorder
             // startet seinen Timer beim ersten Tastendruck.
-            if self.anker.is_none() {
+            //
+            // Wichtig: ein **frischer** Tipp beginnt auch mitten in der Folge
+            // neu. Sonst lief die Aufnahme die ganze Sitzung durch (der Anker
+            // war gesetzt), jede Folge begann bei den Sekunden seit dem
+            // App-Start und die alte Folge blieb stehen — gemessen: der erste
+            // Tipp kam bei 548 s an statt bei 0.
+            let neu = match self.anker {
+                None => true,
+                Some(_) => {
+                    self.anker.map(|a| a.elapsed().as_secs_f32()).unwrap_or(0.0)
+                        > NEU_AFTER_SEKUNDEN
+                }
+            };
+            if neu {
                 self.anker = Some(std::time::Instant::now());
                 self.folge.clear();
+                self.spur.clear();
                 info!("Masken-Aufnahme durch ersten Tipp gestartet");
             }
             self.spur.clear();
