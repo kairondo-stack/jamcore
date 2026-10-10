@@ -136,6 +136,19 @@ impl RhythmPanel {
         self.modul_quelle = quelle;
     }
 
+    /// Klangquelle, Wellenform und Modul fuer andere Panels (der Bild-Scan
+    /// klingt mit derselben Quelle). So gibt es **einen** Schalter fuer Bild
+    /// und Pattern.
+    pub fn klang_zustand(
+        &self,
+    ) -> (
+        Klangquelle,
+        jamcore::klang::Welle,
+        Option<crate::player::ModulQuelle>,
+    ) {
+        (self.klangquelle, self.welle, self.modul_quelle.clone())
+    }
+
     /// Eine Note klingen lassen: Modul-Sample (wenn moeglich) oder Tongenerator.
     /// Ausserhalb von Threads; fuer die Threads wird die Logik dort wiederholt.
     fn note_klingen(&self, pitch: i32) {

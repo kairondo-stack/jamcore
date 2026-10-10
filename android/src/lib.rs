@@ -513,7 +513,8 @@ impl JamApp {
                 let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
                 self.kreis.set_target(&host, &port);
                 if let Some(klassen) = self.kreis.ui(ui) {
-                    self.bild.harmonie_band(klassen);
+                    self.bild
+                        .harmonie_band(klassen, self.bild.aktuelle_tipp_spalte());
                 }
             }
         }
@@ -605,13 +606,19 @@ impl JamApp {
             uebernehmen = self.kreis.ui(ui);
         });
         if let Some(klassen) = uebernehmen {
-            self.bild.harmonie_band(klassen);
+            self.bild
+                .harmonie_band(klassen, self.bild.aktuelle_tipp_spalte());
         }
     }
 
     fn view_bild(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.bild.set_target(&host, &port);
+        // Der Bild-Scan klingt mit derselben Quelle wie das Pattern: ein
+        // Schalter im Rhythmus-Tab gilt fuer Bild UND Rhythmus. Ohne das war
+        // der Scan still, weil er nur OSC an den Laptop schickte.
+        let (quelle, welle, modul) = self.rhythm.klang_zustand();
+        self.bild.set_klang_zustand(quelle, welle, modul);
         // Das eine Tempo (Follow gewinnt) — der Takt-Scan rechnet daraus die
         // Sweep-Dauer.
         let tempo = self.tempo_aktuell();

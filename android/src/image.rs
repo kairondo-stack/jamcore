@@ -12,8 +12,8 @@ use eframe::egui::{self, Color32, TextureOptions};
 
 use jamcore::grid::{Note, Pattern};
 use jamcore::livescan::{
-    build_palette, note_allowed, note_volume, note_volume_farbe, pixel_matches, scale_rgb,
-    scan_column, ScanFilter,
+    build_palette, note_volume, note_volume_farbe, pixel_matches, scale_rgb, scan_column,
+    ScanFilter,
 };
 use jamcore::osc::{OscOut, Renoise};
 use jamcore::scanmask::{Aufloesung, ScanMaske};
@@ -22,9 +22,6 @@ use crate::camera;
 use crate::video;
 
 const TOLERANZ_STANDARD: i32 = 24;
-/// Notenbremse fest (der Fader dafür ist weg).
-const MAX_NOTEN_PRO_SEK: u32 = 8;
-/// Kleinster und groesster Zoomfaktor des Bildes.
 const ZOOM_MIN: f32 = 0.2;
 const ZOOM_MAX: f32 = 4.0;
 /// Höhe der Maskenleiste oben im Bild in Punkten.
@@ -114,6 +111,16 @@ pub struct ImagePanel {
     scan_aufnahme: bool,
     /// Aus der Masken-Folge berechnete Zeitpunkte (fuer Status/Log).
     tipp_zeiten: Vec<f32>,
+    /// Klangquelle des Bild-Scans — gespiegelt aus dem Rhythmus-Tab, damit ein
+    /// Schalter fuer Bild und Pattern gilt.
+    klangquelle: crate::rhythm::Klangquelle,
+    welle: jamcore::klang::Welle,
+    modul_quelle: Option<crate::player::ModulQuelle>,
+    /// x-Spalte des letzten Bildtippens: dort setzt der Harmoniekreis seine
+    /// Grenze (Desktop `notessetx[c] = x`).
+    tipp_spalte: Option<i32>,
+    /// Breite des letzten Kamerabildes in Pixeln.
+    bild_w: usize,
     tipp_status: String,
     /// Wie viele Treffer dabei aufgenommen wurden.
     aufgenommen: u64,
@@ -130,9 +137,11 @@ pub struct ImagePanel {
     scan_x: i32,
     scan_puffer: Option<(usize, usize, Vec<u8>)>,
     scan_naechste_spalte: std::time::Instant,
-    scan_letzte_note: std::time::Instant,
     sweep_noten: u64,
     sweep_gezeichnet: u64,
+    /// Treffer, die die Bremse (Noten pro Sekunde / Spalte) wegschmeissen hat.
+    /// Sichtbar, damit „es klingt nicht" nicht an einer stillen Bremse liegt.
+    sweep_doppelt: u64,
     host: String,
     port: String,
     /// Videos aus dem App-Ordner videos/ (S8).
@@ -157,6 +166,13 @@ impl ImagePanel {
             letzte_nummer: 0,
             eingefroren: None,
             sel: None,
+            // Gleiche Quelle wie das Pattern (Rhythmus-Tab spiegelt sie
+            // herein); ohne sie waere der Bild-Scan stumm.
+            klangquelle: crate::rhythm::Klangquelle::Welle,
+            welle: jamcore::klang::Welle::Sinus,
+            modul_quelle: None,
+            tipp_spalte: None,
+            bild_w: 1,
             bg: (0, 0, 0),
             toleranz: (TOLERANZ_STANDARD, TOLERANZ_STANDARD, TOLERANZ_STANDARD),
             treffer: 0,
@@ -192,9 +208,9 @@ impl ImagePanel {
             scan_x: 0,
             scan_puffer: None,
             scan_naechste_spalte: std::time::Instant::now(),
-            scan_letzte_note: std::time::Instant::now(),
             sweep_noten: 0,
             sweep_gezeichnet: 0,
+            sweep_doppelt: 0,
             host: jamcore::osc::DEFAULT_HOST.to_string(),
             port: jamcore::osc::DEFAULT_BASE_PORT.to_string(),
             videos: Vec::new(),
@@ -321,6 +337,7 @@ impl ImagePanel {
     }
 
     fn note_senden(&mut self, note: i32, volume: i32) {
+        self.note_lokal(note, volume);
         let (host, port) = (
             self.host.clone(),
             self.port.parse().unwrap_or(jamcore::osc::DEFAULT_BASE_PORT),
@@ -338,6 +355,27 @@ impl ImagePanel {
             Ok(used) => log::info!("Scan-Note {note} -> {host}:{used}"),
             Err(e) => self.status = format!("OSC-Fehler: {e}"),
         }
+    }
+
+    /// Die Note auch lokal klingen lassen. Ohne das war der Bild-Scan
+    /// stumm, sobald kein Renoise auf dem Laptop laeuft: er ging ausschliesslich
+    /// per OSC an `127.0.0.1:7003`. Quelle ist derselbe Schalter wie im
+    /// Rhythmus-Tab (Modul-Samples, sonst Tongenerator).
+    fn note_lokal(&self, note: i32, volume: i32) {
+        if volume <= 0 {
+            return;
+        }
+        if self.klangquelle == crate::rhythm::Klangquelle::Modul {
+            if let Some(quelle) = self.modul_quelle.as_ref() {
+                if quelle
+                    .note_spielen(30, note, volume as f32 / 127.0)
+                    .is_some()
+                {
+                    return;
+                }
+            }
+        }
+        crate::klang::spielen_welle(note, self.welle);
     }
 
     fn kamera_an(&mut self) {
@@ -504,23 +542,58 @@ impl ImagePanel {
         );
     }
 
-    /// Ein Harmonie-Band aus der Quintenzirkel-Auswahl anhängen. Das vorige
-    /// Band wird auf die halbe Breite gekürzt, wenn es sonst alles abdeckt —
-    /// sonst bliebe das neue Band wirkungslos (erstes Band gewinnt).
-    pub fn harmonie_band(&mut self, klassen: Vec<i32>) {
+    /// x-Spalte des letzten Bildtippens (Getter fuer den Kreis-Tab).
+    /// x-Spalte des letzten Bildtippens (fuer die Harmonie-Grenze).
+    pub fn aktuelle_tipp_spalte(&self) -> Option<i32> {
+        self.tipp_spalte
+    }
+
+    /// Klangquelle, Wellenform und Modul aus dem Rhythmus-Tab uebernehmen, damit
+    /// ein Schalter fuer Bild und Pattern gilt.
+    pub fn set_klang_zustand(
+        &mut self,
+        quelle: crate::rhythm::Klangquelle,
+        welle: jamcore::klang::Welle,
+        modul: Option<crate::player::ModulQuelle>,
+    ) {
+        self.klangquelle = quelle;
+        self.welle = welle;
+        self.modul_quelle = modul;
+    }
+
+    /// Ein Harmonie-Band aus der Quintenzirkel-Auswahl anhaengen — **an der
+    /// x-Stelle, die im Bild angefasst wurde**. Das ist der Ablauf aus dem
+    /// Desktop-`quintenzirkel_flow`: dort wird pro Harmonie erst eine
+    /// x-Grenze ins Bild geklickt (`notessetx[c] = x`), dann die Noten im
+    /// Kreis gewaehlt. Vorher hat die App die Grenze selbst erfunden (halbe
+    /// Bildbreite), damit war nur **ein** Band moeglich.
+    ///
+    /// Ohne angefasste x-Stelle (`x_spalte == None`) greift die alte
+    /// Ersatzgrenze, damit der Knopf ohne vorherigen Tipp nicht stumm bleibt.
+    pub fn harmonie_band(&mut self, klassen: Vec<i32>, x_spalte: Option<i32>) {
         let breite = self.schritte() as i32;
-        if let Some(letzte) = self.harmonie.setx.last_mut().and_then(|v| v.first_mut()) {
-            if *letzte >= breite {
-                *letzte = (breite / 2).max(1);
+        let bis_x = match x_spalte {
+            Some(x) => x.clamp(1, breite.max(1)),
+            None => {
+                // Ohne Klick: hinter die letzten Band(s) legen, damit das neue
+                // Band nicht mitten im Bild landet.
+                let letzte = self
+                    .harmonie
+                    .baender()
+                    .last()
+                    .map(|(x, _)| *x)
+                    .unwrap_or(breite / 2);
+                (letzte + (breite - letzte).max(1)).clamp(1, breite.max(1))
             }
-        }
-        self.harmonie.set_anhaengen(klassen, breite);
+        };
+        let letzte_klassen = self.harmonie.sets.last().cloned().unwrap_or_default();
+        self.harmonie.set_anhaengen_bei(klassen, bis_x);
         self.harmonie.notenmenge = true;
         self.status = format!(
-            "Notenmenge: Band {} bis {}",
-            self.harmonie.sets.len(),
-            breite
+            "Notenmenge: {} Band bis x={bis_x} (von {breite})",
+            self.harmonie.sets.len()
         );
+        log::info!("Harmonie-Band bis x={bis_x}: {letzte_klassen:?} (von {breite} Schritten)");
     }
 
     /// Geprüfter Scan-Bereich (Anteile der Breite) — wie im Kern: beide Grenzen
@@ -667,6 +740,9 @@ impl ImagePanel {
         };
         let schritte = self.schritte().max(1) as i32;
         let (wi, hi) = (w as i32, h as i32);
+        // Bildbreite merken: der Bildtipp braucht sie, um die x-Spalte des
+        // Harmoniebands zu bestimmen.
+        self.bild_w = w;
         // Ein voller Durchlauf dauert die eingestellte Taktdauer.
         let schritt_ns = (jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64) * 1.0e9
             / schritte as f64) as i64;
@@ -767,26 +843,40 @@ impl ImagePanel {
                     }
                 }
             }
+            // Eine Spalte liefert viele passende Pixel, aber wenige **verschiedene**
+            // Noten (gemessen: 182x Note 67, 156x 64, dann ein paar einzelne).
+            // Jede Note einmal zu spielen ist der Akkord der Spalte; dieselbe
+            // Note 64-mal zu wiederholen hat sie nur zugeworfen — die Warteschlange
+            // lief voll und es klang wie ein Dauerton.
+            //
+            // Also: pro Spalte die Noten entdoppeln, dann alle spielen. Ohne
+            // Deckel — die Harmonie-Auswahl ist die gewollte Menge, und nach dem
+            // Entfernen der Duplikate ist sie klein genug.
+            noten.sort_unstable();
+            let alle = noten.len();
+            noten.dedup();
+            // Die Doppel zaehlen, damit im Log sichtbar bleibt, wie viel von
+            // einer Spalte wirklich dieselbe Note war.
+            self.sweep_doppelt += (alle - noten.len()) as u64;
             for (note, vol) in noten.drain(..) {
-                if note_allowed(self.scan_letzte_note.elapsed(), MAX_NOTEN_PRO_SEK) {
-                    self.scan_letzte_note = std::time::Instant::now();
-                    self.note_senden(note, vol);
-                    self.sweep_noten += 1;
-                }
+                self.note_senden(note, vol);
+                self.sweep_noten += 1;
             }
             let naechster = schritt + 1;
             if naechster >= schritte {
                 // Sweep zu Ende: Protokoll, Zaehler zuruecksetzen, und der
                 // naechste Durchlauf startet wieder bei Schritt 0.
                 log::info!(
-                    "Sweep beendet, {} Noten, {} gezeichnet, {} ({:.2} s)",
+                    "Sweep beendet, {} Noten, {} gezeichnet, {} doppelt, {} ({:.2} s)",
                     self.sweep_noten,
                     self.sweep_gezeichnet,
+                    self.sweep_doppelt,
                     jamcore::takte::text(self.takte),
                     jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64)
                 );
                 self.sweep_noten = 0;
                 self.sweep_gezeichnet = 0;
+                self.sweep_doppelt = 0;
                 self.scan_puffer = None;
                 self.scan_x = 0;
             } else {
@@ -849,8 +939,8 @@ impl ImagePanel {
                 self.note_modus = ((idx + 1) % namen.len()) as u8;
             }
             ui.label(format!(
-                "Sweep: {} Noten, {} gezeichnet",
-                self.sweep_noten, self.sweep_gezeichnet
+                "Sweep: {} Noten, {} gezeichnet, {} doppelt",
+                self.sweep_noten, self.sweep_gezeichnet, self.sweep_doppelt
             ));
             ui.checkbox(&mut self.scan_aufnahme, "ins Pattern");
             if self.scan_aufnahme {
@@ -1538,6 +1628,12 @@ impl ImagePanel {
                 let px = ((pos.x - bild_rect.min.x) / skala) as usize;
                 let py = ((pos.y - bild_rect.min.y) / skala) as usize;
                 if let Some(farbe) = self.farbe_an(px, py) {
+                    // Die x-Stelle merken, an der gerade getippt wurde: der
+                    // Harmoniekreis setzt dort seine Grenze (Desktop
+                    // `notessetx[c] = x`).
+                    self.tipp_spalte = Some(
+                        ((px as f32 / self.bild_w.max(1) as f32) * self.schritte() as f32) as i32,
+                    );
                     if self.sel != Some(farbe) {
                         self.sel = Some(farbe);
                         self.markieren(ui.ctx());

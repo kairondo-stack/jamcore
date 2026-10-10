@@ -111,6 +111,94 @@ impl Harmonie {
         self.setx.push(vec![bis_x]);
         self.notessetcount = self.sets.len() as i32;
     }
+
+    /// Wie [`Harmonie::set_anhaengen`], aber mit eigener x-Grenze — so wie im
+    /// Desktop-quintenzirkel_flow: dort wird **pro Harmonie** eine x-Stelle im
+    /// Bild geklickt (`notessetx[c] = x`). Vorherige Grenzen rutschen nach
+    /// rechts, damit die Baender disjunkt bleiben (in_notesset_range erwartet
+    /// aufsteigende Grenzen).
+    pub fn set_anhaengen_bei(&mut self, klassen: Vec<i32>, bis_x: i32) {
+        // Aufsteigend sortieren, damit jedes Band echte Laenge hat.
+        let mut grenzen: Vec<i32> = self
+            .setx
+            .iter()
+            .filter_map(|s| s.first().copied())
+            .chain(std::iter::once(bis_x))
+            .collect();
+        grenzen.sort_unstable();
+        self.setx = grenzen.into_iter().map(|x| vec![x]).collect();
+        // Die alten Klassen gehoeren zu den Grenzen, die schon da waren — sie
+        // wandern mit, statt an Ort und Stelle zu bleiben.
+        let mut sets: Vec<Vec<i32>> = self.sets.drain(..).take(self.setx.len()).collect();
+        sets.push(klassen);
+        self.sets = sets;
+        // Wenn weniger Klassen als Grenzen da sind, hinten auffüllen, damit
+        // `sets[..count]` und `setx[..count]` dieselbe Zahl haben.
+        while self.sets.len() < self.setx.len() {
+            self.sets.push(Vec::new());
+        }
+        self.notessetcount = self.sets.len() as i32;
+    }
+
+    /// Grenzen und Klassen der gesetzten Harmonien lesbar (Anzeige, Test).
+    pub fn baender(&self) -> Vec<(i32, Vec<i32>)> {
+        self.setx
+            .iter()
+            .enumerate()
+            .map(|(v, s)| {
+                (
+                    s.first().copied().unwrap_or_default(),
+                    self.sets.get(v).cloned().unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests_mehrere_x {
+    use super::*;
+
+    #[test]
+    fn jede_harmonie_bekommt_ihre_own_x_grenze() {
+        // Desktop-quintenzirkel_flow: pro Harmonie eine x-Stelle im Bild.
+        let mut h = Harmonie::default();
+        h.set_anhaengen_bei(vec![0, 4, 7], 100);
+        h.set_anhaengen_bei(vec![2, 5, 9], 220);
+        assert_eq!(
+            h.baender(),
+            vec![(100, vec![0, 4, 7]), (220, vec![2, 5, 9])]
+        );
+        h.an = true;
+        h.notenmenge = true;
+        // Zwei Baender mit verschiedenen Klassen an verschiedenen x.
+        assert!(h.note_erlaubt(4, 50), "Dur-3 im ersten Band");
+        assert!(!h.note_erlaubt(2, 50), "Moll-3 nicht im ersten Band");
+        assert!(h.note_erlaubt(2, 150), "Moll-3 im zweiten Band");
+        assert!(!h.note_erlaubt(4, 150), "Dur-3 nicht mehr im zweiten Band");
+    }
+
+    #[test]
+    fn out_of_order_grenzen_werden_sortiert() {
+        let mut h = Harmonie::default();
+        h.set_anhaengen_bei(vec![0, 4, 7], 300);
+        h.set_anhaengen_bei(vec![2, 5, 9], 120);
+        // Aufsteigend, sonst haetten die Baender keine Laenge.
+        let grenzen: Vec<i32> = h.baender().iter().map(|(x, _)| *x).collect();
+        assert!(grenzen.windows(2).all(|w| w[0] < w[1]), "{grenzen:?}");
+    }
+
+    #[test]
+    fn gleiche_grenz_bleibt_die_letzte_gewinnt() {
+        let mut h = Harmonie::default();
+        h.set_anhaengen_bei(vec![0, 4], 100);
+        h.set_anhaengen_bei(vec![2, 5], 100);
+        // Zwei Baender mit derselben Grenze: das erste Band (x<100) traegt die
+        // zuletzt gesetzte Klasse, das zweite (100<=x<100) ist leer.
+        let b = h.baender();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0].0, 100);
+    }
 }
 
 #[cfg(test)]
