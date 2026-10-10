@@ -178,6 +178,61 @@ impl ScanMaske {
             aufloesung: Aufloesung::Sync,
         }
     }
+
+    /// Die Maske auf eine andere Schrittzahl abbilden: jede neue Spalte nimmt den
+    /// Wert an ihrer **gleichen relativen Position**. Damit bleibt das Muster
+    /// erhalten, statt dass die alten Werte links buendeln und die neuen hinten
+    /// dazukommen (das waere `resync`/`resync_offen`).
+    ///
+    /// Herabstufen braucht eine Entscheidung: eine neue Spalte gilt als durch,
+    /// wenn in ihrem Bereich **mindestens `toleranz` Anteil** der alten
+    /// Spalten durch sind. Bei 0.0 genuegt „irgendeine“ (schmale Impulse
+    /// verschwinden nie), bei 0.5 entscheidet die Mehrheit. Der Wert ist in
+    /// Prozent einstellbar — so laesst sich der Kompromiss zwischen „nichts
+    /// verlieren“ und „nicht verschmieren“ von aussen waehlen.
+    ///
+    /// Ohne Aenderung (`neu == len`) passiert nichts, damit das Malen nicht
+    /// springt.
+    pub fn auf_breite_mit(&mut self, neu: usize, anteil: f32) {
+        let alt = self.alpha.len();
+        if neu == alt || alt == 0 {
+            self.alpha.resize(neu.max(1), 1.0);
+            return;
+        }
+        if neu < alt {
+            // Mindestanteil durcher Spalten. **0 % ist die strenge Variante:**
+            // nur wenn alle alten Spalten im Bereich durch sind, gilt die neue
+            // als durch — nichts wird verschmiert, schmale Impulse koennen
+            // verschwinden. 50 % entscheidet die Mehrheit, 100 % genuegt eine
+            // einzige. Der Anteil ist in Prozent einstellbar.
+            let anteil = anteil.clamp(0.0, 1.0);
+            self.alpha = (0..neu)
+                .map(|x| {
+                    let von = (x * alt) / neu;
+                    let bis = (((x + 1) * alt) / neu).max(von + 1).min(alt);
+                    let n = (bis - von) as f32;
+                    let durch = self.alpha[von..bis].iter().filter(|w| **w > 0.0).count() as f32;
+                    // Mindestens eine muessen es sein, sonst waere ein Bereich
+                    // aus nur gesperrten Spalten (Anteil 0 >= 0) durch.
+                    if durch >= 1.0 && durch / n >= anteil {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            return;
+        }
+        self.alpha = (0..neu)
+            .map(|x| {
+                // Die Mitte der neuen Zelle aufs alte Raster: jede alte Spalte
+                // kommt so oft vor, wie das Verhaeltnis ergibt (4 -> 8 je zwei),
+                // und das Muster bleibt an seiner Stelle.
+                let alt_x = (((x as f64 + 0.5) * alt as f64) / neu as f64).floor() as usize;
+                self.alpha[alt_x.min(alt - 1)]
+            })
+            .collect();
+    }
 }
 
 #[cfg(test)]
@@ -381,5 +436,89 @@ mod tests {
         assert_eq!(neu.alpha(0, 24), 1.0);
         assert_eq!(neu.alpha(22, 24), 1.0);
         assert_eq!(neu.alpha(5, 24), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod tests_breite {
+    use super::*;
+
+    #[test]
+    fn vier_auf_acht_behaelt_die_lage() {
+        let mut m = ScanMaske::neu(4, Aufloesung::Sync);
+        m.setze(0, false);
+        m.setze(1, false);
+        m.setze(2, true);
+        m.setze(3, true);
+        m.auf_breite_mit(8, 0.0);
+        // Die beiden gesperrten Viertel bleiben links, die beiden offenen
+        // rechts — sie wandern nicht.
+        assert_eq!(
+            (0..8).map(|x| m.alpha(x, 8)).collect::<Vec<_>>(),
+            vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn herabstufen_mit_toleranz_steuert_die_abweichung() {
+        // Ein schmaler gesperrter Impuls (1 von 8) bei 2 Schritten:
+        // - Toleranz 0.0: er bleibt sichtbar, verschmiert aber auf die halbe
+        //   Breite (nichts geht verloren).
+        // - Toleranz 0.5: die Minderheit zaehlt nicht mehr, die Spalte gilt
+        //   als durch (sauberes Muster, der Impuls ist weg).
+        let mut m = ScanMaske::neu(8, Aufloesung::Sync);
+        m.setze(0, false);
+        for x in 1..8 {
+            m.setze(x, true);
+        }
+
+        let mut locker = m.clone();
+        // 100 %: eine einzige durchgelassene alte Spalte genuegt — der
+        // Impuls bleibt sichtbar, verschmiert aber auf die halbe Breite.
+        locker.auf_breite_mit(2, 1.0);
+        assert_eq!(
+            locker.alpha(0, 2),
+            0.0,
+            "bei 100 % bleibt der Impuls erhalten"
+        );
+
+        let mut streng = m.clone();
+        // 0 %: nur wenn alle vier alten Spalten durch sind — der schmale
+        // Impuls zaehlt nicht mehr mit und die Spalte ist durch.
+        streng.auf_breite_mit(2, 0.0);
+        assert_eq!(
+            streng.alpha(0, 2),
+            1.0,
+            "bei 0 % zaehlt nur die Vollstaendigkeit"
+        );
+    }
+
+    #[test]
+    fn gleich_bleibt_ungveraendert() {
+        let mut m = ScanMaske::neu(8, Aufloesung::Sync);
+        m.setze(3, false);
+        let vorher: Vec<f32> = (0..8).map(|x| m.alpha(x, 8)).collect();
+        m.auf_breite_mit(8, 0.0);
+        let nachher: Vec<f32> = (0..8).map(|x| m.alpha(x, 8)).collect();
+        assert_eq!(vorher, nachher, "beim Malen darf nichts springen");
+    }
+
+    #[test]
+    fn verhaeltnis_bleibt_erhalten() {
+        // Ein einzelner Punkt in der Mitte bleibt in der Mitte, egal auf
+        // welche Schrittzahl abgebildet wird.
+        for neu in [4usize, 16, 64, 128] {
+            let mut m = ScanMaske::neu(128, Aufloesung::Sync);
+            m.setze_alle(false);
+            m.setze(64, true);
+            m.auf_breite_mit(neu, 0.0);
+            let durch = (0..neu).filter(|x| m.alpha(*x as i32, neu) > 0.0).count();
+            assert!(durch > 0, "bei {neu} Schritten darf nichts verschwinden");
+            let mitte = (0..neu).find(|x| m.alpha(*x as i32, neu) > 0.0).unwrap();
+            assert!(
+                mitte.abs_diff(neu / 2) <= 1,
+                "bei {neu} Schritten in der Mitte, war bei {mitte}"
+            );
+        }
     }
 }

@@ -91,6 +91,9 @@ pub struct ImagePanel {
     /// Vom Nutzer gewaehlte Schrittzahl (X-Aufloesung = Patternlaenge);
     /// der Zoom skaliert nur die Anzeige.
     schritte_wahl: u16,
+    /// Mindestanteil durcher Spalten beim Herabstufen der Maske, in Prozent.
+    /// 0 = streng (nichts verschmieren), 100 = eine genuegt.
+    maske_anteil: u32,
     /// Takt-Anteil a/b, aus dem die Schrittzahl entsteht (1/1 = 16).
     bruch_a: u16,
     bruch_b: u16,
@@ -186,6 +189,7 @@ impl ImagePanel {
             maske_an: false,
             maske: ScanMaske::neu(16, Aufloesung::Sync),
             schritte_wahl: 16,
+            maske_anteil: 50,
             bruch_a: 1,
             bruch_b: 1,
             takte: jamcore::takte::VORGABE,
@@ -1051,15 +1055,20 @@ impl ImagePanel {
         };
         let schritte = self.schrittzahl(links);
         if schritte != self.letzte_schritte {
-            // Schrittzahl geaendert: Maske nachziehen (neue Spalten offen) und
-            // den Pattern-Abschnitt mitwachsen lassen, wenn er vorher bis ans
-            // Ende ging.
+            // Schrittzahl geaendert: die Maske wird **auf die neuen Schritte
+            // abgebildet** (nicht nur gestreckt) — sonst liegen die alten
+            // Spalten links buendeln und das Muster geht verloren.
             let alt_ende = self.letzte_schritte.saturating_sub(1);
             let war_ganz = self.letzte_schritte > 0
                 && self.abschnitt_von == 0
                 && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= alt_ende);
-            self.maske.resync_offen(schritte as usize);
+            self.maske
+                .auf_breite_mit(schritte as usize, self.maske_anteil as f32 / 100.0);
             self.letzte_schritte = schritte;
+            log::info!(
+                "Schritte {schritte}: Maske neu abgebildet (Mindestanteil {} %)",
+                self.maske_anteil
+            );
             if war_ganz {
                 self.abschnitt_bis = schritte.saturating_sub(1);
             }
@@ -1249,6 +1258,18 @@ impl ImagePanel {
                 .small()
                 .color(Color32::GRAY),
         );
+        // Mindestanteil beim Herabstufen: 0 % = streng (nichts verschmieren,
+        // schmale Impulse koennen weg), 100 % = eine durch genuegt. Wirkt bei
+        // der naechsten Aenderung der Schrittzahl.
+        ui.horizontal(|ui| {
+            ui.label("Anteil");
+            if ui
+                .add(egui::Slider::new(&mut self.maske_anteil, 0..=100).suffix(" %"))
+                .changed()
+            {
+                self.status = format!("Mindestanteil: {} %", self.maske_anteil);
+            }
+        });
     }
 
     /// Schrittzahl wählen (Zahlenfeld **und** Takt-Anteil a/b) und die Maske setzen.
@@ -1256,11 +1277,22 @@ impl ImagePanel {
         // Zahlenfeld: direkte Schrittzahl (X-Auflösung = Patternlänge).
         ui.horizontal_wrapped(|ui| {
             ui.label("Schritte");
-            if ui
-                .add(egui::DragValue::new(&mut self.schritte_wahl).range(4..=4096))
-                .changed()
-            {
-                log::info!("Schritte gewaehlt: {}", self.schritte());
+            // Voreinstellungen als Knöpfe: zwei Reihen, damit sie auch im Querformat in
+            // die Spalten passen. Beim Wechsel wird die Maske auf die neuen
+            // Schritte abgebildet (siehe `auf_breite_mit`).
+            const VOREIN: [[u16; 6]; 2] = [[16, 32, 64, 128, 256, 512], [12, 24, 48, 96, 192, 384]];
+            for reihe in VOREIN {
+                ui.horizontal(|ui| {
+                    for wert in reihe {
+                        if ui
+                            .selectable_label(self.schritte() == wert, wert.to_string())
+                            .clicked()
+                        {
+                            self.schritte_wahl = wert;
+                            log::info!("Schritte gewaehlt: {wert}");
+                        }
+                    }
+                });
             }
             // Takt-Anteil a/b statt Kopfrechnen: 1/1 = ein Takt (16 Schritte).
             ui.label("Takt");
