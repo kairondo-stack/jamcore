@@ -1274,26 +1274,38 @@ impl ImagePanel {
 
     /// Schrittzahl wählen (Zahlenfeld **und** Takt-Anteil a/b) und die Maske setzen.
     fn zeile_schritte(&mut self, ui: &mut egui::Ui) {
-        // Zahlenfeld: direkte Schrittzahl (X-Auflösung = Patternlänge).
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Schritte");
-            // Voreinstellungen als Knöpfe: zwei Reihen, damit sie auch im Querformat in
-            // die Spalten passen. Beim Wechsel wird die Maske auf die neuen
-            // Schritte abgebildet (siehe `auf_breite_mit`).
-            const VOREIN: [[u16; 6]; 2] = [[16, 32, 64, 128, 256, 512], [12, 24, 48, 96, 192, 384]];
-            for reihe in VOREIN {
-                ui.horizontal(|ui| {
-                    for wert in reihe {
-                        if ui
-                            .selectable_label(self.schritte() == wert, wert.to_string())
-                            .clicked()
-                        {
-                            self.schritte_wahl = wert;
-                            log::info!("Schritte gewaehlt: {wert}");
-                        }
+        // Voreinstellungen als zwei Reihen von je sieben Werten: 16…1024
+        // und, „ab 12", 12…768. Feste Knopfbreite und das Label in einer
+        // eigenen Zeile, damit die Reihen in die Spalte passen und nicht in die
+        // Nachbarspalte ragen (dort lag vorher die zweite Reihe ueber
+        // „Toleranz“).
+        ui.label(egui::RichText::new("Schritte").small().strong());
+        const VOREIN: [[u16; 7]; 2] = [
+            [16, 32, 64, 128, 256, 512, 1024],
+            [12, 24, 48, 96, 192, 384, 768],
+        ];
+        for reihe in VOREIN {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                // Sieben gleiche Spalten statt fester Knopfbreite: so passen
+                // die Knöpfe in **jede** Spaltenbreite und ragen nicht in die
+                // Nachbarspalte.
+                let breite = (ui.available_width() - 12.0) / 7.0;
+                for wert in reihe {
+                    let knopf = ui
+                        .allocate_ui(egui::vec2(breite, 24.0), |ui| {
+                            ui.selectable_label(self.schritte() == wert, wert.to_string())
+                                .clicked()
+                        })
+                        .inner;
+                    if knopf {
+                        self.schritte_wahl = wert;
+                        log::info!("Schritte gewaehlt: {wert}");
                     }
-                });
-            }
+                }
+            });
+        }
+        ui.horizontal(|ui| {
             // Takt-Anteil a/b statt Kopfrechnen: 1/1 = ein Takt (16 Schritte).
             ui.label("Takt");
             let a = ui.add(egui::DragValue::new(&mut self.bruch_a).range(1..=64));
