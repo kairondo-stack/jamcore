@@ -51,7 +51,7 @@ Handy im aktuellen Netz nicht per adb erreichbar war.
 
 | # | Status | Fehlt/Details |
 |---|---|---|
-| 1 | ⚠️ | **Tastatur-Aufnahmemodell** — bewusst ersetzt durch das Tastenfeld der Maske (jeder Druck = Schritt); die Ziffern-/Faktor-/RStep-Varianten fehlen |
+| 1 | ⚠️ | **Tastatur-Aufnahmemodell** — die Aufnahmelogik des pattern_recorder ist da: der erste Tastendruck startet den Timer (wie `recordingStarted`, Zeile 2445–2450), jeder weitere wird mit Zeitstempel notiert, und daraus werden Pulsspalten der Scan-Maske (`scldiv` = letzter Zeitstempel, KeyEventRender-Writer ab 4888). Statt der Tastatur ist es das Tastenfeld der Maske, mit Wischlogik kombiniert (Gerätetest: 4 Tipps bei 0,00/2,14/7,32/12,53 s → „12 von 16 gesperrt", Spalten 0/3/9/15). Die Ziffern-/**Faktor**-/**RStep**-Varianten (x2/x4, 2/5/11/23/15 Schrittweite, `scaletoa`) fehlen noch |
 | 2 | ✅ | **Notenrampe** — Knopf „Rampe“ mit Anzahl im Rhythmus-Tab; Kern `transformation::notenrampe` (Test). Gerätetest: 4 Noten (59 … 63) im Raster |
 | 3 | ⚠️ | **remove_and_record** — der Lösch-Teil ist da (Knopf „Bereich [von] [bis] löschen", Kern `Pattern::bereich_loeschen` mit Test; Gerätetest: „3 Noten gelöscht"); der interaktive Re-Record-Teil bleibt aus |
 | 4 | ❌ | **fdx (`V`), modul1 (`M`)** fehlen (Legacy-Funktionen ohne Touch-Entsprechung) |

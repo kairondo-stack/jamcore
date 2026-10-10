@@ -79,6 +79,12 @@ gilt für Takt-Scan, Rendern und Tagebuch.
   Endtaste; gehaltene Taste + zweite Taste = zwei Schritte hintereinander (Mehrfinger)
 - Regenbogen-Spur der gedrückten Tasten, Schrittanzeige mit Notenpunkten, „leeren" leert
   das Pattern
+- **Tippfolge für die Scan-Maske**: der erste Druck auf ein Feld beginnt die Aufnahme (es
+  gibt keinen Start-Knopf), jeder weitere Druck ist ein Tipp mit Zeitstempel, „Ende" hält die
+  Maske fest. Spalte = Zeit / letzter Zeit × Schrittzahl — genau die Rechnung des
+  pattern_recorder (`scldiv` = letzter Zeitstempel, Zeile 2253–2256; KeyEventRender-Writer
+  ab Zeile 4888). Der erste Tipp liegt immer auf Spalte 0, weil dort der Timer beginnt.
+  Die Wischlogik gilt dabei unverändert: ein Wisch liefert zwei Schritte **und** zwei Tipps.
 
 ### rhythm.rs — Rhythmus-Tab
 - Step-Editor mit 8 Slots; Tipp setzt Note (lokal `klang::spielen` + OSC), „Aufnahme"

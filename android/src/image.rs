@@ -112,6 +112,13 @@ pub struct ImagePanel {
     harmonie: jamcore::harmonie::Harmonie,
     /// Scan-Treffer ins Rhythmus-Pattern schreiben (Desktop: `L`/bpmo3).
     scan_aufnahme: bool,
+    /// Aufnahme einer Tippfolge fuer die Maske (Desktop: Tastenmaske -> KeyEventRender.txt).
+    tipp_start: Option<std::time::Instant>,
+    tipp_zeiten: Vec<f32>,
+    /// Roh-Zeitpunkt des ersten Tipp: der C++-Recorder startet seinen Timer
+    /// erst beim ersten Tastendruck, alle Zeitstempel sind relativ dazu.
+    tipp_anker: Option<f32>,
+    tipp_status: String,
     /// Wie viele Treffer dabei aufgenommen wurden.
     aufgenommen: u64,
     /// Schrittzahl beim letzten Zeichnen (fuer das Nachziehen der Maske).
@@ -177,6 +184,10 @@ impl ImagePanel {
             finger: crate::touch::Mehrfinger::neu(),
             harmonie: jamcore::harmonie::Harmonie::default(),
             scan_aufnahme: false,
+            tipp_start: None,
+            tipp_zeiten: Vec::new(),
+            tipp_anker: None,
+            tipp_status: String::new(),
             aufgenommen: 0,
             letzte_schritte: 0,
             abschnitt_von: 0,
@@ -446,6 +457,74 @@ impl ImagePanel {
     /// Gewaehlte Schrittzahl: X-Aufloesung = Patternlaenge, mindestens 4.
     pub fn schritte(&self) -> u16 {
         self.schritte_wahl.max(4)
+    }
+
+    /// Beginnt die Aufnahme einer Tippfolge für die Maske (Desktop: Tastenmaske,
+    /// deren Zeitabstaende als Spalten in `KeyEventRender.txt` landen). Wird
+    /// automatisch vom ersten Tastendruck ausgeloest; von Hand nur noetig, um
+    /// eine Aufnahme ohne Tipp zu verwerfen.
+    pub fn tippfolge_starten(&mut self) {
+        self.tipp_start = Some(std::time::Instant::now());
+        self.tipp_zeiten.clear();
+        self.tipp_anker = None;
+        self.maske.setze_alle(false);
+        self.maske_an = true;
+        self.tipp_status = "Aufnahme laeuft".to_string();
+        log::info!("Tippfolge gestartet");
+    }
+
+    /// Einen Tipp mit Zeitstempel aufnehmen und die Maske sofort als
+    /// Pulsspalten zeigen: Spalte = Zeit / letzte Zeit × Schrittzahl (wie der
+    /// Desktop `ts * width` rechnet). Die Scan-Noten kommen aus den
+    /// Bildzeilen — die Tippzeiten bestimmen nur, **wo** gespielt wird.
+    pub fn tipp(&mut self) {
+        // Kein Start gedrueckt: die Aufnahme beginnt mit diesem Tipp. Der
+        // C++-Recorder startet seinen Timer beim ersten Tastendruck
+        // (pattern_recorder Zeile 2445–2450) — ein Feld tippen genuegt also,
+        // und dieser erste Tipp ist Spalte 0 der Maske.
+        if self.tipp_start.is_none() {
+            self.tippfolge_starten();
+        }
+        let roh = self
+            .tipp_start
+            .expect("gerade gestartet")
+            .elapsed()
+            .as_secs_f32();
+        let anker = *self.tipp_anker.get_or_insert(roh);
+        let t = roh - anker;
+        self.tipp_zeiten.push(t);
+        let schritte = self.schritte().max(1) as f32;
+        // C++ normiert durch den letzten Zeitstempel (`scldiv`, Zeile 2253–2256),
+        // Spalte = normierte Zeit × Breite (KeyEventRender-Writer, Zeile 4888ff).
+        let letzte = self.tipp_zeiten.last().copied().unwrap_or(t).max(0.001);
+        self.maske.setze_alle(false);
+        for zeit in &self.tipp_zeiten {
+            let spalte = ((zeit / letzte) * schritte).round() as i64;
+            let spalte = spalte.clamp(0, schritte as i64 - 1) as usize;
+            self.maske.setze(spalte, true);
+        }
+        self.tipp_status = format!("{} Tipps, {:.1} s", self.tipp_zeiten.len(), t);
+        log::info!("Tipp {} bei {t:.2}s -> Maske", self.tipp_zeiten.len());
+    }
+
+    /// Aufnahme beenden (Maske bleibt stehen). Tippen danach beginnt wieder
+    /// eine neue Folge.
+    pub fn tippfolge_ende(&mut self) {
+        if self.tipp_start.take().is_some() {
+            self.tipp_anker = None;
+            self.tipp_status = format!("Fertig: {} Tipps", self.tipp_zeiten.len());
+            log::info!("Tippfolge beendet ({} Tipps)", self.tipp_zeiten.len());
+        }
+    }
+
+    /// Laeuft die Tippfolge-Aufnahme gerade?
+    pub fn tippfolge_laeuft(&self) -> bool {
+        self.tipp_start.is_some()
+    }
+
+    /// Text zum Aufnahmestand (Tipps, Dauer) fuer die Anzeige im Maske-Tab.
+    pub fn tipp_status(&self) -> String {
+        self.tipp_status.clone()
     }
 
     /// Ein Harmonie-Band aus der Quintenzirkel-Auswahl anhängen. Das vorige
@@ -884,10 +963,16 @@ impl ImagePanel {
         };
         let schritte = self.schrittzahl(links);
         if schritte != self.letzte_schritte {
-            // Schrittzahl geaendert: Maske nachziehen (neue Spalten offen).
+            // Schrittzahl geaendert: Maske nachziehen (neue Spalten offen) und
+            // den Pattern-Abschnitt mitwachsen lassen, wenn er vorher bis ans
+            // Ende ging.
+            let alt_ende = self.letzte_schritte.saturating_sub(1);
+            let war_ganz = self.letzte_schritte > 0
+                && self.abschnitt_von == 0
+                && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= alt_ende);
             self.maske.resync_offen(schritte as usize);
             self.letzte_schritte = schritte;
-            if self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= schritte.saturating_sub(1) {
+            if war_ganz {
                 self.abschnitt_bis = schritte.saturating_sub(1);
             }
         }

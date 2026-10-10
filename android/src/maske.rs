@@ -45,6 +45,10 @@ pub struct MaskePanel {
     finger: Mehrfinger,
     /// Erst- und Endtaste je Finger (Fingernummer -> (Start, Ende)).
     wisch: std::collections::HashMap<u64, (Option<usize>, Option<usize>)>,
+    /// Tastendruecke dieses Bildes (Reihenfolge), ausgeleert von
+    /// [`MaskePanel::presse_entnehmen`]. Der Bild-Scan zaehlt daraus seine
+    /// Tippfolge: so wird aus dem Feldtippen die Maske (wie KeyEventRender.txt).
+    presse: Vec<usize>,
 }
 
 impl Default for MaskePanel {
@@ -65,7 +69,14 @@ impl MaskePanel {
             naechster_schritt: 0,
             finger: Mehrfinger::neu(),
             wisch: std::collections::HashMap::new(),
+            presse: Vec::new(),
         }
+    }
+
+    /// Die seit dem letzten Aufruf gedrueckten Tasten (Index je Druck), in
+    /// Druckreihenfolge. Der Aufrufer zaehlt daraus die Tippfolge.
+    pub fn presse_entnehmen(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.presse)
     }
 
     fn tasten_anzahl(&self) -> usize {
@@ -289,6 +300,15 @@ impl MaskePanel {
         for (id, pos) in rahmen.starts {
             let taste = self.taste_unter(rect, pos);
             self.wisch.insert(id, (taste, taste));
+            // Aufsetzen = erster Schritt, und genau dann faengt auch die
+            // Tippfolge an (der C++-Recorder startet seinen Timer beim ersten
+            // Tastendruck). Deshalb wird hier schon geschrieben und nicht erst
+            // beim Loslassen — sonst kaeme der erste Schritt zu spaet.
+            if let Some(taste) = taste {
+                self.spur.clear();
+                self.druck_schritt(taste, pos, pattern);
+                self.presse.push(taste);
+            }
         }
         for (id, pos) in rahmen.zuege {
             let treffer = self.taste_unter(rect, pos);
@@ -303,14 +323,13 @@ impl MaskePanel {
             let Some(start) = start else {
                 continue;
             };
-            let ende = ende.unwrap_or(start);
-            self.spur.clear();
-            for taste in [Some(start), if ende == start { None } else { Some(ende) }]
-                .into_iter()
-                .flatten()
-            {
-                let pos = self.zentrum(rect, taste);
-                self.druck_schritt(taste, pos, pattern);
+            // Der Wisch zaehlt als zweiter Schritt nur, wenn er wirklich
+            // gewandert ist; ein Tippen auf dieselbe Taste bleibt ein Schritt.
+            let gewandert = ende.filter(|ende| *ende != start);
+            if let Some(ende) = gewandert {
+                let pos = self.zentrum(rect, ende);
+                self.druck_schritt(ende, pos, pattern);
+                self.presse.push(ende);
             }
         }
 

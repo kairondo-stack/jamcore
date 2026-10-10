@@ -407,8 +407,40 @@ impl JamApp {
             egui::ScrollArea::vertical()
                 .scroll_source(egui::scroll_area::ScrollSource::ALL)
                 .id_salt("maske_inhalt")
-                .show(ui, |ui| self.maske.ui(ui, self.rhythm.pattern_mut()));
+                .show(ui, |ui| self.maske_bereich(ui));
         });
+    }
+
+    /// Maskenfeld mit der Tippfolge-Zeile. Jeder Druck auf das Feld zaehlt als
+    /// Tipp der Scan-Maske (das Bild bekommt ihn hier, nicht im Panel, damit
+    /// Bild und Maske dieselbe Quelle sehen).
+    fn maske_bereich(&mut self, ui: &mut egui::Ui) {
+        let laeuft = self.bild.tippfolge_laeuft();
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add_enabled(
+                    laeuft,
+                    egui::Button::new("Ende").min_size(egui::vec2(96.0, 44.0)),
+                )
+                .clicked()
+            {
+                self.bild.tippfolge_ende();
+            }
+            let text = if laeuft {
+                self.bild.tipp_status()
+            } else {
+                "Feld tippen: nimmt auf".to_string()
+            };
+            ui.label(egui::RichText::new(text).color(if laeuft {
+                egui::Color32::from_rgb(120, 230, 160)
+            } else {
+                egui::Color32::GRAY
+            }));
+        });
+        self.maske.ui(ui, self.rhythm.pattern_mut());
+        for _ in self.maske.presse_entnehmen() {
+            self.bild.tipp();
+        }
     }
 
     /// Kombi-Ansicht: zwei Module gleichzeitig (im Hochformat untereinander,
@@ -441,7 +473,7 @@ impl JamApp {
                 self.rhythm.set_tempo(tempo);
                 self.rhythm.ui(ui);
             }
-            KombiTeil::Maske => self.maske.ui(ui, self.rhythm.pattern_mut()),
+            KombiTeil::Maske => self.maske_bereich(ui),
             KombiTeil::Tempo => {
                 let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
                 self.mic.set_target(&host, &port);
