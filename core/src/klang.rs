@@ -97,6 +97,67 @@ impl Welle {
 
 /// Ein kurzes Ton-Signal mit gewählter Wellenform, 16 Bit mono. Ein-/Ausblenden
 /// wie bei [`sinus_puffer`]; Rauschen bekommt einen festen Zufallsstrom
+/// Welche Toene aus einer Warteschlange ueberhaupt gespielt werden.
+///
+/// Der Bild-Scan liefert mehr Noten, als der Tongenerator in der Zeit
+/// abspielen kann (ein Ton dauert `LAENGE_MS`, die Spalte ist viel kuerzer).
+/// Ohne Begrenzung wächst die Warteschlange unbegrenzt: der Klang hoert nie
+/// auf und man lauscht auf einen alten Rueckstand statt auf das Bild.
+///
+/// Deshalb bleiben nur die **`max` neuesten** Toene. Die aeltesten fallen weg —
+/// genau die, die man ohnehin nicht mehr hoeren will.
+pub fn neueste_woertlich<T>(schlange: &[T], max: usize) -> Vec<&T> {
+    if max == 0 || schlange.is_empty() {
+        return Vec::new();
+    }
+    let start = schlange.len().saturating_sub(max);
+    schlange[start..].iter().collect()
+}
+
+#[cfg(test)]
+mod tests_warteschlange {
+    use super::neueste_woertlich;
+
+    #[test]
+    fn nur_die_neuesten_bleiben() {
+        let schlange: Vec<i32> = (0..100).collect();
+        let raus = neueste_woertlich(&schlange, 8);
+        assert_eq!(raus.len(), 8);
+        assert_eq!(*raus.last().unwrap(), &99, "die neueste Note bleibt");
+        assert_eq!(*raus.first().unwrap(), &92);
+    }
+
+    #[test]
+    fn kurze_schlange_bleibt_vollstaendig() {
+        let schlange: Vec<i32> = (0..3).collect();
+        assert_eq!(neueste_woertlich(&schlange, 8).len(), 3);
+    }
+
+    #[test]
+    fn leere_schlange_und_null() {
+        let leer: Vec<i32> = Vec::new();
+        assert!(neueste_woertlich(&leer, 8).is_empty());
+        let schlange: Vec<i32> = (0..5).collect();
+        assert!(
+            neueste_woertlich(&schlange, 0).is_empty(),
+            "max = 0 spielt nichts"
+        );
+    }
+
+    #[test]
+    fn die_grenze_haelt_und_begrenzt() {
+        // So viele Noten, wie der Bild-Scan liefert: die Warteschlange darf
+        // nicht groesser werden als das Fenster.
+        let schlange: Vec<i32> = (0..10_000).collect();
+        let raus = neueste_woertlich(&schlange, 16);
+        assert!(
+            raus.len() <= 16,
+            "die Schlange bleibt begrenzt: {}",
+            raus.len()
+        );
+    }
+}
+
 /// (xorshift, damit die Tests reproduzierbar sind).
 pub fn puffer_welle(freq: f32, rate: u32, laenge_ms: u32, welle: Welle) -> Vec<i16> {
     if welle == Welle::Sinus {

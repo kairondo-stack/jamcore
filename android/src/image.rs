@@ -352,8 +352,17 @@ impl ImagePanel {
             }
             Ok(used)
         }) {
-            Ok(used) => log::info!("Scan-Note {note} -> {host}:{used}"),
-            Err(e) => self.status = format!("OSC-Fehler: {e}"),
+            // Die Werte, die wirklich rausgehen: /renoise/trigger/note_on mit
+            // (track=-1, device=-1, note, volume) auf Port 7000, dazu der
+            // MIDI-Trigger auf 7002. Ohne die Lautstaerke war nicht zu sehen,
+            // ob der Sweep leise oder voll traf.
+            Ok(used) => log::info!(
+                "OSC note_on -1 -1 {note} {volume} -> {host}:{used} (MIDI-Trigger :7002)"
+            ),
+            Err(e) => {
+                self.status = format!("OSC-Fehler: {e}");
+                log::warn!("OSC note_on -1 -1 {note} {volume} -> {host} FEHLER: {e}");
+            }
         }
     }
 
@@ -858,6 +867,18 @@ impl ImagePanel {
             // Die Doppel zaehlen, damit im Log sichtbar bleibt, wie viel von
             // einer Spalte wirklich dieselbe Note war.
             self.sweep_doppelt += (alle - noten.len()) as u64;
+            // Pro Spalte: welche Noten mit welcher Lautstaerke. Das ist die
+            // Zeile, an der man im Log sieht, ob „y faellt" wirklich faellt.
+            if !noten.is_empty() {
+                let spalte_text: Vec<String> =
+                    noten.iter().map(|(n, v)| format!("{n}/{v}")).collect();
+                log::info!(
+                    "Spalte {}: {} Noten {}",
+                    schritt,
+                    noten.len(),
+                    spalte_text.join(" ")
+                );
+            }
             for (note, vol) in noten.drain(..) {
                 self.note_senden(note, vol);
                 self.sweep_noten += 1;

@@ -17,6 +17,10 @@ const STREAM_MUSIC: i32 = 3;
 const CHANNEL_OUT_STEREO: i32 = 12;
 const ENCODING_PCM_16BIT: i32 = 2;
 const MODE_STREAM: i32 = 1;
+/// So viele Toene duerfen sich hoechstens stauen, bevor die aeltesten
+/// verworfen werden. Ohne diese Grenze waechst die Warteschlange beim
+/// Bild-Scan unbegrenzt — der Klang hoert nie auf.
+const MAX_STAU: usize = 8;
 
 pub struct Spieler {
     tx: Sender<(i32, Welle)>,
@@ -66,40 +70,77 @@ fn starten() -> Result<Spieler, String> {
 fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<(i32, Welle)>) -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let (track, array) = create_track(&mut env)?;
-    while let Ok((midi, welle)) = rx.recv() {
-        let puffer = puffer_welle(frequenz(midi), RATE as u32, LAENGE_MS, welle);
-        // Stereo PCM16 little-endian, beide Kanäle gleich.
-        let mut bytes: Vec<i8> = Vec::with_capacity(puffer.len() * 4);
-        for s in &puffer {
-            let (lo, hi) = (s.to_le_bytes()[0] as i8, s.to_le_bytes()[1] as i8);
-            bytes.push(lo);
-            bytes.push(hi);
-            bytes.push(lo);
-            bytes.push(hi);
+    let rx = rx;
+    loop {
+        let Ok((midi, welle)) = rx.recv() else {
+            break;
+        };
+        // Was sich waehrend des Spielens gesammelt hat, auf die neuesten
+        // MAX_STAU kuerzen. Ohne das waechst die Warteschlange unbegrenzt:
+        // Der Bild-Scan liefert mehr Noten, als in der Zeit spielbar sind (Ton
+        // 120 ms, Spalte wenige ms) — der Klang hoert nie auf und man lauscht
+        // auf einen alten Rueckstand statt auf das Bild.
+        let mut naechste = vec![(midi, welle)];
+        while naechste.len() < MAX_STAU {
+            match rx.try_recv() {
+                Ok(weitere) => naechste.push(weitere),
+                Err(_) => break,
+            }
         }
-        let jarray: &jni::objects::JPrimitiveArray<i8> = array.as_obj().into();
-        if env.set_byte_array_region(jarray, 0, &bytes).is_err() {
-            crate::jniutil::clear(&mut env);
-            continue;
+        let verworfen = rx.try_iter().count();
+        if verworfen > 0 {
+            info!("klang: {verworfen} veraltete Toene verworfen");
         }
-        let wrote = env.call_method(
-            track.as_obj(),
-            "write",
-            "([BII)I",
-            &[
-                jni::objects::JValue::Object(array.as_ref()),
-                jni::objects::JValue::Int(0),
-                jni::objects::JValue::Int(bytes.len() as i32),
-            ],
-        );
-        if wrote.is_err() {
-            let detail = crate::jniutil::describe_and_clear(&mut env);
-            info!("klang: write fehlgeschlagen: {detail}");
+        for (midi, welle) in naechste {
+            if !ton(&mut env, &track, &array, midi, welle) {
+                return Ok(());
+            }
         }
     }
     Ok(())
 }
 
+/// Einen Ton erzeugen und in den AudioTrack schreiben (blockiert). `false`,
+/// wenn der JNI-Aufruf gescheitert ist — dann aufgeben statt weiterzuprobieren.
+fn ton(
+    env: &mut jni::JNIEnv,
+    track: &jni::objects::GlobalRef,
+    array: &jni::objects::GlobalRef,
+    midi: i32,
+    welle: Welle,
+) -> bool {
+    let puffer = puffer_welle(frequenz(midi), RATE as u32, LAENGE_MS, welle);
+    // Stereo PCM16 little-endian, beide Kanaele gleich.
+    let mut bytes: Vec<i8> = Vec::with_capacity(puffer.len() * 4);
+    for s in &puffer {
+        let (lo, hi) = (s.to_le_bytes()[0] as i8, s.to_le_bytes()[1] as i8);
+        bytes.push(lo);
+        bytes.push(hi);
+        bytes.push(lo);
+        bytes.push(hi);
+    }
+    let jarray: &jni::objects::JPrimitiveArray<i8> = array.as_obj().into();
+    if env.set_byte_array_region(jarray, 0, &bytes).is_err() {
+        crate::jniutil::clear(env);
+        return true; // nur dieses Array fehlt, weiter versuchen
+    }
+    let wrote = env.call_method(
+        track.as_obj(),
+        "write",
+        "([BII)I",
+        &[
+            jni::objects::JValue::Object(array.as_ref()),
+            jni::objects::JValue::Int(0),
+            jni::objects::JValue::Int(bytes.len() as i32),
+        ],
+    );
+    if let Err(e) = wrote {
+        let detail = crate::jniutil::describe_and_clear(env);
+        info!("klang: write fehlgeschlagen: {detail} / {e}");
+        return false;
+    }
+    true
+}
 fn create_track(
     env: &mut jni::JNIEnv,
 ) -> Result<(jni::objects::GlobalRef, jni::objects::GlobalRef), String> {
