@@ -79,6 +79,8 @@ struct JamApp {
     kombi_unten: KombiTeil,
     diary: diary::DiaryPanel,
     maske: maske::MaskePanel,
+    /// Wie stark die Wischgeschwindigkeit die Schrittweite im Maske-Tab kippt.
+    maske_staerke: f32,
     /// **Ein** BPM für Tempo-Tab, Takt-Scan, Rendern und Tagebuch. Mit aktivem
     /// Link-Follow gewinnt das Session-Tempo (siehe `tempo_aktuell`).
     tempo_bpm: f32,
@@ -120,6 +122,7 @@ impl Default for JamApp {
             kombi_unten: KombiTeil::Rhythmus,
             diary: diary::DiaryPanel::default(),
             maske: maske::MaskePanel::default(),
+            maske_staerke: 0.5,
             tempo_bpm: 128.0,
             tempo_teiler: 1.0,
             wav_sekunden: 60.0,
@@ -411,23 +414,25 @@ impl JamApp {
         });
     }
 
-    /// Maskenfeld mit der Tippfolge-Zeile. Jeder Druck auf das Feld zaehlt als
-    /// Tipp der Scan-Maske (das Bild bekommt ihn hier, nicht im Panel, damit
-    /// Bild und Maske dieselbe Quelle sehen).
+    /// Maskenfeld mit der Folge-Zeile. Die Aufzeichnung kommt aus dem
+    /// Maske-Tab (Zeitabstaende + Feldwerte); das Bild rechnet daraus die
+    /// gruene Maske ueber dem Kamerabild.
     fn maske_bereich(&mut self, ui: &mut egui::Ui) {
-        let laeuft = self.bild.tippfolge_laeuft();
+        let laeuft = self.maske.laeuft();
+        let anzahl = self.maske.folge().len();
         ui.horizontal_wrapped(|ui| {
+            // „neu" loescht die Folge und nimmt wieder auf. Ohne Ende-Knopf:
+            // die Aufnahme laeuft einfach weiter, bis man neu drueckt.
             if ui
-                .add_enabled(
-                    laeuft,
-                    egui::Button::new("Ende").min_size(egui::vec2(96.0, 44.0)),
-                )
+                .add(egui::Button::new("neu").min_size(egui::vec2(96.0, 44.0)))
                 .clicked()
             {
-                self.bild.tippfolge_ende();
+                self.maske.neu();
             }
             let text = if laeuft {
-                self.bild.tipp_status()
+                format!("{anzahl} Zeitpunkte — nimmt auf")
+            } else if anzahl > 0 {
+                format!("{anzahl} Zeitpunkte — festgehalten")
             } else {
                 "Feld tippen: nimmt auf".to_string()
             };
@@ -437,9 +442,28 @@ impl JamApp {
                 egui::Color32::GRAY
             }));
         });
+        // Wie stark die Wischgeschwindigkeit die Schrittweite kippt. Bei 0
+        // wirkt nur die normale Rechnung.
+        ui.horizontal(|ui| {
+            ui.label("Wisch-Modulation");
+            ui.add(
+                egui::Slider::new(&mut self.maske_staerke, 0.0..=1.0)
+                    .text("stark")
+                    .show_value(true),
+            );
+        });
         self.maske.ui(ui, self.rhythm.pattern_mut());
-        for _ in self.maske.presse_entnehmen() {
-            self.bild.tipp();
+        // Die aufgezeichnete Folge in den Bild-Scan: erst die normale
+        // Schrittweiten-Rechnung, dann die Timestamps auf die X-Aufloesung.
+        let staerke = self.maske_staerke;
+        let folge: Vec<(f32, f32, Vec<f32>)> = self
+            .maske
+            .folge()
+            .iter()
+            .map(|a| (a.zeit, a.indexnum, a.tempo.clone()))
+            .collect();
+        if !folge.is_empty() {
+            self.bild.maske_aus_folge(&folge, staerke);
         }
     }
 

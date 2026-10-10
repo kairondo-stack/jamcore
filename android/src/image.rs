@@ -112,12 +112,8 @@ pub struct ImagePanel {
     harmonie: jamcore::harmonie::Harmonie,
     /// Scan-Treffer ins Rhythmus-Pattern schreiben (Desktop: `L`/bpmo3).
     scan_aufnahme: bool,
-    /// Aufnahme einer Tippfolge fuer die Maske (Desktop: Tastenmaske -> KeyEventRender.txt).
-    tipp_start: Option<std::time::Instant>,
+    /// Aus der Masken-Folge berechnete Zeitpunkte (fuer Status/Log).
     tipp_zeiten: Vec<f32>,
-    /// Roh-Zeitpunkt des ersten Tipp: der C++-Recorder startet seinen Timer
-    /// erst beim ersten Tastendruck, alle Zeitstempel sind relativ dazu.
-    tipp_anker: Option<f32>,
     tipp_status: String,
     /// Wie viele Treffer dabei aufgenommen wurden.
     aufgenommen: u64,
@@ -184,9 +180,7 @@ impl ImagePanel {
             finger: crate::touch::Mehrfinger::neu(),
             harmonie: jamcore::harmonie::Harmonie::default(),
             scan_aufnahme: false,
-            tipp_start: None,
             tipp_zeiten: Vec::new(),
-            tipp_anker: None,
             tipp_status: String::new(),
             aufgenommen: 0,
             letzte_schritte: 0,
@@ -459,72 +453,55 @@ impl ImagePanel {
         self.schritte_wahl.max(4)
     }
 
-    /// Beginnt die Aufnahme einer Tippfolge für die Maske (Desktop: Tastenmaske,
-    /// deren Zeitabstaende als Spalten in `KeyEventRender.txt` landen). Wird
-    /// automatisch vom ersten Tastendruck ausgeloest; von Hand nur noetig, um
-    /// eine Aufnahme ohne Tipp zu verwerfen.
-    pub fn tippfolge_starten(&mut self) {
-        self.tipp_start = Some(std::time::Instant::now());
-        self.tipp_zeiten.clear();
-        self.tipp_anker = None;
+    /// Die Maske aus einer aufgezeichneten Folge bauen.
+    /// dem Maske-Tab (Zeitabstaende + Feldwerte als Indexnum); was hier
+    /// passiert, ist exakt der Weg aus `pattern_recorder`: erst die normale
+    /// Schrittweiten-Rechnung, dann die Timestamps auf die X-Aufloesung
+    /// legen (KeyEventRender-Massstab).
+    ///
+    /// `staerke` waechelt die Modulation der Wischgeschwindigkeit auf die
+    /// Krümmung; bei 0.0 bleibt die reine Rechnung uebrig.
+    pub fn maske_aus_folge(&mut self, folge: &[(f32, f32, Vec<f32>)], staerke: f32) {
+        if folge.is_empty() {
+            return;
+        }
+        let tipps: Vec<jamcore::schrittweite::Tipp> = folge
+            .iter()
+            .map(|(zeit, indexnum, _)| jamcore::schrittweite::Tipp::new(*zeit, *indexnum))
+            .collect();
+        let mut zeiten = jamcore::schrittweite::timestamps(&tipps);
+        // Die Krümmung kommt aus dem Wischprofil: der Referenzwert ist der
+        // Mittelweg der Geste, ein gleichmaessiger Wisch ergibt daher
+        // ueberall 1.0 und laesst die Timestamps unveraendert.
+        let tempo: Vec<f32> = folge
+            .iter()
+            .flat_map(|(_, _, t)| t.iter().copied())
+            .collect();
+        if staerke.abs() > 1e-9 && tempo.len() >= 2 {
+            let kappa = jamcore::schrittweite::kruemmung(
+                &tempo,
+                jamcore::schrittweite::tempo_mittel(&tempo),
+            );
+            zeiten = jamcore::schrittweite::modulieren(&zeiten, &kappa, staerke);
+        }
+        let schritte = self.schritte().max(1) as usize;
+        let spalten = jamcore::schrittweite::spalten(&zeiten, schritte);
         self.maske.setze_alle(false);
+        for spalte in &spalten {
+            self.maske.setze(*spalte, true);
+        }
         self.maske_an = true;
-        self.tipp_status = "Aufnahme laeuft".to_string();
-        log::info!("Tippfolge gestartet");
-    }
-
-    /// Einen Tipp mit Zeitstempel aufnehmen und die Maske sofort als
-    /// Pulsspalten zeigen: Spalte = Zeit / letzte Zeit × Schrittzahl (wie der
-    /// Desktop `ts * width` rechnet). Die Scan-Noten kommen aus den
-    /// Bildzeilen — die Tippzeiten bestimmen nur, **wo** gespielt wird.
-    pub fn tipp(&mut self) {
-        // Kein Start gedrueckt: die Aufnahme beginnt mit diesem Tipp. Der
-        // C++-Recorder startet seinen Timer beim ersten Tastendruck
-        // (pattern_recorder Zeile 2445–2450) — ein Feld tippen genuegt also,
-        // und dieser erste Tipp ist Spalte 0 der Maske.
-        if self.tipp_start.is_none() {
-            self.tippfolge_starten();
-        }
-        let roh = self
-            .tipp_start
-            .expect("gerade gestartet")
-            .elapsed()
-            .as_secs_f32();
-        let anker = *self.tipp_anker.get_or_insert(roh);
-        let t = roh - anker;
-        self.tipp_zeiten.push(t);
-        let schritte = self.schritte().max(1) as f32;
-        // C++ normiert durch den letzten Zeitstempel (`scldiv`, Zeile 2253–2256),
-        // Spalte = normierte Zeit × Breite (KeyEventRender-Writer, Zeile 4888ff).
-        let letzte = self.tipp_zeiten.last().copied().unwrap_or(t).max(0.001);
-        self.maske.setze_alle(false);
-        for zeit in &self.tipp_zeiten {
-            let spalte = ((zeit / letzte) * schritte).round() as i64;
-            let spalte = spalte.clamp(0, schritte as i64 - 1) as usize;
-            self.maske.setze(spalte, true);
-        }
-        self.tipp_status = format!("{} Tipps, {:.1} s", self.tipp_zeiten.len(), t);
-        log::info!("Tipp {} bei {t:.2}s -> Maske", self.tipp_zeiten.len());
-    }
-
-    /// Aufnahme beenden (Maske bleibt stehen). Tippen danach beginnt wieder
-    /// eine neue Folge.
-    pub fn tippfolge_ende(&mut self) {
-        if self.tipp_start.take().is_some() {
-            self.tipp_anker = None;
-            self.tipp_status = format!("Fertig: {} Tipps", self.tipp_zeiten.len());
-            log::info!("Tippfolge beendet ({} Tipps)", self.tipp_zeiten.len());
-        }
-    }
-
-    /// Laeuft die Tippfolge-Aufnahme gerade?
-    pub fn tippfolge_laeuft(&self) -> bool {
-        self.tipp_start.is_some()
-    }
-
-    /// Text zum Aufnahmestand (Tipps, Dauer) fuer die Anzeige im Maske-Tab.
-    pub fn tipp_status(&self) -> String {
-        self.tipp_status.clone()
+        self.tipp_zeiten = zeiten.clone();
+        self.tipp_status = format!(
+            "{} Punkte, {:.1} s",
+            zeiten.len(),
+            zeiten.last().copied().unwrap_or(0.0)
+        );
+        log::info!(
+            "Maske aus Folge: {} Zeitpunkte -> {} Spalten von {schritte}",
+            zeiten.len(),
+            spalten.len()
+        );
     }
 
     /// Ein Harmonie-Band aus der Quintenzirkel-Auswahl anhängen. Das vorige

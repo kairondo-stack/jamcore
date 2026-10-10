@@ -5,6 +5,8 @@
 
 /// Schritte je Pattern-Zyklus als Vorgabe, wenn kein Bild die Länge vorgibt.
 pub const STEPS_PER_CYCLE: u16 = 16;
+/// Obergrenze der waehlbaren Patternlaenge (Rhythmus-Tab: 1 bis 128).
+pub const MAX_STEPS_PER_CYCLE: u16 = 128;
 /// Unter- und Obergrenze der Schrittzahl aus der Bildbreite.
 pub const MIN_SCHRITTE: u16 = 4;
 pub const MAX_SCHRITTE: u16 = 4096;
@@ -100,6 +102,15 @@ impl Pattern {
 
     pub fn steps_per_cycle(&self) -> u16 {
         self.steps_per_cycle
+    }
+
+    /// Laenge des Zyklus setzen (1..=128, wie im Rhythmus-Tab waehlbar).
+    /// Noten auf Schritten, die es danach nicht mehr gibt, fallen weg — sonst
+    /// waeren sie im Raster unsichtbar, aber beim Abspielen noch da.
+    pub fn set_steps_per_cycle(&mut self, schritte: u16) {
+        let neu = schritte.clamp(1, MAX_STEPS_PER_CYCLE);
+        self.steps_per_cycle = neu;
+        self.notes.retain(|n| n.step < neu);
     }
 
     pub fn notes(&self) -> &[Note] {
@@ -459,6 +470,77 @@ mod tests {
         p.toggle(4, 72);
         assert_eq!(p.notes().len(), 1, "gleicher Schritt wird ersetzt");
         assert_eq!(p.notes()[0].pitch, 72);
+    }
+
+    #[test]
+    fn laenge_ist_von_1_bis_128_waehlbar() {
+        let mut p = Pattern::with_steps(16);
+        for laenge in [1_u16, 3, 64, 128] {
+            p.set_steps_per_cycle(laenge);
+            assert_eq!(p.steps_per_cycle(), laenge, "Laenge {laenge}");
+        }
+        // Ausserhalb geklemmt, damit die Anzeige nie einen leeren Zyklus zeigt.
+        p.set_steps_per_cycle(0);
+        assert_eq!(p.steps_per_cycle(), 1, "unter 1 wird auf 1 geklemmt");
+        p.set_steps_per_cycle(5000);
+        assert_eq!(
+            p.steps_per_cycle(),
+            MAX_STEPS_PER_CYCLE,
+            "ueber 128 wird geklemmt"
+        );
+    }
+
+    #[test]
+    fn verkuerzen_verliert_die_noten_ausserhalb() {
+        let mut p = Pattern::with_steps(16);
+        p.insert(Note {
+            step: 0,
+            instrument: 0,
+            pitch: 60,
+            glide: false,
+        });
+        p.insert(Note {
+            step: 5,
+            instrument: 0,
+            pitch: 64,
+            glide: false,
+        });
+        p.insert(Note {
+            step: 15,
+            instrument: 0,
+            pitch: 67,
+            glide: false,
+        });
+        p.set_steps_per_cycle(6);
+        assert_eq!(p.steps_per_cycle(), 6);
+        assert_eq!(
+            p.notes().iter().map(|n| n.step).collect::<Vec<_>>(),
+            vec![0, 5],
+            "der Schritt 15 liegt jetzt ausserhalb und faellt weg"
+        );
+        // Verlaengern holt nichts zurueck — die Noten waren weg.
+        p.set_steps_per_cycle(16);
+        assert_eq!(p.notes().len(), 2, "Verlaengern erzeugt keine Noten");
+    }
+
+    #[test]
+    fn bei_laenge_ein_bleibt_erste_note_erhalten() {
+        let mut p = Pattern::with_steps(16);
+        p.insert(Note {
+            step: 0,
+            instrument: 0,
+            pitch: 60,
+            glide: false,
+        });
+        p.insert(Note {
+            step: 3,
+            instrument: 0,
+            pitch: 60,
+            glide: false,
+        });
+        p.set_steps_per_cycle(1);
+        assert_eq!(p.notes().len(), 1);
+        assert_eq!(p.notes()[0].step, 0);
     }
 
     #[test]

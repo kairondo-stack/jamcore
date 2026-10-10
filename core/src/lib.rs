@@ -15,6 +15,7 @@ pub mod openmpt;
 pub mod osc;
 pub mod quint;
 pub mod scanmask;
+pub mod schrittweite;
 pub mod session;
 pub mod takte;
 pub mod transformation;

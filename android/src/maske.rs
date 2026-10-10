@@ -1,21 +1,37 @@
-//! Takt-Maske: Tastenfeld, jeder Tastendruck ein Schritt.
+//! Takt-Maske: Tastenfeld, jeder Tastendruck ein Zeitabstand.
 //!
-//! Tippen auf eine Taste belegt den nächsten Schritt. Ein Wisch zählt **nur**
-//! die Taste, bei der er anfängt, und die, bei der er aufhört. Eine gehaltene
-//! Taste plus eine zweite ergibt zwei Schritte hintereinander (jeder neu
-//! aufgesetzte Finger ist ein Tastendruck).
+//! Der Tab macht **nur Zeitabstaende**. Was hier aufgezeichnet wird, geht an den
+//! Bild-Scan und wird wie `KeyEventRender.txt` auf die X-Aufloesung des Bilds
+//! gemappt (gruener Balken ueber dem Bild). Noten kommen aus dem Rhythmus-Tab.
 //!
-//! Zwei Feldarten:
-//! - **Je Wert**: eine Taste je Wert, 0..=wert_max (z.B. 0..128 = 129 Tasten);
-//!   die Spaltenzahl bestimmt die Anordnung.
-//! - **Verteilt**: festes Feld (Spalten x Reihen), die Werte gleichmäßig von
-//!   0 (Pause) bis wert_max verteilt.
+//! Getippt wird mit dem Finger: Aufsetzen = erster Zeitpunkt, Loslassen = der
+//! letzte. Ein Wisch ueber mehrere Felder zaehlt beide Felder als zwei
+//! Zeitpunkte mit dem Abstand dazwischen; die Felder dazwischen sind nur
+//! Durchgang.
+//!
+//! Der Feldwert ist das **Indexnum** (Unterteilungen je Schritt, wie im
+//! pattern_recorder): die Schrittbreite des Abschnitts ist `1/Indexnum`, also
+//! ein kleines Feld = breiter Schritt. Zwischen zwei Feldern mit
+//! unterschiedlichem Wert entsteht daraus eine Rampe (Kern
+//! `schrittweite::timestamps`); die Wischgeschwindigkeit moduliert deren
+//! Krümmung.
 
 use eframe::egui::{self, Color32, RichText};
-use jamcore::grid::{Note, Pattern};
+use jamcore::grid::Pattern;
 use log::info;
 
 use crate::touch::Mehrfinger;
+
+/// Unter- und Obergrenze des Zoom vom Tastenfeld (Prozent, wie im Bild-Tab).
+pub const ZOOM_MIN: f32 = 0.2;
+/// Siehe [`ZOOM_MIN`].
+pub const ZOOM_MAX: f32 = 4.0;
+
+/// Hoechste Dauer einer Geste, die noch als Wisch im Feld gilt. Ein Scroll
+/// ueber die Seite dauert laenger; ein gezielter Wisch ist schnell. Ohne diese
+/// Grenze wuerde jeder Scroll durch das (fast bildschirmfüllende) Feld als
+/// Schrittweiten-Wisch gezählt.
+pub const WISCH_MAX_SEKUNDEN: f32 = 0.45;
 
 /// Regenbogenfarbe fuer den Touch-Verlauf (0.0 = rot, 1.0 = violett).
 fn regenbogen(anteil: f32) -> Color32 {
@@ -30,6 +46,16 @@ pub enum Feldart {
     Verteilt,
 }
 
+/// Ein aufgezeichneter Feldruck: der Feldwert als Indexnum, der Zeitpunkt
+/// relativ zum ersten Druck und das Geschwindigkeitsprofil des Wischs (Wege je
+/// Frame, leer bei einem blossen Tipp).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Aufzeichnung {
+    pub zeit: f32,
+    pub indexnum: f32,
+    pub tempo: Vec<f32>,
+}
+
 pub struct MaskePanel {
     feldart: Feldart,
     spalten: usize,
@@ -38,17 +64,30 @@ pub struct MaskePanel {
     status: String,
     /// Getastete Felder in Druckreihenfolge (Index und Mitte) fuer den Regenbogen.
     spur: Vec<(usize, egui::Pos2)>,
-    /// Der zuletzt gesetzte Schritt, damit „Taste halten + andere" den
-    /// **nächsten** Schritt belegt.
-    naechster_schritt: u16,
-    /// Mehrfinger: jeder neu aufgesetzte Finger ist ein weiterer Tastendruck.
+    /// Mehrfinger: jeder neu aufgesetzte Finger ist ein weiterer Zeitpunkt.
     finger: Mehrfinger,
     /// Erst- und Endtaste je Finger (Fingernummer -> (Start, Ende)).
     wisch: std::collections::HashMap<u64, (Option<usize>, Option<usize>)>,
-    /// Tastendruecke dieses Bildes (Reihenfolge), ausgeleert von
-    /// [`MaskePanel::presse_entnehmen`]. Der Bild-Scan zaehlt daraus seine
-    /// Tippfolge: so wird aus dem Feldtippen die Maske (wie KeyEventRender.txt).
-    presse: Vec<usize>,
+    /// Aufgezeichnete Folge (Zeitabstaende) — das, was der Bild-Scan mapped.
+    folge: Vec<Aufzeichnung>,
+    /// Nach „Ende" ist die Folge festgehalten: ein weiterer Felddruck darf sie
+    /// nicht wegschmeissen. Erst „neu" (oder „leeren") nimmt wieder auf.
+    fest: bool,
+    /// Zeitpunkt des ersten Drucks als Anker (wie der C++-Recorder: der Timer
+    /// startet beim ersten Tastendruck, alles weitere ist relativ dazu).
+    anker: Option<std::time::Instant>,
+    /// Wischweg je Frame je Finger, fuer die Krümmungs-Modulation.
+    wege: std::collections::HashMap<u64, Vec<f32>>,
+    /// Letzte Position und Zeit je Finger, um den Weg je Frame zu messen.
+    spurpunkt: std::collections::HashMap<u64, (egui::Pos2, std::time::Instant)>,
+    /// Aufsetzzeit je Finger, um Scrollen von einem Wisch zu unterscheiden.
+    gestedauer: std::collections::HashMap<u64, std::time::Instant>,
+    /// Zoom des Tastenfelds in Prozent (20..400), wie im Bild-Tab.
+    zoom: f32,
+    /// Verschiebung des Tastenfelds in Punkten.
+    pan: egui::Vec2,
+    /// Bildschirmgrenze des Fensters (für Zoom um die Fingerposition).
+    sichtbar: egui::Rect,
 }
 
 impl Default for MaskePanel {
@@ -64,19 +103,64 @@ impl MaskePanel {
             spalten: 8,
             reihen: 4,
             wert_max: 32,
-            status: "Taste tippen = nächster Schritt; halten + andere Taste = danach.".to_string(),
+            status: "Feld tippen: Zeitabstaende aufzeichnen; wischen = Schrittweite.".to_string(),
             spur: Vec::new(),
-            naechster_schritt: 0,
             finger: Mehrfinger::neu(),
             wisch: std::collections::HashMap::new(),
-            presse: Vec::new(),
+            folge: Vec::new(),
+            fest: false,
+            anker: None,
+            wege: std::collections::HashMap::new(),
+            spurpunkt: std::collections::HashMap::new(),
+            gestedauer: std::collections::HashMap::new(),
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
+            sichtbar: egui::Rect::NOTHING,
         }
     }
 
-    /// Die seit dem letzten Aufruf gedrueckten Tasten (Index je Druck), in
-    /// Druckreihenfolge. Der Aufrufer zaehlt daraus die Tippfolge.
-    pub fn presse_entnehmen(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.presse)
+    /// Die aufgezeichnete Folge (Zeitabstaende) fuer den Bild-Scan.
+    pub fn folge(&self) -> &[Aufzeichnung] {
+        &self.folge
+    }
+
+    /// Laufende Aufnahme? Der Bild-Scan zeigt nur waehrenddessen live mit.
+    pub fn laeuft(&self) -> bool {
+        self.anker.is_some()
+    }
+
+    /// Folge verwerfen und wieder aufnehmen. Ohne Ende-Knopf ist das der Weg
+    /// aus einer festgehaltenen Folge heraus: der naechste Felddruck beginnt
+    /// sonst sofort eine neue und die alte waere weg.
+    pub fn neu(&mut self) {
+        self.folge.clear();
+        self.spur.clear();
+        self.fest = false;
+        self.anker = None;
+        self.status = "neu — Feld tippen nimmt auf".to_string();
+        info!("Maske: neu");
+    }
+
+    /// Die Zeit seit dem ersten Druck (Anker). Der erste Druck setzt ihn, wie
+    /// beim C++-Recorder, wo der Timer beim ersten Tastendruck startet.
+    fn zeit_seit_anker(&self) -> f32 {
+        self.anker.map(|a| a.elapsed().as_secs_f32()).unwrap_or(0.0)
+    }
+
+    /// Einen Feldruck aufnehmen: Feldwert als Indexnum, Zeit und (beim Wisch)
+    /// das Geschwindigkeitsprofil.
+    fn druck_aufnehmen(&mut self, taste: usize, pos: egui::Pos2, tempo: Vec<f32>) {
+        let zeit = self.zeit_seit_anker();
+        let indexnum = self.wert_der_taste(taste) as f32;
+        self.spur.push((taste, pos));
+        info!("feld {} (indexnum {indexnum}) bei {zeit:.2}s", taste + 1);
+        self.folge.push(Aufzeichnung {
+            zeit,
+            indexnum,
+            tempo,
+        });
+        let anzahl = self.folge.len();
+        self.status = format!("{anzahl} Zeitpunkte, {zeit:.1} s");
     }
 
     fn tasten_anzahl(&self) -> usize {
@@ -109,7 +193,8 @@ impl MaskePanel {
     }
 
     /// Taste unter einer Position im Feld (None außerhalb).
-    /// Mitte einer Taste im Feld.
+    /// Mitte einer Taste im Feld. Rechnet ueber den Sichtbereich, damit beim
+    /// Zoom die richtige Zelle trifft.
     fn zentrum(&self, rect: egui::Rect, index: usize) -> egui::Pos2 {
         let reihen = self.reihen();
         let zell_w = rect.width() / self.spalten.max(1) as f32;
@@ -137,36 +222,16 @@ impl MaskePanel {
         (index < self.tasten_anzahl()).then_some(index)
     }
 
-    /// Setzt einen Schritt mit dem Wert der Taste und rückt den Schrittzähler vor.
-    fn druck_schritt(&mut self, taste: usize, pos: egui::Pos2, pattern: &mut Pattern) {
-        let wert = self.wert_der_taste(taste);
-        let schritt = self.naechster_schritt % pattern.steps_per_cycle().max(1);
-        self.naechster_schritt = self.naechster_schritt.wrapping_add(1);
-        self.spur.push((taste, pos));
-        if wert > 0 {
-            pattern.insert(Note {
-                step: schritt,
-                instrument: 0,
-                pitch: wert,
-                glide: false,
-            });
-            info!(
-                "druck: taste {} -> schritt {} (wert {wert})",
-                taste + 1,
-                schritt + 1
-            );
-            self.status = format!(
-                "Taste {} -> Schritt {} (Wert {wert})",
-                taste + 1,
-                schritt + 1
-            );
-        } else {
-            info!(
-                "druck: taste {} -> schritt {} (pause)",
-                taste + 1,
-                schritt + 1
-            );
-            self.status = format!("Taste {} ist Pause (Schritt {}).", taste + 1, schritt + 1);
+    /// Den Wischweg je Frame messen: pro Frame der Abstand des Fingers,
+    /// normiert auf die Zeit — daraus wird die Krümmungs-Modulation.
+    fn weg_messen(&mut self, id: u64, pos: egui::Pos2) {
+        let jetzt = std::time::Instant::now();
+        if let Some((vorher, zeit)) = self.spurpunkt.insert(id, (pos, jetzt)) {
+            let dt = jetzt.duration_since(zeit).as_secs_f32();
+            if dt > 1e-4 {
+                let weg = (pos - vorher).length();
+                self.wege.entry(id).or_default().push(weg / dt);
+            }
         }
     }
 
@@ -187,8 +252,11 @@ impl MaskePanel {
                 self.feldart = Feldart::Verteilt;
             }
             if ui.button("leeren").clicked() {
-                pattern.clear();
-                self.status = "Raster geleert.".to_string();
+                self.folge.clear();
+                self.spur.clear();
+                self.fest = false;
+                self.anker = None;
+                self.status = "Aufzeichnung geleert.".to_string();
             }
         });
         ui.horizontal(|ui| {
@@ -229,13 +297,46 @@ impl MaskePanel {
             .color(Color32::GRAY),
         );
 
+        // Die Touch-Ereignisse zuerst auswerten: die Geste (Pinch/Pan) braucht das
+        // Ergebnis vor dem Zeichnen, und die Aufzeichnung nutzt dieselben
+        // Fingerdaten.
+        let rahmen = self.finger.schritt(ui);
+
         // Das Tastenfeld: ein Painter fürs Ganze (so kommen die Wischproben mit).
+        // Pinch (zwei Finger) zoomt das Feld, drei Finger schieben es — wie im
+        // Bild-Tab. Der Sichtbereich wandert mit, damit die Felder unter den
+        // Fingern bleiben.
+        let mut pan_versatz = self.pan;
+        if let Some((zoomfaktor, weg)) = rahmen.geste {
+            self.zoom = (self.zoom * zoomfaktor).clamp(ZOOM_MIN, ZOOM_MAX);
+            pan_versatz += egui::vec2(weg.0, weg.1);
+        }
+        // Verschiebung merken, sonst waere der Pan nach jedem Frame weg.
+        self.pan = pan_versatz;
+
+        // Der Sichtbereich: normalerweise das ganze Feld, bei Zoom/Schieben ein
+        // Ausschnitt. Alles Zeichnen rechnet ueber `sichtbar`.
         let breite = ui.available_width();
         let reihen = self.reihen();
         let hoehe = (breite * reihen as f32 / self.spalten.max(1) as f32).min(430.0);
+        // Zoom und Verschiebung uebernehmen (der Wert wird weiter unten beim
+        // Anzeigen gebraucht).
         let (response, painter) =
             ui.allocate_painter(egui::vec2(breite, hoehe), egui::Sense::click_and_drag());
-        let rect = response.rect;
+        let ganzes = response.rect;
+        let sichtbar = if self.zoom > 1.0 || pan_versatz.length() > 0.1 {
+            let skaliert =
+                egui::Rect::from_min_size(ganzes.min + pan_versatz, ganzes.size() / self.zoom);
+            // Nicht aus dem Bild laufen lassen.
+            egui::Rect::from_min_max(
+                skaliert.min.clamp(ganzes.min, ganzes.max),
+                skaliert.max.clamp(ganzes.min, ganzes.max),
+            )
+        } else {
+            ganzes
+        };
+        self.sichtbar = sichtbar;
+        let rect = sichtbar;
         let zell_w = rect.width() / self.spalten.max(1) as f32;
         let zell_h = rect.height() / reihen.max(1) as f32;
         let schrift = (zell_h * 0.45).clamp(9.0, 14.0);
@@ -292,54 +393,83 @@ impl MaskePanel {
             );
         }
 
-        // Alles laeuft ueber die Touch-Ereignisse: so zaehlt ein Finger genau einmal.
-        // Aufsetzen = erster Schritt, Loslassen = der Schritt, bei dem der Wisch
-        // endet. Damit ist „Taste halten und eine andere druecken" automatisch
-        // „naechster Schritt".
-        let rahmen = self.finger.schritt(ui);
+        // Alles laeuft ueber die Touch-Ereignisse: so zaehlt ein Finger genau
+        // einmal. Aufsetzen = erster Zeitpunkt, Loslassen = der letzte. Ein
+        // Die Aufzeichnung selbst: Aufsetzen = erster Zeitpunkt, Loslassen =
+        // letzter; ein Wisch ueber mehrere Felder zaehlt Anfangs- und
+        // Endtaste als zwei Zeitpunkte mit dem Abstand dazwischen.
         for (id, pos) in rahmen.starts {
+            // Solange die Folge festgehalten ist (nach „Ende“ oder „leeren“),
+            // zeichnet ein Felddruck nichts auf — sonst waere die festgehaltene
+            // Folge beim naechsten Tippen weg.
+            if self.fest {
+                continue;
+            }
             let taste = self.taste_unter(rect, pos);
             self.wisch.insert(id, (taste, taste));
-            // Aufsetzen = erster Schritt, und genau dann faengt auch die
-            // Tippfolge an (der C++-Recorder startet seinen Timer beim ersten
-            // Tastendruck). Deshalb wird hier schon geschrieben und nicht erst
-            // beim Loslassen — sonst kaeme der erste Schritt zu spaet.
+            self.wege.entry(id).or_default();
+            self.gestedauer.insert(id, std::time::Instant::now());
+            self.spurpunkt.insert(id, (pos, std::time::Instant::now()));
+            // Der allererste Druckoeffnet die Aufnahme: der C++-Recorder
+            // startet seinen Timer beim ersten Tastendruck.
+            if self.anker.is_none() {
+                self.anker = Some(std::time::Instant::now());
+                self.folge.clear();
+                info!("Masken-Aufnahme durch ersten Tipp gestartet");
+            }
+            self.spur.clear();
             if let Some(taste) = taste {
-                self.spur.clear();
-                self.druck_schritt(taste, pos, pattern);
-                self.presse.push(taste);
+                self.druck_aufnehmen(taste, pos, Vec::new());
             }
         }
         for (id, pos) in rahmen.zuege {
+            self.weg_messen(id, pos);
             let treffer = self.taste_unter(rect, pos);
             if let Some(gespeichert) = self.wisch.get_mut(&id) {
                 gespeichert.1 = treffer.or(gespeichert.1);
             }
         }
         for (id, _) in rahmen.endes {
+            let tempo = self.wege.remove(&id).unwrap_or_default();
+            self.spurpunkt.remove(&id);
+            // Scrollen und Wischen sind dieselbe Geste. Entscheidend ist die
+            // Dauer: ein Scroll ueber die Seite dauert laenger als
+            // `WISCH_MAX_SEKUNDEN`, ein gezielter Wisch im Feld ist kurz.
+            let dauer = self
+                .gestedauer
+                .remove(&id)
+                .map(|start| start.elapsed().as_secs_f32())
+                .unwrap_or(0.0);
+            let gescrollt = dauer > WISCH_MAX_SEKUNDEN;
+            if gescrollt {
+                self.wisch.remove(&id);
+                continue;
+            }
             let Some((start, ende)) = self.wisch.remove(&id) else {
                 continue;
             };
             let Some(start) = start else {
                 continue;
             };
-            // Der Wisch zaehlt als zweiter Schritt nur, wenn er wirklich
-            // gewandert ist; ein Tippen auf dieselbe Taste bleibt ein Schritt.
+            // Der Wisch zaehlt als zweiter Zeitpunkt nur, wenn er wirklich
+            // gewandert ist; ein Tippen auf dieselbe Taste bleibt einer.
             let gewandert = ende.filter(|ende| *ende != start);
             if let Some(ende) = gewandert {
                 let pos = self.zentrum(rect, ende);
-                self.druck_schritt(ende, pos, pattern);
-                self.presse.push(ende);
+                self.druck_aufnehmen(ende, pos, tempo);
             }
         }
 
-        // Schrittanzeige: die gesetzten Schritte mit ihrem Wert.
-        let schritte = pattern.steps_per_cycle().max(2);
-        if !pattern.is_empty() {
+        // Zeitabstaende auf dem Raster der Patternlaenge (kein 16er-Raster: es
+        // zaehlt derselbe Wert wie im Rhythmus-Tab). Der aufgezeichnete Weg
+        // liegt als Linie darauf, die Zeitpunkte als Punkte mit ihrem Feldwert
+        // und — wichtig — dem Abstand zum vorherigen in Sekunden.
+        let schritte = pattern.steps_per_cycle().max(2) as usize;
+        if !self.folge.is_empty() {
             let (leiste, painter) =
-                ui.allocate_painter(egui::vec2(breite, 44.0), egui::Sense::hover());
+                ui.allocate_painter(egui::vec2(breite, 58.0), egui::Sense::hover());
             let rect = leiste.rect;
-            let mitte = rect.center().y + 6.0;
+            let mitte = rect.center().y + 4.0;
             painter.line_segment(
                 [
                     egui::pos2(rect.left(), mitte),
@@ -354,29 +484,69 @@ impl MaskePanel {
                     egui::Stroke::new(1.0, Color32::from_rgb(70, 70, 78)),
                 );
             }
-            for note in pattern.notes() {
-                let x = rect.left() + rect.width() * note.step as f32 / (schritte - 1) as f32;
-                painter.circle_filled(egui::pos2(x, mitte), 6.0, Color32::from_rgb(90, 200, 255));
+            let erste = self.folge[0].zeit.max(1e-4);
+            let spanne = (self.folge[self.folge.len() - 1].zeit - erste).max(1e-4);
+            let mut vorher: Option<egui::Pos2> = None;
+            for a in &self.folge {
+                let anteil = ((a.zeit - erste) / spanne).clamp(0.0, 1.0);
+                let x = rect.left() + rect.width() * anteil;
+                let p = egui::pos2(x, mitte);
+                if let Some(v) = vorher {
+                    // Die Zeitabstaende sind das, worum es geht: die Linie
+                    // dazwischen zeigt ihren Laengenunterschied.
+                    painter.line_segment(
+                        [v, p],
+                        egui::Stroke::new(2.0, Color32::from_rgb(90, 200, 255)),
+                    );
+                }
+                painter.circle_filled(p, 5.0, Color32::from_rgb(120, 230, 160));
+                // Feldwert ueber dem Punkt, Abstand zum vorherigen darunter.
                 painter.text(
-                    egui::pos2(x, mitte - 16.0),
+                    egui::pos2(x, mitte - 14.0),
                     egui::Align2::CENTER_CENTER,
-                    format!("{}", note.pitch),
+                    format!("{}", a.indexnum as i32),
                     egui::FontId::proportional(10.0),
                     Color32::from_rgb(225, 225, 230),
+                );
+                vorher = Some(p);
+            }
+            // Die Abstaende als Text: bei gedrueckter Breite zaehlt die Zahl
+            // mehr als die Zeichnung.
+            let abstaende: Vec<String> = self
+                .folge
+                .windows(2)
+                .map(|w| format!("{:.2}", w[1].zeit - w[0].zeit))
+                .collect();
+            if !abstaende.is_empty() {
+                painter.text(
+                    egui::pos2(rect.center().x, rect.bottom() - 2.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    format!("Abstand: {} s", abstaende.join(" / ")),
+                    egui::FontId::proportional(10.0),
+                    Color32::from_rgb(160, 160, 170),
                 );
             }
         }
 
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
-        ui.label(format!(
-            "Nächster Schritt: {}",
-            self.naechster_schritt.wrapping_add(1)
-        ));
+        // Zoom wie im Bild-Tab: zwei Finger, 20 bis 400 Prozent.
+        ui.horizontal(|ui| {
+            ui.label(format!("Zoom {:.0} %", self.zoom * 100.0));
+            if (self.zoom - 1.0).abs() > 0.01 {
+                if ui.button("Zoom weg").clicked() {
+                    self.zoom = 1.0;
+                    self.pan = egui::Vec2::ZERO;
+                }
+            }
+        });
+        ui.label(format!("Zeitpunkte: {}", self.folge.len()));
         ui.label(
             RichText::new(
-                "Jede Taste belegt den nächsten Schritt. Ein Wisch zählt nur die Taste, \
-                 bei der er anfängt, und die, bei der er aufhört; eine gehaltene Taste \
-                 plus eine zweite ergibt zwei Schritte hintereinander.",
+                "Der Feldwert ist das Indexnum (Unterteilungen je Schritt): die \
+                 Schrittbreite ist 1/Wert, ein kleines Feld also ein breiter \
+                 Schritt. Zwischen zwei verschiedenen Feldern entsteht daraus eine \
+                 Rampe; ein Wisch zählt als zwei Zeitpunkte mit dem Abstand \
+                 dazwischen. Der erste Druck beginnt die Aufnahme.",
             )
             .small()
             .color(Color32::DARK_GRAY),

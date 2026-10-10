@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Grid, RichText, Sense};
-use jamcore::grid::{note_name, Note, Pattern, STEPS_PER_CYCLE as STEP_COUNT};
+use jamcore::grid::{note_name, Note, Pattern, MAX_STEPS_PER_CYCLE, STEPS_PER_CYCLE as STEP_COUNT};
 use jamcore::osc::{OscOut, Renoise, DEFAULT_BASE_PORT};
 use jamcore::transformation;
 use log::info;
@@ -558,9 +558,13 @@ impl RhythmPanel {
             ui.allocate_painter(egui::vec2(breite, hoehe), egui::Sense::hover());
         let rect = response.rect;
         let grau = Color32::from_rgb(60, 60, 66);
-        // Rasterlinien alle vier Schritte.
-        for s in (0..=STEP_COUNT).step_by(4) {
-            let x = rect.left() + breite * s as f32 / STEP_COUNT as f32;
+        // Die Rasterweite ist die gewaehlte Patternlaenge, nicht die Vorgabe 16.
+        let schritte = self.pattern().steps_per_cycle().max(1) as f32;
+        // Rasterlinien: bei langer Patternlaenge engere Staerke, sonst waeren
+        // 128 Linien nur noch ein Grauschmier.
+        let linien_abstand = ((schritte / 16.0).round() as u32).max(1);
+        for s in (0..=schritte as u32).step_by(linien_abstand as usize) {
+            let x = rect.left() + breite * s as f32 / schritte;
             painter.line_segment(
                 [pos2(x, rect.top()), pos2(x, rect.bottom())],
                 Stroke::new(1.0, grau),
@@ -572,13 +576,13 @@ impl RhythmPanel {
                 .fold((127, 0), |(mn, mx), (_, p, _)| (mn.min(*p), mx.max(*p)));
             let spanne = (max_p - min_p).max(1) as f32;
             for (step, pitch, _) in &noten {
-                let x = rect.left() + breite * *step as f32 / STEP_COUNT as f32;
+                let x = rect.left() + breite * *step as f32 / schritte;
                 let y = rect.bottom() - (*pitch - min_p) as f32 / spanne * (hoehe - 16.0) - 8.0;
                 painter.circle_filled(pos2(x, y), 5.0, Color32::from_rgb(90, 200, 120));
             }
         }
         // Abspielposition.
-        let x = rect.left() + breite * self.current_step as f32 / STEP_COUNT as f32;
+        let x = rect.left() + breite * self.current_step as f32 / schritte;
         painter.line_segment(
             [pos2(x, rect.top()), pos2(x, rect.bottom())],
             Stroke::new(2.0, Color32::from_rgb(245, 245, 255)),
@@ -590,7 +594,8 @@ impl RhythmPanel {
         // Aufnahme: der Tipp landet auf dem gerade laufenden Schritt (wie
         // die Recorder-Tasten im Desktop), nicht auf der angefassten Zelle.
         if self.aufnahme && self.render_laeuft {
-            let ziel = self.render_schritt.load(Ordering::Relaxed) % STEP_COUNT;
+            let ziel = self.render_schritt.load(Ordering::Relaxed)
+                % self.pattern().steps_per_cycle().max(1);
             if !self.pattern_mut().has_at(ziel, pitch) {
                 let instrument = self.instrument;
                 self.pattern_mut().insert(Note {
@@ -828,6 +833,23 @@ impl RhythmPanel {
                 self.interpolieren();
             }
             ui.separator();
+            // Patternlaenge 1..128. Das Raster darunter, das Abspielen und der
+            // Maske-Tab (dessen Zeitabstaende) lesen dieselbe Zahl.
+            ui.horizontal(|ui| {
+                ui.label("Laenge");
+                let mut laenge = self.pattern().steps_per_cycle() as i32;
+                if ui
+                    .add(egui::DragValue::new(&mut laenge).range(1..=MAX_STEPS_PER_CYCLE as i32))
+                    .changed()
+                {
+                    self.pattern_mut().set_steps_per_cycle(laenge as u16);
+                    self.status = format!("Patternlaenge: {laenge} Schritte");
+                }
+                if ui.button("16").clicked() {
+                    self.pattern_mut().set_steps_per_cycle(STEP_COUNT);
+                    self.status = "Patternlaenge: 16 Schritte".to_string();
+                }
+            });
             ui.label("Bereich");
             ui.add(egui::DragValue::new(&mut self.bereich_von).range(0..=STEP_COUNT - 1));
             ui.add(egui::DragValue::new(&mut self.bereich_bis).range(0..=STEP_COUNT - 1));
@@ -925,8 +947,14 @@ impl RhythmPanel {
             } else if ui.button("Rendern").clicked() {
                 self.rendern_starten();
             }
-            ui.label("BPM");
-            ui.add(egui::Slider::new(&mut self.render_bpm, 40.0..=220.0));
+            // Kein eigener Regler: `set_tempo` schreibt das Rendertempo jeden
+            // Frame aus dem App-Tempo (OSC-Tab „Tempo“), ein Slider hier waere
+            // wirkungslos — er zeigte nur einen Wert, den man nicht aendern
+            // kann. Also nur anzeigen, woher er kommt.
+            ui.label(
+                RichText::new(format!("{:.0} BPM (folgt App-Tempo)", self.render_bpm))
+                    .color(Color32::GRAY),
+            );
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.transport_mit, "Transport");
