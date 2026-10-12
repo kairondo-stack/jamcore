@@ -53,6 +53,7 @@ impl Entry {
         if let Some(video) = &self.video {
             s += &format!("video={video}\n");
         }
+        s += &format!("laenge={}\n", self.noten.steps_per_cycle());
         s += "noten:\n";
         s += &self.noten.to_csv();
         s
@@ -70,6 +71,9 @@ impl Entry {
         let mut bpm = None;
         let mut notiz = String::new();
         let mut video = None;
+        // Aeltere Dateien haben kein `laenge=`; sie stammen aus dem
+        // 16er-Raster, also gilt fuer sie 16.
+        let mut laenge: u16 = 16;
         let mut noten_text = String::new();
         let mut bei_noten = false;
         for zeile in zeilen {
@@ -97,6 +101,7 @@ impl Entry {
                 }
                 "notiz" => notiz = wert.replace("\\n", "\n"),
                 "video" => video = Some(wert.to_string()),
+                "laenge" => laenge = wert.trim().parse().map_err(|e| format!("laenge: {e}"))?,
                 anderes => return Err(format!("unbekannter Schlüssel: {anderes:?}")),
             }
         }
@@ -109,7 +114,7 @@ impl Entry {
             bpm,
             notiz,
             video,
-            noten: Pattern::from_csv(&noten_text, crate::grid::STEPS_PER_CYCLE)?,
+            noten: Pattern::from_csv(&noten_text, laenge)?,
         })
     }
 }
@@ -148,6 +153,8 @@ mod tests {
 
     fn beispiel() -> Entry {
         let mut e = Entry::neu(1_791_000_000, "Zug-Skizze");
+        // 16 Schritte: der Test prueft die konkreten Desktop-Zeitstempel.
+        e.noten = Pattern::with_steps(16);
         e.bpm = Some(120.5);
         e.notiz = "erste Idee\nzweite Zeile".to_string();
         e.noten.insert(Note {
@@ -180,6 +187,19 @@ mod tests {
         assert!(text.contains("video=demo.mp4"), "{text}");
         let gelesen = Entry::from_text(&text).expect("lesbar");
         assert_eq!(gelesen.video.as_deref(), Some("demo.mp4"));
+        assert_eq!(gelesen, e);
+    }
+
+    #[test]
+    fn tagebuch_haelt_die_patternlaenge() {
+        // Die Noten stehen als normierte Zeitstempel im Text; ohne die Laenge
+        // kaeme eine 200er-Folge als 512er-Pattern zurueck und alle Schritte
+        // laegen woanders.
+        let mut e = beispiel();
+        e.noten = Pattern::with_steps(200);
+        e.noten.toggle(50, 60);
+        let gelesen = Entry::from_text(&e.to_text()).expect("lesbar");
+        assert_eq!(gelesen.noten.steps_per_cycle(), 200);
         assert_eq!(gelesen, e);
     }
 

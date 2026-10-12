@@ -407,8 +407,12 @@ impl JamApp {
 
     fn view_maske(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
+            // Scrollen nur ueber die Leiste: jede Geste im Feld ist ein Tipp
+            // oder ein Wisch (auch ein langsamer). Frueher entschied die
+            // Gestendauer, was ein Wisch ist — langsame Wische fielen weg
+            // (Vorgabe des Nutzers 2026-10-11).
             egui::ScrollArea::vertical()
-                .scroll_source(egui::scroll_area::ScrollSource::ALL)
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
                 .id_salt("maske_inhalt")
                 .show(ui, |ui| self.maske_bereich(ui));
         });
@@ -453,17 +457,21 @@ impl JamApp {
             );
         });
         self.maske.ui(ui, self.rhythm.pattern_mut());
-        // Die aufgezeichnete Folge in den Bild-Scan: erst die normale
-        // Schrittweiten-Rechnung, dann die Timestamps auf die X-Aufloesung.
+        // Die aufgezeichnete Folge in den Bild-Scan: der Maske-Tab liefert die
+        // fertigen Zeitpunkte (Rampen + min/max-Regeln), der Bild-Tab legt
+        // sie auf die gemeinsame Patternlaenge.
         let staerke = self.maske_staerke;
-        let folge: Vec<(f32, f32, Vec<f32>)> = self
+        let zeiten = self.maske.zeiten();
+        let tempo: Vec<f32> = self
             .maske
             .folge()
             .iter()
-            .map(|a| (a.zeit, a.indexnum, a.tempo.clone()))
+            .flat_map(|a| a.tempo.iter().copied())
             .collect();
-        if !folge.is_empty() {
-            self.bild.maske_aus_folge(&folge, staerke);
+        if !zeiten.is_empty() {
+            let schritte = self.rhythm.pattern().steps_per_cycle();
+            self.bild
+                .maske_aus_zeiten(&zeiten, &tempo, staerke, schritte);
         }
     }
 
@@ -526,7 +534,9 @@ impl JamApp {
         let noten = self.rhythm.pattern().clone();
         // Der Bild-Export liegt zuklappbar **über** dem Tagebuch: darunter füllt
         // die Einträge-Liste die ganze Fläche, sonst wäre er unsichtbar.
-        let abschnitt = self.bild.abschnitt_pattern();
+        let abschnitt = self
+            .bild
+            .abschnitt_pattern(self.rhythm.pattern().steps_per_cycle());
         let abschnitt_schritte = self.bild.schritte();
         egui::Panel::top("tagebuch_bild_pattern").show(ui, |ui| {
             egui::CollapsingHeader::new("Bild-Pattern (Start/Ende aus dem Bild-Tab)")

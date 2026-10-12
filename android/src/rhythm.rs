@@ -286,7 +286,7 @@ impl RhythmPanel {
 
     /// Schritt aus dem laufenden Modul (Follow-Modus).
     pub fn set_follow_step(&mut self, step: u16) {
-        self.current_step = step % STEP_COUNT;
+        self.current_step = step % self.pattern().steps_per_cycle().max(1);
     }
 
     /// Eigene Uhr, wenn der Follow-Modus aus ist.
@@ -303,6 +303,9 @@ impl RhythmPanel {
             .iter()
             .map(|n| (n.step, n.pitch))
             .collect();
+        // Die Laenge des Zyklus fuer den Render-Thread: die gemeinsame
+        // Patternlaenge (frueher fest 16).
+        let schritte = self.pattern().steps_per_cycle().max(1);
         if noten.is_empty() {
             self.status = "Raster ist leer - nichts zu rendern.".to_string();
             return;
@@ -354,7 +357,7 @@ impl RhythmPanel {
                         }
                     }
                     schritt_c.store(i, Ordering::Relaxed);
-                    i = (i + 1) % STEP_COUNT;
+                    i = (i + 1) % schritte;
                     // 16tel bei bpm: 60/bpm/4 Sekunden je Schritt.
                     let ziel = (60_000.0 / bpm / 4.0) as u64;
                     let rest = ziel.saturating_sub(start.elapsed().as_millis() as u64);
@@ -462,8 +465,9 @@ impl RhythmPanel {
 
     fn tick_own_clock(&mut self) {
         // Beim Rendern zeigt der Playhead die laufende Abspielposition.
+        let schritte = self.pattern().steps_per_cycle().max(1);
         if self.render_laeuft {
-            self.current_step = self.render_schritt.load(Ordering::Relaxed) % STEP_COUNT;
+            self.current_step = self.render_schritt.load(Ordering::Relaxed) % schritte;
             return;
         }
         if self.follow {
@@ -475,7 +479,7 @@ impl RhythmPanel {
         // sattigieren und die Uhr einfrieren.
         let steps = (beats * 4.0).max(0.0);
         self.current_step = if steps.is_finite() {
-            (steps as i64 % STEP_COUNT as i64) as u16
+            (steps as i64 % schritte as i64) as u16
         } else {
             0
         };
@@ -733,18 +737,20 @@ impl RhythmPanel {
         };
         let path = std::path::Path::new(&dir).join(format!("pattern {}.xml", self.slot));
         match std::fs::read_to_string(&path) {
-            Ok(content) => match Pattern::from_renoise_xml(&content, STEP_COUNT) {
-                Ok(loaded) => {
-                    *self.pattern_mut() = loaded;
-                    self.status = format!(
-                        "{} Noten aus {}",
-                        self.pattern().notes().len(),
-                        path.display()
-                    );
-                    info!("XML geladen: {}", path.display());
+            Ok(content) => {
+                match Pattern::from_renoise_xml(&content, self.pattern().steps_per_cycle()) {
+                    Ok(loaded) => {
+                        *self.pattern_mut() = loaded;
+                        self.status = format!(
+                            "{} Noten aus {}",
+                            self.pattern().notes().len(),
+                            path.display()
+                        );
+                        info!("XML geladen: {}", path.display());
+                    }
+                    Err(e) => self.status = format!("XML kaputt: {e}"),
                 }
-                Err(e) => self.status = format!("XML kaputt: {e}"),
-            },
+            }
             Err(e) => self.status = format!("XML fehlt: {e}"),
         }
     }
@@ -756,7 +762,7 @@ impl RhythmPanel {
         };
         let path = std::path::Path::new(&dir).join(format!("pattern {}.csv", self.slot));
         match std::fs::read_to_string(&path) {
-            Ok(content) => match Pattern::from_csv(&content, STEP_COUNT) {
+            Ok(content) => match Pattern::from_csv(&content, self.pattern().steps_per_cycle()) {
                 Ok(loaded) => {
                     *self.pattern_mut() = loaded;
                     self.status = format!(
@@ -859,13 +865,13 @@ impl RhythmPanel {
                     self.status = format!("Patternlaenge: {laenge} Schritte");
                 }
                 if ui.button("16").clicked() {
-                    self.pattern_mut().set_steps_per_cycle(STEP_COUNT);
+                    self.pattern_mut().set_steps_per_cycle(16);
                     self.status = "Patternlaenge: 16 Schritte".to_string();
                 }
             });
             ui.label("Bereich");
-            ui.add(egui::DragValue::new(&mut self.bereich_von).range(0..=STEP_COUNT - 1));
-            ui.add(egui::DragValue::new(&mut self.bereich_bis).range(0..=STEP_COUNT - 1));
+            ui.add(egui::DragValue::new(&mut self.bereich_von).range(0..=MAX_STEPS_PER_CYCLE - 1));
+            ui.add(egui::DragValue::new(&mut self.bereich_bis).range(0..=MAX_STEPS_PER_CYCLE - 1));
             if ui.button("löschen").clicked() {
                 self.bereich_loeschen_anwenden();
             }
@@ -915,7 +921,11 @@ impl RhythmPanel {
             .color(Color32::DARK_GRAY),
         );
         ui.horizontal(|ui| {
-            ui.label(format!("Schritt {}/{}", self.current_step + 1, STEP_COUNT));
+            ui.label(format!(
+                "Schritt {}/{}",
+                self.current_step + 1,
+                self.pattern().steps_per_cycle()
+            ));
             ui.label(format!("Noten: {}", self.pattern().notes().len()));
             if self.follow {
                 ui.label(RichText::new("Follow: Modul").strong());
@@ -993,7 +1003,8 @@ impl RhythmPanel {
                 self.noten_transformieren(|n| transformation::transponieren(n, 12));
             }
             if ui.button("Umkehren").clicked() {
-                self.noten_transformieren(transformation::umkehren);
+                let laenge = self.pattern().steps_per_cycle();
+                self.noten_transformieren(|noten| transformation::umkehren(noten, laenge));
             }
             if ui.button("Q2").clicked() {
                 self.noten_transformieren(|n| transformation::quantisieren(n, 2));
@@ -1037,17 +1048,29 @@ impl RhythmPanel {
             self.presenter_zeichnen(ui);
         }
 
-        // 16 Spalten passen nicht nebeneinander auf die Handy-Breite, deshalb
-        // zwei Bloecke a 8 Schritte mit grossen Zellen zum Tippen.
-        for block in 0..2 {
+        // Ein Block je 8 Schritte (16 passen nicht nebeneinander auf die
+        // Handy-Breite). Die Blockzahl folgt der **Patternlaenge**: bei der
+        // Vorgabe 512 sind das 64 Bloecke, die ScrollArea traegt sie. Vorher
+        // waren es fest zwei Bloecke (16 Schritte) — alles darueber war
+        // unsichtbar und damit nicht zu bearbeiten.
+        let schritte = self.pattern().steps_per_cycle().max(1);
+        let bloecke = schritte.div_ceil(BLOCK);
+        for block in 0..bloecke {
             Grid::new(format!("rhythm_block{block}"))
                 .spacing([2.0, 2.0])
                 .show(ui, |ui| {
-                    let titel = if block == 0 { "1-8" } else { "9-16" };
-                    ui.label(RichText::new(titel).small().color(Color32::GRAY));
+                    let erster = block * BLOCK;
+                    let letzter = (erster + BLOCK).min(schritte);
+                    ui.label(
+                        RichText::new(format!("{}-{}", erster + 1, letzter))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
                     for i in 0..BLOCK {
                         let step = block * BLOCK + i;
-                        if i % 2 == 0 {
+                        if step >= schritte {
+                            _ = ui.allocate_painter(egui::vec2(CELL, 12.0), Sense::hover());
+                        } else if i % 2 == 0 {
                             ui.label(
                                 RichText::new(format!("{}", step + 1))
                                     .small()
@@ -1062,6 +1085,12 @@ impl RhythmPanel {
                         ui.label(RichText::new(note_name(pitch)).small());
                         for i in 0..BLOCK {
                             let step = block * BLOCK + i;
+                            if step >= schritte {
+                                // Laenge kein Vielfaches von 8: Restzelle leer,
+                                // aber gleiche Breite wie die anderen.
+                                _ = ui.allocate_painter(egui::vec2(CELL, CELL), Sense::hover());
+                                continue;
+                            }
                             let on = self.pattern().has_at(step, pitch);
                             let played = step == self.current_step;
                             let color = if on {

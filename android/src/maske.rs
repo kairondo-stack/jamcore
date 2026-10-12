@@ -22,23 +22,15 @@ use log::info;
 
 use crate::touch::Mehrfinger;
 
-/// Ab dieser Pause zwischen zwei Felddruecken beginnt die Aufnahme neu.
-/// Also: schneller als dieser Abstand gehoert die Folge zusammen, langsamer
-/// beginnt eine neue. Ohne diese Grenze lief die Aufnahme die ganze Sitzung
-/// durch — der erste Tipp kam dann bei den Sekunden seit dem App-Start an
-/// (gemessen 548 s) statt bei 0.
-pub const NEU_AFTER_SEKUNDEN: f32 = 8.0;
+/// Ab dieser Pause zwischen zwei Felddruecken beginnt die Aufnahme neu. Die
+/// Zahl steht im Kern (`schrittweite::NEU_AFTER_SEKUNDEN`), weil die Regel
+/// `schrittweite::beginnt_aufnahme` dort getestet wird.
+pub use jamcore::schrittweite::NEU_AFTER_SEKUNDEN;
 
 /// Unter- und Obergrenze des Zoom vom Tastenfeld (Prozent, wie im Bild-Tab).
 pub const ZOOM_MIN: f32 = 0.2;
 /// Siehe [`ZOOM_MIN`].
 pub const ZOOM_MAX: f32 = 4.0;
-
-/// Hoechste Dauer einer Geste, die noch als Wisch im Feld gilt. Ein Scroll
-/// ueber die Seite dauert laenger; ein gezielter Wisch ist schnell. Ohne diese
-/// Grenze wuerde jeder Scroll durch das (fast bildschirmfüllende) Feld als
-/// Schrittweiten-Wisch gezählt.
-pub const WISCH_MAX_SEKUNDEN: f32 = 0.45;
 
 /// Regenbogenfarbe fuer den Touch-Verlauf (0.0 = rot, 1.0 = violett).
 fn regenbogen(anteil: f32) -> Color32 {
@@ -90,6 +82,11 @@ pub struct MaskePanel {
     /// Maske „Zeitpunkte: 0“, waehrend die Zwischenschritte nur beim Umrechnen
     /// auf die Bildspalen kurz auftauchten und wieder verschwanden.
     zwischenschritte: Vec<f32>,
+    /// Regel je Abschnitt (min/max Schritte aus der Zeitleiste); ohne Eintrag
+    /// gelten die Feldwerte der beiden Tipps.
+    regeln: Vec<Option<jamcore::schrittweite::Abschnitt>>,
+    /// In der Zeitleiste angetippter Abschnitt (Index des linken Tipps).
+    auswahl: Option<usize>,
     /// Nach „Ende" ist die Folge festgehalten: ein weiterer Felddruck darf sie
     /// nicht wegschmeissen. Erst „neu" (oder „leeren") nimmt wieder auf.
     fest: bool,
@@ -100,8 +97,6 @@ pub struct MaskePanel {
     wege: std::collections::HashMap<u64, Vec<f32>>,
     /// Letzte Position und Zeit je Finger, um den Weg je Frame zu messen.
     spurpunkt: std::collections::HashMap<u64, (egui::Pos2, std::time::Instant)>,
-    /// Aufsetzzeit je Finger, um Scrollen von einem Wisch zu unterscheiden.
-    gestedauer: std::collections::HashMap<u64, std::time::Instant>,
     /// Zoom des Tastenfelds in Prozent (20..400), wie im Bild-Tab.
     zoom: f32,
     /// Verschiebung des Tastenfelds in Punkten.
@@ -129,11 +124,12 @@ impl MaskePanel {
             wisch: std::collections::HashMap::new(),
             folge: Vec::new(),
             zwischenschritte: Vec::new(),
+            regeln: Vec::new(),
+            auswahl: None,
             fest: false,
             anker: None,
             wege: std::collections::HashMap::new(),
             spurpunkt: std::collections::HashMap::new(),
-            gestedauer: std::collections::HashMap::new(),
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             sichtbar: egui::Rect::NOTHING,
@@ -143,6 +139,14 @@ impl MaskePanel {
     /// Die aufgezeichnete Folge (Zeitabstaende) fuer den Bild-Scan.
     pub fn folge(&self) -> &[Aufzeichnung] {
         &self.folge
+    }
+
+    /// Die Zeitpunkte der Folge **mit** den Abschnitts-Regeln (min/max
+    /// Schritte aus der Zeitleiste). Der Bild-Tab baut daraus die Maske.
+    pub fn zeiten(&self) -> Vec<f32> {
+        let tipps: Vec<jamcore::schrittweite::Tipp> =
+            self.folge.iter().map(Aufzeichnung::als_tipp).collect();
+        jamcore::schrittweite::timestamps_mit_regeln(&tipps, &self.regeln)
     }
 
     /// Laufende Aufnahme? Der Bild-Scan zeigt nur waehrenddessen live mit.
@@ -156,6 +160,8 @@ impl MaskePanel {
     pub fn neu(&mut self) {
         self.folge.clear();
         self.spur.clear();
+        self.regeln.clear();
+        self.auswahl = None;
         self.fest = false;
         self.anker = None;
         self.status = "neu — Feld tippen nimmt auf".to_string();
@@ -182,14 +188,9 @@ impl MaskePanel {
         });
         // Die Zwischenschritte sofort ausklappen und ablegen, wie der
         // pattern_recorder es mit `notes4` tut (nicht erst beim Umrechnen auf
-        // die Bildspalten — sonst sind sie nach dem Bild-Tab weg).
-        self.zwischenschritte = jamcore::schrittweite::timestamps(
-            &self
-                .folge
-                .iter()
-                .map(Aufzeichnung::als_tipp)
-                .collect::<Vec<_>>(),
-        );
+        // die Bildspalten — sonst sind sie nach dem Bild-Tab weg). Die Regeln
+        // (min/max aus der Zeitleiste) gehen mit ein.
+        self.zwischenschritte = self.zeiten();
         let anzahl = self.folge.len();
         let gesamt = self.zwischenschritte.len();
         self.status = format!("{anzahl} Toene, {gesamt} Zeitpunkte, {zeit:.1} s");
@@ -293,6 +294,8 @@ impl MaskePanel {
             if ui.button("leeren").clicked() {
                 self.folge.clear();
                 self.zwischenschritte.clear();
+                self.regeln.clear();
+                self.auswahl = None;
                 self.spur.clear();
                 self.fest = false;
                 self.anker = None;
@@ -439,43 +442,45 @@ impl MaskePanel {
         // letzter; ein Wisch ueber mehrere Felder zaehlt Anfangs- und
         // Endtaste als zwei Zeitpunkte mit dem Abstand dazwischen.
         for (id, pos) in rahmen.starts {
-            // Solange die Folge festgehalten ist (nach „Ende“ oder „leeren“),
-            // zeichnet ein Felddruck nichts auf — sonst waere die festgehaltene
-            // Folge beim naechsten Tippen weg.
+            // Solange die Folge festgehalten ist (nach „leeren“), zeichnet ein
+            // Felddruck nichts auf — sonst waere die festgehaltene Folge beim
+            // naechsten Tippen weg.
             if self.fest {
                 continue;
             }
-            let taste = self.taste_unter(rect, pos);
-            self.wisch.insert(id, (taste, taste));
+            // Nur ein Druck, der wirklich ein Feld trifft, ist ueberhaupt ein
+            // Ton. Das Feld hat rechts neben der letzten Zeile leere Zellen:
+            // ein Druck dort loeschte sonst die Folge und setzte den Anker,
+            // ohne einen Ton zu liefern, und der naechste echte Tipp kam bei
+            // 1,70 s statt bei 0 an (gemessen 2026-10-10).
+            let Some(taste) = self.taste_unter(rect, pos) else {
+                continue;
+            };
+            self.wisch.insert(id, (Some(taste), Some(taste)));
             self.wege.entry(id).or_default();
-            self.gestedauer.insert(id, std::time::Instant::now());
             self.spurpunkt.insert(id, (pos, std::time::Instant::now()));
             // Der allererste Druckoeffnet die Aufnahme: der C++-Recorder
-            // startet seinen Timer beim ersten Tastendruck.
-            //
-            // Wichtig: ein **frischer** Tipp beginnt auch mitten in der Folge
-            // neu. Sonst lief die Aufnahme die ganze Sitzung durch (der Anker
-            // war gesetzt), jede Folge begann bei den Sekunden seit dem
-            // App-Start und die alte Folge blieb stehen — gemessen: der erste
-            // Tipp kam bei 548 s an statt bei 0.
-            let neu = match self.anker {
-                None => true,
-                Some(_) => {
-                    self.anker.map(|a| a.elapsed().as_secs_f32()).unwrap_or(0.0)
-                        > NEU_AFTER_SEKUNDEN
-                }
-            };
+            // startet seinen Timer beim ersten Tastendruck. Danach laeuft die
+            // Aufnahme weiter (es gibt kein Ende), bis die Pause
+            // `NEU_AFTER_SEKUNDEN` eine neue Folge beginnt — sonst haette der
+            // Anker aus der Vorsitzung (548 s) den ersten Tipp um 548 s
+            // verschoben.
+            let neu = jamcore::schrittweite::beginnt_aufnahme(
+                true,
+                self.anker.map(|a| a.elapsed().as_secs_f32()),
+                NEU_AFTER_SEKUNDEN,
+            );
             if neu {
                 self.anker = Some(std::time::Instant::now());
                 self.folge.clear();
                 self.zwischenschritte.clear();
+                self.regeln.clear();
+                self.auswahl = None;
                 self.spur.clear();
                 info!("Masken-Aufnahme durch ersten Tipp gestartet");
             }
             self.spur.clear();
-            if let Some(taste) = taste {
-                self.druck_aufnehmen(taste, pos, Vec::new());
-            }
+            self.druck_aufnehmen(taste, pos, Vec::new());
         }
         for (id, pos) in rahmen.zuege {
             self.weg_messen(id, pos);
@@ -487,19 +492,9 @@ impl MaskePanel {
         for (id, _) in rahmen.endes {
             let tempo = self.wege.remove(&id).unwrap_or_default();
             self.spurpunkt.remove(&id);
-            // Scrollen und Wischen sind dieselbe Geste. Entscheidend ist die
-            // Dauer: ein Scroll ueber die Seite dauert laenger als
-            // `WISCH_MAX_SEKUNDEN`, ein gezielter Wisch im Feld ist kurz.
-            let dauer = self
-                .gestedauer
-                .remove(&id)
-                .map(|start| start.elapsed().as_secs_f32())
-                .unwrap_or(0.0);
-            let gescrollt = dauer > WISCH_MAX_SEKUNDEN;
-            if gescrollt {
-                self.wisch.remove(&id);
-                continue;
-            }
+            // Keine Zeitgrenze: ein Wisch darf auch langsam sein, damit sich
+            // das Beschleunigungsverhalten fein aufzeichnen laesst. Gescrollt
+            // wird im Maske-Tab nur ueber die Leiste, Gesten gehoeren dem Feld.
             let Some((start, ende)) = self.wisch.remove(&id) else {
                 continue;
             };
@@ -522,7 +517,7 @@ impl MaskePanel {
         let schritte = pattern.steps_per_cycle().max(2) as usize;
         if !self.folge.is_empty() {
             let (leiste, painter) =
-                ui.allocate_painter(egui::vec2(breite, 58.0), egui::Sense::hover());
+                ui.allocate_painter(egui::vec2(breite, 58.0), egui::Sense::click());
             let rect = leiste.rect;
             let mitte = rect.center().y + 4.0;
             painter.line_segment(
@@ -546,6 +541,24 @@ impl MaskePanel {
             };
             let erste = punkte[0].max(1e-4);
             let spanne = (punkte[punkte.len() - 1] - erste).max(1e-4);
+            let x_von =
+                |z: f32| rect.left() + rect.width() * ((z - erste) / spanne).clamp(0.0, 1.0);
+            // Der angetippte Abschnitt liegt als heller Balken unter den
+            // Punkten: dort stellen die Regler darunter min/max ein.
+            if let Some(i) = self.auswahl {
+                if i + 1 < self.folge.len() {
+                    let x0 = x_von(self.folge[i].zeit);
+                    let x1 = x_von(self.folge[i + 1].zeit);
+                    painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x0, rect.top()),
+                            egui::pos2(x1, rect.bottom()),
+                        ),
+                        2.0,
+                        Color32::from_rgba_unmultiplied(90, 140, 220, 48),
+                    );
+                }
+            }
             let mut vorher: Option<egui::Pos2> = None;
             for (i, &z) in punkte.iter().enumerate() {
                 let anteil = ((z - erste) / spanne).clamp(0.0, 1.0);
@@ -599,6 +612,86 @@ impl MaskePanel {
                     Color32::from_rgb(160, 160, 170),
                 );
             }
+            // Antippen waehlt den Abschnitt (zwischen zwei Handdruecken), fuer
+            // den die min/max-Regler darunter gelten.
+            if leiste.clicked() {
+                if let Some(pos) = leiste.interact_pointer_pos() {
+                    let anteil = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                    let t = erste + anteil * spanne;
+                    let gewaehlt = (0..self.folge.len().saturating_sub(1))
+                        .find(|i| t >= self.folge[*i].zeit && t <= self.folge[*i + 1].zeit);
+                    self.auswahl = gewaehlt;
+                    if let Some(i) = gewaehlt {
+                        info!("Abschnitt {} gewaehlt (Zeitleiste)", i + 1);
+                    }
+                }
+            }
+        }
+
+        // Min/max Schritte des angetippten Abschnitts. Die Rampe laeuft dann
+        // von `min` nach `max`, statt die Feldwerte der beiden Tipps zu
+        // nehmen (Nutzerwunsch 2026-10-12).
+        if let Some(i) = self.auswahl {
+            if i + 1 < self.folge.len() {
+                let tipp_von = self.folge[i].indexnum;
+                let tipp_bis = self.folge[i + 1].indexnum;
+                let regel = self.regeln.get(i).copied().flatten();
+                let grenze = self.wert_max.max(1) as i32;
+                let mut von = regel
+                    .map(|r| r.von as i32)
+                    .unwrap_or(tipp_von as i32)
+                    .clamp(1, grenze);
+                let mut bis = regel
+                    .map(|r| r.bis as i32)
+                    .unwrap_or(tipp_bis as i32)
+                    .clamp(1, grenze);
+                ui.label(
+                    RichText::new(format!(
+                        "Abschnitt {} (Tipp {:.0} -> {:.0}{})",
+                        i + 1,
+                        tipp_von,
+                        tipp_bis,
+                        if regel.is_some() { ", Regel" } else { "" }
+                    ))
+                    .small()
+                    .color(Color32::GRAY),
+                );
+                let a = ui
+                    .horizontal(|ui| {
+                        ui.label("min");
+                        ui.add(egui::Slider::new(&mut von, 1..=grenze)).changed()
+                    })
+                    .inner;
+                let b = ui
+                    .horizontal(|ui| {
+                        ui.label("max");
+                        ui.add(egui::Slider::new(&mut bis, 1..=grenze)).changed()
+                    })
+                    .inner;
+                if a || b {
+                    if self.regeln.len() <= i {
+                        self.regeln.resize(i + 1, None);
+                    }
+                    self.regeln[i] = Some(jamcore::schrittweite::Abschnitt {
+                        von: von as f32,
+                        bis: bis as f32,
+                    });
+                    self.zwischenschritte = self.zeiten();
+                    self.status = format!("Abschnitt {}: min {von}, max {bis}", i + 1);
+                    info!("Abschnitt {}: min {von}, max {bis}", i + 1);
+                }
+                if regel.is_some() && ui.button("Regel weg").clicked() {
+                    self.regeln[i] = None;
+                    self.zwischenschritte = self.zeiten();
+                    self.status = format!("Abschnitt {}: Regel entfernt", i + 1);
+                }
+            }
+        } else if !self.folge.is_empty() {
+            ui.label(
+                RichText::new("Zeitleiste antippen: min/max Schritte für einen Abschnitt.")
+                    .small()
+                    .color(Color32::DARK_GRAY),
+            );
         }
 
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));

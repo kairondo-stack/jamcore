@@ -6,18 +6,24 @@
 //!
 //! ```text
 //! schrittwa = 1/startIndexnum      schrittwe = 1/endIndexnum
-//! kd        = laenge - basis * n   sumanz = n(n+1)/2   kdtanz = kd/sumanz
+//! erster Schritt = schrittwa       (C++: `näschritt += schrittwa`)
+//! Indexnumlaenge = laenge - schrittwa     (C++ `totalDi==1`)
+//! kd        = Indexnumlaenge - basis * n  sumanz = n(n+1)/2  kdtanz = kd/sumanz
 //! Breite(i) = schrittwe + (n-i+1)*kdtanz      (von breit nach schmal)
 //!          | schrittwa +  i      *kdtanz      (von schmal nach breit)
 //! ```
 //!
-//! (C++-Zeilen 2800–2846 und 2862–2889). Die Summenprobe: `sum(Breite) ==
-//! laenge`, die Rampe fuellt den Abschnitt also genau.
+//! (C++-Zeilen 2800–2846, 2862–2889 und 2943–2949). Die Summenprobe:
+//! `sum(Breite) == laenge`, die Rampe fuellt den Abschnitt also genau. Der
+//! **erste** Schritt ist dabei 1/startIndexnum selbst — ohne ihn waren alle
+//! Breiten fast gleich und von 1/4 war nichts mehr zu sehen (gemessen
+//! 2026-10-12).
 //!
 //! **Abweichungen vom Original, mit Grund:**
-//! - `laenge` ist die Länge des Abschnitts in Sekunden, nicht
-//!   `Indexnumlaenge` aus `kk`/`kl`/`kr` (Tasten `s`/`a`/`d`). Der C++ misst
-//!   dort am ganzen Loop; hier sind die Abschnitte kurz und frei gewaehlt.
+//! - `laenge` ist die Länge des Abschnitts in Sekunden; der C++ schaltet
+//!   zwischen `totalDi==1` (Dauer in Sekunden) und `totalDi==0` (Zyklus 0..1,
+//!   am Ende mit der Dauer skaliert) um. Beide Modi sind im Kern dieselbe
+//!   Form, die App nimmt immer den Sekunden-Modus.
 //! - `n = |endIndexnum - startIndexnum|`. Der C++ rechnet `(e-s)^2/(e-s)`,
 //!   also `e - s` mit Vorzeichen — bei „43 auf 23" ist das negativ und die
 //!   Schleife `for (i=1; i<=schrittweitanz; ++i)` laeuft nie, es entsteht kein
@@ -25,6 +31,12 @@
 //! - Es gibt nur eine Rampe, nicht den Mittelwert der linken und rechten
 //!   (C++ 2893–2898). Der Mittelwert verschiebt die Rampe um einen halben
 //!   Schritt und ist fuer die App nicht noetig.
+//! - Bei sehr kurzen Abschnitten koennen die Rohbreiten negativ werden (der
+//!   erste Schritt 1/von ist fast so lang wie der Abschnitt); dann wird
+//!   geklemmt und auf die Laenge skaliert.
+//! - Zusaetzlich [`Abschnitt`]-Regeln: in der App laesst sich ein Abschnitt in
+//!   der Zeitleiste antippen und mit min/max-Schritten ueberschreiben, ohne
+//!   die Feldwerte neu zu tippen.
 
 /// Ein Fingerdruck auf dem Masken-Feld: Zeit seit Aufnahmebeginn und der
 /// Feldwert als Indexnum (Unterteilungen je Schritt).
@@ -70,23 +82,40 @@ pub fn abschnitt_breiten(von: f32, bis: f32, laenge: f32) -> Vec<f32> {
     }
     let schrittwa = schrittweite(von);
     let schrittwe = schrittweite(bis);
+    // Der **erste** Schritt ist der Startwert selbst: der C++ setzt
+    // `näschritt += schrittwa` vor die Rampe, und die Rampe fuellt nur den
+    // Rest (`Indexnumlaenge = laenge - 1/startIndexnum`, Modus `totalDi==1`).
+    // Ohne diesen Schritt waren alle Breiten fast gleich und von 1/4 war
+    // nichts mehr zu sehen (gemessen 2026-10-12).
+    let indexnumlaenge = laenge - schrittwa;
     // Startet der Abschnitt breit (1/von > 1/bis), laeuft die Rampe von der
     // Endbreite herunter, sonst von der Anfangsbreite hinauf — genau die
     // beiden Zweige des C++.
     let fallend = schrittwa > schrittwe;
     let basis = if fallend { schrittwe } else { schrittwa };
-    let kd = laenge - basis * n as f32;
+    let kd = indexnumlaenge - basis * n as f32;
     let sumanz = (n * (n + 1)) / 2;
     let kdtanz = if sumanz == 0 { 0.0 } else { kd / sumanz as f32 };
-    (1..=n)
-        .map(|i| {
-            if fallend {
-                basis + (n - i + 1) as f32 * kdtanz
-            } else {
-                basis + i as f32 * kdtanz
-            }
-        })
-        .collect()
+    let mut roh: Vec<f32> = Vec::with_capacity(n + 1);
+    roh.push(schrittwa);
+    for i in 1..=n {
+        roh.push(if fallend {
+            basis + (n - i + 1) as f32 * kdtanz
+        } else {
+            basis + i as f32 * kdtanz
+        });
+    }
+    // Kurze Abschnitte koennen die Rampe unter null druecken (der erste
+    // Schritt 1/von ist schon fast so lang wie der ganze Abschnitt). Dann
+    // klemmen und auf die Laenge skalieren: alle Schritte bleiben positiv
+    // und die Summe ist weiter genau die Abschnittslaenge.
+    if roh.iter().any(|b| *b <= 1e-6) {
+        let klein = 1e-6;
+        let geklemmt: Vec<f32> = roh.iter().map(|b| b.max(klein)).collect();
+        let summe: f32 = geklemmt.iter().sum();
+        return geklemmt.iter().map(|b| b * laenge / summe).collect();
+    }
+    roh
 }
 
 /// Zeitpunkte innerhalb eines Abschnitts `[start, start+laenge]`: `breiten`
@@ -110,6 +139,22 @@ pub fn abschnitt_zeitpunkte(start: f32, breiten: &[f32]) -> Vec<f32> {
 /// Der letzte Punkt eines Abschnitts faellt mit dem naechsten Tipp zusammen
 /// und faellt deshalb weg — sonst stuende dieselbe Zeit zweimal im Ergebnis.
 pub fn timestamps(tipps: &[Tipp]) -> Vec<f32> {
+    timestamps_mit_regeln(tipps, &[])
+}
+
+/// Regel fuer den Abschnitt zwischen zwei Tipps: die Indexnums, die die Rampe
+/// begrenzen. In der App setzt man sie in der Zeitleiste (min/max Schritte),
+/// ohne die Feldwerte neu zu tippen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Abschnitt {
+    pub von: f32,
+    pub bis: f32,
+}
+
+/// Wie [`timestamps`], aber `regeln[i]` ersetzt fuer den Abschnitt zwischen
+/// Tipp `i` und `i+1` die Indexnums. Ohne Regel (oder ohne Eintrag) gelten die
+/// Feldwerte der Tipps.
+pub fn timestamps_mit_regeln(tipps: &[Tipp], regeln: &[Option<Abschnitt>]) -> Vec<f32> {
     let mut raus: Vec<f32> = Vec::new();
     for (i, tipp) in tipps.iter().enumerate() {
         raus.push(tipp.zeit);
@@ -117,7 +162,11 @@ pub fn timestamps(tipps: &[Tipp]) -> Vec<f32> {
             break;
         };
         let laenge = naechster.zeit - tipp.zeit;
-        let breiten = abschnitt_breiten(tipp.indexnum, naechster.indexnum, laenge);
+        let (von, bis) = match regeln.get(i).copied().flatten() {
+            Some(regel) => (regel.von, regel.bis),
+            None => (tipp.indexnum, naechster.indexnum),
+        };
+        let breiten = abschnitt_breiten(von, bis, laenge);
         let mut punkte = abschnitt_zeitpunkte(tipp.zeit, &breiten);
         punkte.pop();
         raus.extend(punkte);
@@ -210,6 +259,27 @@ pub fn modulieren(zeiten: &[f32], kappa: &[f32], staerke: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Pause in Sekunden, ab der ein Felddruck die Aufnahme neu beginnt. Also:
+/// schneller als dieser Abstand gehoert die Folge zusammen, langsamer beginnt
+/// eine neue. Ohne diese Grenze lief die Aufnahme die ganze Sitzung durch —
+/// der erste Tipp kam dann bei den Sekunden seit dem App-Start an (gemessen
+/// 548 s) statt bei 0.
+pub const NEU_AFTER_SEKUNDEN: f32 = 8.0;
+
+/// Ob ein Fingerdruck die Aufnahme neu beginnt.
+///
+/// Zwei Bedingungen muessen zutreffen: der Druck muss ein **Feld** getroffen
+/// haben, und seit dem Anker muss mehr als `grenze` Sekunden vergangen sein
+/// (kein Anker heisst: der allererste Druck).
+///
+/// Der erste Teil ist nicht Kosmetik: das Feld hat rechts neben der letzten
+/// Zeile leere Zellen, und ein Druck dort loescht die Folge und setzt den
+/// Anker, ohne selbst einen Ton zu liefern. Der naechste echte Tipp kam dann
+/// bei 1,70 s statt bei 0 an (gemessen 2026-10-10).
+pub fn beginnt_aufnahme(feld_getroffen: bool, anker_sekunden: Option<f32>, grenze: f32) -> bool {
+    feld_getroffen && anker_sekunden.map(|s| s > grenze).unwrap_or(true)
+}
+
 /// Die Zeitpunkte auf die Spalten der X-Aufloesung legen — der Massstab von
 /// `KeyEventRender.txt`: die Zeitpunkte einer Folge decken die Breite ab, und
 /// jeder landet auf der Spalte, die seiner Position entspricht.
@@ -286,17 +356,69 @@ mod tests {
     }
 
     #[test]
+    fn erster_schritt_ist_der_startwert() {
+        // Der C++ setzt `näschritt += schrittwa` **vor** die Rampe: der erste
+        // Schritt eines Abschnitts ist 1/startIndexnum lang, die Rampe fuellt
+        // nur den Rest (Indexnumlaenge = laenge - 1/startIndexnum).
+        // Gemessen 2026-10-12 am Port: ohne diesen Schritt waren alle Breiten
+        // fast gleich und 1/4 war nicht mehr zu sehen.
+        let breiten = abschnitt_breiten(4.0, 26.0, 1.03);
+        assert_eq!(breiten.len(), 23, "erster Schritt + 22 Rampenschritte");
+        assert!(nah(breiten[0], 0.25), "1/4: {breiten:?}");
+        assert!(
+            breiten[0] > 6.0 * breiten[1],
+            "der erste Schritt ist deutlich breiter als die Rampe: {breiten:?}"
+        );
+        let summe: f32 = breiten.iter().sum();
+        assert!(nah(summe, 1.03), "Summe bleibt die Abschnittslaenge");
+    }
+
+    #[test]
+    fn kurze_abschnitte_bleiben_positiv() {
+        // 0,3 s fuer 22 Rampenschritte: 1/4 passt kaum hinein, die Rohbreiten
+        // wuerden negativ. Dann wird geklemmt und auf die Laenge skaliert —
+        // kein Rueckwaerts-Timestamp.
+        let breiten = abschnitt_breiten(4.0, 26.0, 0.3);
+        assert!(breiten.iter().all(|b| *b > 0.0), "{breiten:?}");
+        let summe: f32 = breiten.iter().sum();
+        assert!(nah(summe, 0.3), "{summe} != 0.3");
+    }
+
+    #[test]
+    fn regeln_ersetzen_die_indexnums_eines_abschnitts() {
+        // Nutzerwunsch 2026-10-12: in der Zeitleiste einen Abschnitt antippen
+        // und Schritt-min/max setzen, ohne die Feldwerte neu zu tippen.
+        let tipps = [Tipp::new(0.0, 2.0), Tipp::new(1.0, 4.0)];
+        let ohne = timestamps(&tipps);
+        assert_eq!(ohne.len(), 4);
+        let mit = timestamps_mit_regeln(&tipps, &[Some(Abschnitt { von: 2.0, bis: 8.0 })]);
+        assert_eq!(mit.len(), 8, "sechs Rampenschritte: {mit:?}");
+        assert!(nah(mit[1], 0.5), "erster Schritt bleibt 1/2: {mit:?}");
+        assert!(mit.windows(2).all(|w| w[0] < w[1]), "{mit:?}");
+        assert_eq!(*mit.last().unwrap(), 1.0, "endet beim zweiten Tipp");
+    }
+
+    #[test]
+    fn ohne_regel_bleibt_alles_wie_gehabt() {
+        let tipps = [Tipp::new(0.0, 2.0), Tipp::new(1.0, 4.0)];
+        assert_eq!(timestamps_mit_regeln(&tipps, &[]), timestamps(&tipps));
+        assert_eq!(timestamps_mit_regeln(&tipps, &[None]), timestamps(&tipps));
+    }
+
+    #[test]
     fn rampe_von_2_nach_4_faellt() {
         // Feld 2 -> schrittweite 0.5 (breit), Feld 4 -> 0.25 (schmal): der
         // Abschnitt wird schmaler, das ist der C++-Zweig `schrittwa >
-        // schrittwe` mit der Basis `schrittwe`.
+        // schrittwe` mit der Basis `schrittwe`. Der erste Schritt ist 1/2,
+        // die beiden Rampenschritte sind bei kd = 0 genau 1/4.
         let breiten = abschnitt_breiten(2.0, 4.0, 1.0);
-        assert_eq!(breiten.len(), 2);
+        assert_eq!(breiten.len(), 3);
+        assert!(nah(breiten[0], 0.5), "{breiten:?}");
+        assert!(breiten[1] <= breiten[0], "Rampe schmaler: {breiten:?}");
         assert!(
-            breiten[1] < breiten[0],
-            "zweiter Schritt schmaler: {breiten:?}"
+            nah(breiten[1], 0.25) && nah(breiten[2], 0.25),
+            "{breiten:?}"
         );
-        assert!(nah(breiten[0], 0.25 + 2.0 * (0.5 / 3.0)), "{breiten:?}");
     }
 
     #[test]
@@ -304,9 +426,10 @@ mod tests {
         // Feld 43 -> 1/43 = 0.023 (schmal), Feld 23 -> 1/23 = 0.043 (breit):
         // der Abschnitt wird breiter, der andere C++-Zweig.
         let breiten = abschnitt_breiten(43.0, 23.0, 1.0);
-        assert_eq!(breiten.len(), 20);
+        assert_eq!(breiten.len(), 21, "erster Schritt + 20 Rampenschritte");
+        assert!(nah(breiten[0], 1.0 / 43.0), "{breiten:?}");
         assert!(
-            breiten[19] > breiten[0],
+            breiten[20] > breiten[0],
             "letzter Schritt breiter: {breiten:?}"
         );
     }
@@ -350,9 +473,9 @@ mod tests {
     fn timestamps_enthalten_die_tipps_und_die_abschnitte() {
         let tipps = [Tipp::new(0.0, 2.0), Tipp::new(1.0, 4.0)];
         let zeiten = timestamps(&tipps);
-        // Zwei Tipps plus ein Zwischenschritt: die Differenz 2 -> 4 ergibt zwei
-        // Breiten, deren zweiter Endpunkt der naechste Tipp ist.
-        assert_eq!(zeiten.len(), 3, "{zeiten:?}");
+        // Zwei Tipps plus zwei Zwischenschritte: erster Schritt 1/2, dann zwei
+        // Rampenschritte à 1/4 — deren letzter Endpunkt ist der naechste Tipp.
+        assert_eq!(zeiten.len(), 4, "{zeiten:?}");
         assert!(
             zeiten.windows(2).all(|w| w[0] <= w[1]),
             "sortiert: {zeiten:?}"
@@ -360,8 +483,8 @@ mod tests {
         assert_eq!(zeiten[0], 0.0);
         assert_eq!(*zeiten.last().unwrap(), 1.0, "endet beim letzten Tipp");
         assert!(
-            zeiten[1] > 0.0 && zeiten[1] < 1.0,
-            "Zwischenschritt liegt dazwischen"
+            nah(zeiten[1], 0.5) && nah(zeiten[2], 0.75),
+            "Zwischenschritte: {zeiten:?}"
         );
     }
 
@@ -554,6 +677,43 @@ mod tests {
         let spalten = spalten(&zeiten, 16);
         assert_eq!(spalten.first(), Some(&0), "Anfang auf Spalte 0");
         assert_eq!(spalten.last(), Some(&15), "Ende auf der letzten Spalte");
+    }
+
+    #[test]
+    fn druck_ohne_feld_startet_keine_aufnahme() {
+        // Gemessen 2026-10-10: ein Tippen auf die leere Zelle rechts neben dem
+        // letzten Feld loeschte die Folge und setzte den Anker — der naechste
+        // echte Tipp kam bei 1,70 s statt bei 0 an.
+        assert!(
+            !beginnt_aufnahme(false, None, NEU_AFTER_SEKUNDEN),
+            "ohne Anker und ohne Feld: nichts"
+        );
+        assert!(
+            !beginnt_aufnahme(false, Some(99.0), NEU_AFTER_SEKUNDEN),
+            "auch ein uralter Anker wird vom leeren Feld nicht geaendert"
+        );
+    }
+
+    #[test]
+    fn nach_langer_pause_beginnt_der_naechste_felddruck_neu() {
+        assert!(beginnt_aufnahme(true, None, NEU_AFTER_SEKUNDEN));
+        assert!(beginnt_aufnahme(
+            true,
+            Some(NEU_AFTER_SEKUNDEN + 0.1),
+            NEU_AFTER_SEKUNDEN
+        ));
+    }
+
+    #[test]
+    fn innerhalb_der_pause_laeuft_die_aufnahme_weiter() {
+        assert!(
+            !beginnt_aufnahme(true, Some(1.7), NEU_AFTER_SEKUNDEN),
+            "zweiter Tipp 1,7 s spaeter haengt sich an"
+        );
+        assert!(
+            !beginnt_aufnahme(true, Some(NEU_AFTER_SEKUNDEN), NEU_AFTER_SEKUNDEN),
+            "genau auf der Grenze noch nicht"
+        );
     }
 
     #[test]

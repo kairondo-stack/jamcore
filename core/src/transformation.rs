@@ -23,11 +23,11 @@ pub fn quantisieren(noten: &[Note], raster: u16) -> Vec<Note> {
 }
 
 /// Spiegelt die Schritte im Zyklus (Schritt 0 wird zum letzten).
-pub fn umkehren(noten: &[Note]) -> Vec<Note> {
+pub fn umkehren(noten: &[Note], schritte: u16) -> Vec<Note> {
     let mut out: Vec<Note> = noten
         .iter()
         .map(|note| Note {
-            step: crate::grid::STEPS_PER_CYCLE - 1 - note.step,
+            step: schritte.saturating_sub(1).saturating_sub(note.step),
             ..*note
         })
         .collect();
@@ -142,7 +142,7 @@ mod tests {
 
     #[test]
     fn umkehren_spiegelt_die_schritte() {
-        let u = umkehren(&[n(0, 60), n(3, 62)]);
+        let u = umkehren(&[n(0, 60), n(3, 62)], 16);
         // Sortiert nach Schritt: 12 (ehemals 3) kommt vor 15 (ehemals 0).
         assert_eq!(u[0].step, 12);
         assert_eq!(u[1].step, 15);

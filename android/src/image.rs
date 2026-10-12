@@ -88,8 +88,15 @@ pub struct ImagePanel {
     /// Takt-Maske (rrn5 `biialpha`): Spalten an/ab, ohne die Zeilen mit alpha 0.
     maske_an: bool,
     maske: ScanMaske,
-    /// Vom Nutzer gewaehlte Schrittzahl (X-Aufloesung = Patternlaenge);
-    /// der Zoom skaliert nur die Anzeige.
+    /// Die Maske wurde von Hand getippt (Leiste/„alle an/aus“). Dann wird sie
+    /// bei einem Laengenwechsel nur gestreckt statt aus den Zeitpunkten neu
+    /// gerechnet — Handarbeit soll nicht verschwinden.
+    maske_von_hand: bool,
+    /// Schluessel der Quelle, aus der [`Self::maske_aus_zeiten`] zuletzt
+    /// gerechnet hat (Anzahl, letzte Zeit, Staerke, Schritte, Pruefsumme).
+    maske_quelle: Option<(usize, u32, u32, u16, u32)>,
+    /// Anzeige-Kopie der gemeinsamen Patternlaenge (Quelle ist das Pattern im
+    /// Rhythmus-Tab; siehe Kopf von [`Self::inhalt`]).
     schritte_wahl: u16,
     /// Mindestanteil durcher Spalten beim Herabstufen der Maske, in Prozent.
     /// 0 = streng (nichts verschmieren), 100 = eine genuegt.
@@ -153,6 +160,8 @@ pub struct ImagePanel {
     video_fps: u32,
     video_laeuft: bool,
     video_pruefung: std::time::Instant,
+    /// Zeitpunkt der letzten ScrollArea-Messung (siehe [`Self::ui`]).
+    messung: std::time::Instant,
 }
 
 impl Default for ImagePanel {
@@ -187,8 +196,10 @@ impl ImagePanel {
             mal_masse: (0, 0),
             radieren: false,
             maske_an: false,
-            maske: ScanMaske::neu(16, Aufloesung::Sync),
-            schritte_wahl: 16,
+            maske: ScanMaske::neu(jamcore::grid::STEPS_PER_CYCLE as usize, Aufloesung::Sync),
+            maske_von_hand: false,
+            maske_quelle: None,
+            schritte_wahl: jamcore::grid::STEPS_PER_CYCLE,
             maske_anteil: 50,
             bruch_a: 1,
             bruch_b: 1,
@@ -222,6 +233,7 @@ impl ImagePanel {
             video_fps: 20,
             video_laeuft: false,
             video_pruefung: std::time::Instant::now(),
+            messung: std::time::Instant::now(),
         }
     }
 
@@ -504,44 +516,63 @@ impl ImagePanel {
         self.schritte_wahl.max(4)
     }
 
-    /// Die Maske aus einer aufgezeichneten Folge bauen.
-    /// dem Maske-Tab (Zeitabstaende + Feldwerte als Indexnum); was hier
-    /// passiert, ist exakt der Weg aus `pattern_recorder`: erst die normale
-    /// Schrittweiten-Rechnung, dann die Timestamps auf die X-Aufloesung
-    /// legen (KeyEventRender-Massstab).
+    /// Die Maske aus den Zeitpunkten des Maske-Tabs bauen. Die Zeitpunkte
+    /// bringt der Maske-Tab fertig mit (Rampe aus den Feldwerten, Abschnitts-
+    /// Regeln min/max aus der Zeitleiste); hier kommt nur noch die
+    /// Wisch-Modulation und die Abbildung auf die X-Aufloesung dazu
+    /// (KeyEventRender-Massstab).
     ///
     /// `staerke` waechelt die Modulation der Wischgeschwindigkeit auf die
     /// Krümmung; bei 0.0 bleibt die reine Rechnung uebrig.
-    pub fn maske_aus_folge(&mut self, folge: &[(f32, f32, Vec<f32>)], staerke: f32) {
-        if folge.is_empty() {
+    pub fn maske_aus_zeiten(&mut self, zeiten: &[f32], tempo: &[f32], staerke: f32, schritte: u16) {
+        if zeiten.is_empty() {
             return;
         }
-        let tipps: Vec<jamcore::schrittweite::Tipp> = folge
+        let mut zeiten = zeiten.to_vec();
+        // Nur neu rechnen, wenn sich die Quelle geaendert hat. Der Maske-Tab
+        // ruft das je Frame auf; ohne diesen Vergleich wuerde er die Maske
+        // staendig neu aufbauen und Handkorrekturen aus der Leiste loeschen
+        // (die Laenge gehoert zum Schluessel: ein Laengenwechsel soll neu
+        // rechnen). Die Pruefsumme ueber **alle** Zeiten ist noetig, weil eine
+        // min/max-Regel die Zwischenzeiten aendern kann, ohne Anzahl oder
+        // letzte Zeit zu ruehren (z. B. 6->26 auf 5->25).
+        let pruef = zeiten
             .iter()
-            .map(|(zeit, indexnum, _)| jamcore::schrittweite::Tipp::new(*zeit, *indexnum))
-            .collect();
-        let mut zeiten = jamcore::schrittweite::timestamps(&tipps);
+            .fold(0u32, |summe, z| summe.wrapping_add(z.to_bits()));
+        let quelle = (
+            zeiten.len(),
+            zeiten.last().map(|z| z.to_bits()).unwrap_or(0),
+            staerke.to_bits(),
+            schritte,
+            pruef,
+        );
+        if self.maske_quelle == Some(quelle) {
+            return;
+        }
+        // Handkorrektur am Balken: nur eine **neue Aufnahme** (andere
+        // Zeitpunkte, andere Staerke) darf sie ersetzen. Ein reiner
+        // Laengenwechsel wird schon oben in `inhalt` als Streckung behandelt.
+        let folge_gleich = self
+            .maske_quelle
+            .is_some_and(|q| (q.0, q.1, q.2, q.4) == (zeiten.len(), quelle.1, quelle.2, pruef));
+        if self.maske_von_hand && folge_gleich {
+            return;
+        }
+        self.maske_quelle = Some(quelle);
         // Die Krümmung kommt aus dem Wischprofil: der Referenzwert ist der
         // Mittelweg der Geste, ein gleichmaessiger Wisch ergibt daher
         // ueberall 1.0 und laesst die Timestamps unveraendert.
-        let tempo: Vec<f32> = folge
-            .iter()
-            .flat_map(|(_, _, t)| t.iter().copied())
-            .collect();
         if staerke.abs() > 1e-9 && tempo.len() >= 2 {
-            let kappa = jamcore::schrittweite::kruemmung(
-                &tempo,
-                jamcore::schrittweite::tempo_mittel(&tempo),
-            );
+            let kappa =
+                jamcore::schrittweite::kruemmung(tempo, jamcore::schrittweite::tempo_mittel(tempo));
             zeiten = jamcore::schrittweite::modulieren(&zeiten, &kappa, staerke);
         }
-        let schritte = self.schritte().max(1) as usize;
-        let spalten = jamcore::schrittweite::spalten(&zeiten, schritte);
-        self.maske.setze_alle(false);
-        for spalte in &spalten {
-            self.maske.setze(*spalte, true);
-        }
+        let schritte = schritte.max(1) as usize;
+        // Neu aufbauen statt umzuschalten: `aus_zeiten` setzt auch die Laenge,
+        // und die Spalten sitzen exakt dort, wo die Zeit sie hinlegt.
+        self.maske = ScanMaske::aus_zeiten(&zeiten, schritte);
         self.maske_an = true;
+        self.maske_von_hand = false;
         self.tipp_zeiten = zeiten.clone();
         self.tipp_status = format!(
             "{} Punkte, {:.1} s",
@@ -549,9 +580,8 @@ impl ImagePanel {
             zeiten.last().copied().unwrap_or(0.0)
         );
         log::info!(
-            "Maske aus Folge: {} Zeitpunkte -> {} Spalten von {schritte}",
+            "Maske aus Folge: {} Zeitpunkte auf {schritte} Spalten",
             zeiten.len(),
-            spalten.len()
         );
     }
 
@@ -706,20 +736,13 @@ impl ImagePanel {
     /// Pattern aus dem gewählten Abschnitt der X-Auflösung: Start- und Endpunkt
     /// bestimmen, welcher Teil des Bildes ins Pattern kommt (und damit dessen
     /// Länge). Wird im Tagebuch für den Export gebraucht.
-    pub fn abschnitt_pattern(&self) -> jamcore::grid::Pattern {
-        let schritte = self.schritte();
+    pub fn abschnitt_pattern(&self, schritte: u16) -> jamcore::grid::Pattern {
         let bis = if self.abschnitt_bis == u16::MAX {
             schritte.saturating_sub(1)
         } else {
             self.abschnitt_bis.min(schritte.saturating_sub(1))
         };
         jamcore::grid::Pattern::mit_abschnitt(self.abschnitt_von, bis, schritte)
-    }
-
-    /// Schrittzahl ist die vom Nutzer gewaehlte X-Aufloesung; die Anzeige
-    /// (Zoom, Breite) aendert sie nicht mehr.
-    fn schrittzahl(&self, _platz: f32) -> u16 {
-        self.schritte()
     }
 
     /// Anteil der Höhe, den das Bild im Querformat bekommt. Im Hochformat
@@ -918,15 +941,34 @@ impl ImagePanel {
         // ~20 Bilder je Sekunde reichen fuer die Vorschau und sparen Strom.
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
+        // Kamera und Scan stehen **ausserhalb** der ScrollArea: mit laufender
+        // Vorschau ist das Bild so hoch, dass diese Zeilen sonst aus dem
+        // Sichtbereich gescrollt werden — und der Bildkasten schluckt jede
+        // Wischgeste, man kommt also nicht mehr zu „Scan an“ zurueck
+        // (gemessen 2026-10-10).
+        self.zeilen_kamera(ui);
         // Alles in eine ScrollArea: im Querformat ist sonst unter dem Bild
         // nichts mehr erreichbar, weil das Bild den ganzen Platz nimmt.
         egui::ScrollArea::vertical()
             .scroll_source(egui::scroll_area::ScrollSource::ALL)
             .id_salt("bild_inhalt")
-            .show(ui, |ui| self.inhalt(ui, pattern));
+            .show(ui, |ui| {
+                if self.messung.elapsed() >= std::time::Duration::from_secs(2) {
+                    self.messung = std::time::Instant::now();
+                    log::info!(
+                        "bild-scroll: min {:?} max {:?} frei {:.0}x{:.0}",
+                        ui.min_rect().min,
+                        ui.max_rect(),
+                        ui.available_width(),
+                        ui.available_height()
+                    );
+                }
+                self.inhalt(ui, pattern)
+            });
     }
 
-    fn inhalt(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
+    /// Die beiden Zeilen mit Kamera, Scan und Aufnahme — immer erreichbar.
+    fn zeilen_kamera(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Kamera an").clicked() {
                 self.kamera_an();
@@ -975,6 +1017,9 @@ impl ImagePanel {
                 self.snapshot_sichern();
             }
         });
+    }
+
+    fn inhalt(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         // Dekodierfehler aus Java einmal je Sekunde sichtbar machen.
         if self.video_laeuft && self.video_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
             self.video_pruefung = std::time::Instant::now();
@@ -1053,22 +1098,35 @@ impl ImagePanel {
         } else {
             platz
         };
-        let schritte = self.schrittzahl(links);
+        // Gemeinsame Patternlaenge: das Pattern im Rhythmus-Tab ist die
+        // Quelle, das Bild zeigt dieselbe Zahl (Schritte-Knoepfe und die
+        // Laenge dort schreiben beide hinein).
+        let schritte = pattern.steps_per_cycle();
+        self.schritte_wahl = schritte;
         if schritte != self.letzte_schritte {
-            // Schrittzahl geaendert: die Maske wird **auf die neuen Schritte
-            // abgebildet** (nicht nur gestreckt) — sonst liegen die alten
-            // Spalten links buendeln und das Muster geht verloren.
+            // Laenge geaendert: die Maske wird **auf die neuen Schritte
+            // abgebildet** (nicht nur gestreckt) — sonst buendeln die alten
+            // Spalten links und das Muster geht verloren.
             let alt_ende = self.letzte_schritte.saturating_sub(1);
             let war_ganz = self.letzte_schritte > 0
                 && self.abschnitt_von == 0
                 && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= alt_ende);
-            self.maske
-                .auf_breite_mit(schritte as usize, self.maske_anteil as f32 / 100.0);
+            if !self.tipp_zeiten.is_empty() && !self.maske_von_hand {
+                // Aus den Zeitpunkten **neu rechnen**: jede Spalte sitzt dort,
+                // wo die Zeit sie hinlegt. Das Strecken der alten Maske machte
+                // aus einer 16er-Spalte bei 512 einen 32 breiten Block
+                // (gemessen 2026-10-10).
+                self.maske = ScanMaske::aus_zeiten(&self.tipp_zeiten, schritte as usize);
+                log::info!("Schritte {schritte}: Maske aus den Zeitpunkten neu gerechnet");
+            } else {
+                self.maske
+                    .auf_breite_mit(schritte as usize, self.maske_anteil as f32 / 100.0);
+                log::info!(
+                    "Schritte {schritte}: Maske neu abgebildet (Mindestanteil {} %)",
+                    self.maske_anteil
+                );
+            }
             self.letzte_schritte = schritte;
-            log::info!(
-                "Schritte {schritte}: Maske neu abgebildet (Mindestanteil {} %)",
-                self.maske_anteil
-            );
             if war_ganz {
                 self.abschnitt_bis = schritte.saturating_sub(1);
             }
@@ -1096,8 +1154,8 @@ impl ImagePanel {
                             // `allocate_ui`-Kasten ragen die Zeilen sonst
                             // in die Nachbarspalte hinein und ueberlappen.
                             ui.columns(2, |cols| {
-                                self.steuerung_teile(&mut cols[0], 0);
-                                self.steuerung_teile(&mut cols[1], 1);
+                                self.steuerung_teile(&mut cols[0], 0, pattern);
+                                self.steuerung_teile(&mut cols[1], 1, pattern);
                             });
                         });
                 });
@@ -1106,7 +1164,7 @@ impl ImagePanel {
         }
 
         self.bild_zeichnen(ui, platz, flaeche, schritte);
-        self.steuerung(ui);
+        self.steuerung(ui, pattern);
     }
 
     /// Wie viele Zeilen die Steuerung hat. Jede Zeile ist schmal genug für eine
@@ -1115,13 +1173,13 @@ impl ImagePanel {
 
     /// Eine Zeile der Steuerung. Jede Zeile ist schmal genug für eine Spalte;
     /// im Querformat wechseln sie sich zwischen zwei Spalten ab.
-    fn steuerungs_zeile(&mut self, ui: &mut egui::Ui, zeile: usize) {
+    fn steuerungs_zeile(&mut self, ui: &mut egui::Ui, zeile: usize, pattern: &mut Pattern) {
         match zeile {
             0 => self.zeile_zoom(ui),
             1 => self.zeile_takte(ui),
             2 => self.zeile_bpm(ui),
             3 => self.zeile_maske(ui),
-            4 => self.zeile_schritte(ui),
+            4 => self.zeile_schritte(ui, pattern),
             5 => self.zeile_toleranz(ui),
             6 => self.zeile_auswahl(ui),
             7 => self.zeile_malen(ui),
@@ -1133,17 +1191,17 @@ impl ImagePanel {
     }
 
     /// Alle Regler unterhalb des Bildes (Hochformat, eine Spalte).
-    fn steuerung(&mut self, ui: &mut egui::Ui) {
+    fn steuerung(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         for zeile in 0..Self::STEUERUNG_ZEILEN {
-            self.steuerungs_zeile(ui, zeile);
+            self.steuerungs_zeile(ui, zeile, pattern);
         }
     }
 
     /// Zeilen 0, 2, 4 … in die linke, 1, 3, 5 … in die rechte Spalte.
-    fn steuerung_teile(&mut self, ui: &mut egui::Ui, spalte: usize) {
+    fn steuerung_teile(&mut self, ui: &mut egui::Ui, spalte: usize, pattern: &mut Pattern) {
         let mut zeile = spalte;
         while zeile < Self::STEUERUNG_ZEILEN {
-            self.steuerungs_zeile(ui, zeile);
+            self.steuerungs_zeile(ui, zeile, pattern);
             zeile += 2;
         }
     }
@@ -1273,7 +1331,7 @@ impl ImagePanel {
     }
 
     /// Schrittzahl wählen (Zahlenfeld **und** Takt-Anteil a/b) und die Maske setzen.
-    fn zeile_schritte(&mut self, ui: &mut egui::Ui) {
+    fn zeile_schritte(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         // Voreinstellungen als zwei Reihen von je sieben Werten: 16…1024
         // und, „ab 12", 12…768. Feste Knopfbreite und das Label in einer
         // eigenen Zeile, damit die Reihen in die Spalte passen und nicht in die
@@ -1299,6 +1357,9 @@ impl ImagePanel {
                         })
                         .inner;
                     if knopf {
+                        // Ins Pattern schreiben: die Laenge ist **eine** Zahl,
+                        // Rhythmus-Raster und Bild-Maske lesen sie von dort.
+                        pattern.set_steps_per_cycle(wert);
                         self.schritte_wahl = wert;
                         log::info!("Schritte gewaehlt: {wert}");
                     }
@@ -1314,7 +1375,10 @@ impl ImagePanel {
             if a.changed() || b.changed() {
                 let nenner = self.bruch_b.max(1) as f32;
                 let anteil = self.bruch_a.max(1) as f32 / nenner;
-                self.schritte_wahl = ((16.0 * anteil).round() as i64).clamp(4, 4096) as u16;
+                self.schritte_wahl = ((16.0 * anteil).round() as i64)
+                    .clamp(4, jamcore::grid::MAX_STEPS_PER_CYCLE as i64)
+                    as u16;
+                pattern.set_steps_per_cycle(self.schritte_wahl);
                 log::info!(
                     "Schritte aus {}/{} Takt: {}",
                     self.bruch_a,
@@ -1369,9 +1433,11 @@ impl ImagePanel {
             );
             if ui.button("alle an").clicked() {
                 self.maske.setze_alle(true);
+                self.maske_von_hand = true;
             }
             if ui.button("alle aus").clicked() {
                 self.maske.setze_alle(false);
+                self.maske_von_hand = true;
             }
         });
         // Austausch mit dem Desktop-Recorder: dieselbe Datei, die rrn5 mit
@@ -1673,6 +1739,7 @@ impl ImagePanel {
                     let durch = self.maske_pinsel.unwrap_or(true);
                     if (self.maske.alpha(anteil, schritte as usize) > 0.0) != durch {
                         self.maske.setze(eintrag, durch);
+                        self.maske_von_hand = true;
                         self.status = format!(
                             "Maske: Schritt {anteil} {} (von {})",
                             if durch { "an" } else { "aus" },

@@ -22,13 +22,13 @@ ab; mit `--install` zusätzlich `adb install -r` und Start der Activity
 | 1 | **Überblick** | Kamera an/aus, Frame-Zähler und -Größe, gefundene Module, „Module neu suchen", „Zum Player" |
 | 2 | **Player** | Modul-Liste (`.it/.xm/.mod/.s3m/.mtm`) aus den Suchordnern; Abspielen/Stopp/Dauerschleife; Peak, Position, Order/Row, Frames |
 | 3 | **OSC** | Ziel-IP/Port (gilt für OSC **und** Tempo), Tempo-Slider 30–300 BPM + „Tempo senden", Verbinden/Trennen, Notenbuttons 48/60/64/67/72, Transport Start/Stop, BPM 128, Pattern-Follow an/aus |
-| 4 | **Rhythmus** | Step-Editor: 8 Slots, 16 Schritte in zwei 8er-Blöcken, Reihen 36/48/60/72; Follow am Modul oder Eigenuhr; Rendern (Loop, OSC + lokaler Klang), Aufnahme-Modus, Transport-Mit, Transformationen, Skalenfilter, Presenter, CSV/XML-Export |
+| 4 | **Rhythmus** | Step-Editor: 8 Slots, Patternlänge 1–1024 (Vorgabe 512) in 8er-Blöcken, Reihen 36/48/60/72; Follow am Modul oder Eigenuhr; Rendern (Loop, OSC + lokaler Klang), Aufnahme-Modus, Transport-Mit, Transformationen, Skalenfilter, Presenter, CSV/XML-Export |
 | 5 | **Tempo** | Mikrofon-BPM: „Messen (4 s)", „Live", „Stop", „Tap", „Übernehmen" (sendet BPM und setzt das App-Tempo); Pegel, Konfidenz, Samplerate, Fenster; Ziel kommt aus dem OSC-Tab |
 | 6 | **Bild** | Kamera oder Videos aus `videos/` als Quelle; Live-Scan (Spalten-Sweep → OSC-Noten), Farbauswahl per Finger, Toleranz/Malen/Radieren/Palette, Takt-Maske, Pattern-Ausschnitt; Zwei-Finger-Zoom, Drei-Finger-Verschieben; Querformat mit Bild links und zwei Steuerspalten |
 | 7 | **Kreis** | Quintenzirkel-Touchscheibe mit 12 Segmenten; Tippen toggelt und sendet beim Hinzufügen sofort `note_on`; Auswahl ergibt die Notenklassen |
 | 8 | **Session** | Ableton-Link-Zustand (BPM, Beat, Peers, Transport), Link an/aus, „Link neu starten", „Tempo folgen", Quantum-Slider |
 | 9 | **Tagebuch** | Einträge mit Name/Notiz (übernimmt Raster und Tempo); Liste neueste zuerst, CSV-Ansicht; oben zuklappbar der Bild-Pattern-Export (Renoise-XML kopierbar, CSV) |
-| 10 | **Maske** | Takt-Maske-Tastenfeld: jeder Tastendruck belegt den nächsten Schritt; Feldarten „je Wert"/„verteilt"; Wisch zählt nur Anfangs- und Endtaste; Mehrfinger-Eingabe |
+| 10 | **Maske** | Takt-Maske-Tastenfeld: Zeitpunkte statt Schritte (Rampe aus Indexnum, Wisch mit Geschwindigkeitsprofil); Feldarten „je Wert"/„verteilt"; keine Zeitgrenze für Wische; Mehrfinger-Eingabe |
 | 11 | **Kombi** | Zwei Module gleichzeitig: Hochformat untereinander, Querformat nebeneinander; Auswahl aus leer/Bild/Rhythmus/Maske/Tempo/Session/Tagebuch/Kreis |
 
 Gemeinsam: obere Leiste mit App-Name, Tab-Zeile(n) und Systemleisten-Insets; untere
@@ -67,30 +67,43 @@ gilt für Takt-Scan, Rendern und Tagebuch.
 - **Takt-Maske** (`ScanMaske`, rrn5-`b`): Leiste oben im Bild, Tippen/Wischen schaltet
   Spalten an/aus; `alpha` sperrt Spalten und skaliert Farbe und Lautstärke; `abschnitte`
   fasst gleiche Werte zu Rechtecken zusammen (auch bei 872 Spalten flüssig)
-- **X-Auflösung = Schrittzahl = Patternlänge**: ein Schritt je Punkt Breite (Zoom ×),
-  „Schritte festhalten" pinnt; „Pattern von…bis" + „ganzes Bild" wählt den Ausschnitt
+- **Eine gemeinsame Patternlänge** (Vorgabe **512**, wählbar 1–1024): die Schritte-Knöpfe
+  im Bild schreiben sie ins Pattern, `Laenge` im Rhythmus-Tab schreibt dieselbe Zahl;
+  das Raster der Maske-Zeitleiste, die X-Auflösung des Sweeps und die Notenzuordnung
+  lesen sie von dort. Beim Längenwechsel wird die Maske **aus den Zeitpunkten neu
+  gerechnet** (`ScanMaske::aus_zeiten`); nur eine von Hand getippte Maske wird gestreckt
+- „Pattern von…bis" + „ganzes Bild" wählt den Ausschnitt
 - **Zoom/Pan**: Zwei-Finger-Zoom 20–400 %, drei Finger verschieben, Bild bleibt im Kasten
 - Farbauswahl mit Toleranz (Gesamt + R/G/B), Hintergrundfarbe, Malen/Radieren, Palette-Scan
 - Hochformat einspaltig (ScrollArea), Querformat Bild links + zwei Steuerspalten
+- Kamera-/Scan-/Aufnahme-Zeilen liegen **außerhalb** der ScrollArea (immer erreichbar)
 
 ### maske.rs — Maske-Tab (Tastenfeld)
 - Feldarten `JeWert` (0..wert_max) und `Verteilt`; Spalten 2–16, Reihen 2–8, Wert max 8–128
-- **jeder Tastendruck belegt den nächsten Schritt**; ein Wisch zählt nur Anfangs- und
-  Endtaste; gehaltene Taste + zweite Taste = zwei Schritte hintereinander (Mehrfinger)
-- Regenbogen-Spur der gedrückten Tasten, Schrittanzeige mit Notenpunkten, „leeren" leert
-  das Pattern
-- **Tippfolge für die Scan-Maske**: der erste Druck auf ein Feld beginnt die Aufnahme (es
-  gibt keinen Start-Knopf), jeder weitere Druck ist ein Tipp mit Zeitstempel, „Ende" hält die
-  Maske fest. Spalte = Zeit / letzter Zeit × Schrittzahl — genau die Rechnung des
-  pattern_recorder (`scldiv` = letzter Zeitstempel, Zeile 2253–2256; KeyEventRender-Writer
-  ab Zeile 4888). Der erste Tipp liegt immer auf Spalte 0, weil dort der Timer beginnt.
-  Die Wischlogik gilt dabei unverändert: ein Wisch liefert zwei Schritte **und** zwei Tipps.
+- **Aufnahme**: jeder Feldruck setzt einen Zeitpunkt (Indexnum = Feldwert), „neu" leert
+  und beginnt von vorn; nach `NEU_AFTER_SEKUNDEN` (8 s) Pause startet der nächste Druck
+  eine neue Folge. Ein Druck in eine leere Zelle startet **nichts** (weder Anker noch
+  Löschen — gemessen 2026-10-10)
+- **Wisch**: Anfangs- und Endfeld sind zwei Zeitpunkte; der Abschnitt dazwischen wird mit
+  der Schrittweiten-Rampe gefüllt (Zwischenschritte, `schrittweite::timestamps`), die
+  Wischgeschwindigkeit moduliert die Krümmung (`modulieren`). **Keine Zeitgrenze** mehr:
+  auch langsame Wische zählen. Gescrollt wird im Maske-Tab nur über die Leiste
+  (`ScrollSource::SCROLL_BAR`), nicht per Geste
+- Die Zwischenschritte stehen als kleine Punkte auf der Zeitachse (die Handdrücke groß
+  mit Feldwert) und im grünen Balken über dem Bild. Der **erste Schritt** eines
+  Abschnitts ist 1/Startwert (wie im C++ `näschritt += schrittwa`), die Rampe füllt
+  den Rest; bei sehr kurzen Abschnitten wird geklemmt und auf die Länge skaliert
+- **Abschnitts-Regeln**: in die Zeitleiste tippen wählt den Abschnitt (heller Balken),
+  darunter Regler „min“/„max“ überschreiben die Schrittwerte nur dieses Abschnitts;
+  „Regel weg“ nimmt die Feldwerte zurück. Die Regel wirkt sofort in Zeitleiste und
+  Bild-Maske (z. B. Abschnitt 6→26 auf min 5/max 10 ⇒ 13 statt 28 Zeitpunkte)
+- Regenbogen-Spur der gedrückten Tasten, Pinch-Zoom 20–400 %, „leeren" leert die Folge
 
 ### rhythm.rs — Rhythmus-Tab
 - Step-Editor mit 8 Slots; Tipp setzt Note (lokal `klang::spielen` + OSC), „Aufnahme"
   legt Tipps auf den laufenden Render-Schritt
-- „Rendern" (Hintergrund-Thread „jam-render"): 16tel-Loop, `note_on`, optional
-  Renoise-Transport (`transport_mit`)
+- „Rendern" (Hintergrund-Thread „jam-render"): 16tel-Loop über die Patternlänge, `note_on`,
+  optional Renoise-Transport (`transport_mit`)
 - Follow am Modul (`set_follow_step`) oder Eigenuhr; `set_tempo` bekommt das App-Tempo
 - Transformationen (`transponieren`, `umkehren`, `quantisieren`, `glide`, `instrument`),
   Skalenfilter (Moll/Dur/Pentatonik), Grundton, Presenter-Ansicht

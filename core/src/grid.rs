@@ -3,10 +3,11 @@
 //! Zeitachse wie im Desktop-`pattern_recorder` und im Renoise-Clipboard: ein
 //! Pattern-Zyklus geht von 0.0 bis 1.0, ein Schritt belegt `1/steps_per_cycle`.
 
-/// Schritte je Pattern-Zyklus als Vorgabe, wenn kein Bild die Länge vorgibt.
-pub const STEPS_PER_CYCLE: u16 = 16;
-/// Obergrenze der waehlbaren Patternlaenge (Rhythmus-Tab: 1 bis 128).
-pub const MAX_STEPS_PER_CYCLE: u16 = 128;
+/// Schritte je Pattern-Zyklus als Vorgabe. Bild-Maske und Rhythmus-Raster
+/// teilen sich diese Laenge (eine Quelle: das Pattern).
+pub const STEPS_PER_CYCLE: u16 = 512;
+/// Obergrenze der waehlbaren Patternlaenge (Rhythmus-Tab und Bild-Schritte).
+pub const MAX_STEPS_PER_CYCLE: u16 = 1024;
 /// Unter- und Obergrenze der Schrittzahl aus der Bildbreite.
 pub const MIN_SCHRITTE: u16 = 4;
 pub const MAX_SCHRITTE: u16 = 4096;
@@ -448,11 +449,25 @@ mod tests {
     use super::*;
 
     fn pattern_with(notes: &[(u16, i32)]) -> Pattern {
-        let mut p = Pattern::new();
+        // 16 Schritte: diese Tests pruefen konkrete Schrittnummern aus der
+        // Zeit vor der 512er-Vorgabe. Die Vorgabe selbst prueft
+        // `neue_patterns_sind_512_schritte_lang`.
+        let mut p = Pattern::with_steps(16);
         for &(step, pitch) in notes {
             p.toggle(step, pitch);
         }
         p
+    }
+
+    #[test]
+    fn neue_patterns_sind_512_schritte_lang() {
+        // Vorgabe des Nutzers (2026-10-11): Pattern und Bild-Maske teilen sich
+        // **eine** Laenge, und die startet bei 512.
+        assert_eq!(Pattern::new().steps_per_cycle(), 512);
+        assert!(
+            MAX_STEPS_PER_CYCLE >= STEPS_PER_CYCLE,
+            "die Vorgabe muss waehlbar sein"
+        );
     }
 
     #[test]
@@ -755,7 +770,9 @@ mod tests {
 
     #[test]
     fn step_und_timestamp_rechnen_ineinander() {
-        let p = Pattern::new();
+        // Das Verhaeltnis gilt fuer jede Laenge; die konkreten Zahlen dieses
+        // Tests stammen aus dem 16er-Raster.
+        let p = Pattern::with_steps(16);
         assert!((p.timestamp(4) - 0.25).abs() < 1e-6);
         assert_eq!(p.step_from_timestamp(0.25), 4);
         assert_eq!(

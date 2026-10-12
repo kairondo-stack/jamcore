@@ -40,6 +40,22 @@ impl ScanMaske {
         }
     }
 
+    /// Maske direkt aus den Zeitpunkten einer Folge bauen: die Spalten, auf
+    /// die ein Zeitpunkt faellt, sind durch, alles andere gesperrt.
+    ///
+    /// Fuer den Laengenwechsel gedacht: die alte Maske zu strecken macht aus
+    /// einer Spalte breite Bloecke, neu gerechnet sitzt jede Spalte dort, wo
+    /// die Zeit sie hinlegt (gemessen 2026-10-10).
+    pub fn aus_zeiten(zeiten: &[f32], schritte: usize) -> Self {
+        let schritte = schritte.max(1);
+        let mut maske = Self::neu(schritte, Aufloesung::Sync);
+        maske.setze_alle(false);
+        for spalte in crate::schrittweite::spalten(zeiten, schritte) {
+            maske.setze(spalte, true);
+        }
+        maske
+    }
+
     /// Anzahl der Einträge in der Maske.
     pub fn laenge(&self) -> usize {
         self.alpha.len()
@@ -238,6 +254,38 @@ impl ScanMaske {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aus_zeiten_malt_dieselben_positionen_bei_jeder_breite() {
+        // Gemessen 2026-10-10: beim Laengenwechsel wurde die alte Maske nur
+        // gestreckt — eine 16er-Spalte wurde bei 512 zu einem 32 breiten
+        // Block. Aus den Zeitpunkten neu gerechnet sitzt jede Spalte dort, wo
+        // die Zeit sie hinlegt.
+        let zeiten = [0.0, 0.25, 1.0, 1.5];
+        let grob = ScanMaske::aus_zeiten(&zeiten, 16);
+        let fein = ScanMaske::aus_zeiten(&zeiten, 512);
+        assert_eq!(grob.laenge(), 16);
+        assert_eq!(fein.laenge(), 512);
+        // 0.25 s von 1.5 s ist ein Sechstel: Spalte 3 von 16, Spalte 85 von 512.
+        assert_eq!(grob.alpha(0, 16), 1.0, "erster Zeitpunkt");
+        assert_eq!(grob.alpha(3, 16), 1.0);
+        assert_eq!(grob.alpha(11, 16), 1.0, "zwei Drittel");
+        assert_eq!(grob.alpha(15, 16), 1.0, "letzter Zeitpunkt");
+        assert_eq!(grob.alpha(8, 16), 0.0, "dazwischen gesperrt");
+        assert_eq!(fein.alpha(0, 512), 1.0);
+        assert_eq!(fein.alpha(85, 512), 1.0);
+        assert_eq!(fein.alpha(511, 512), 1.0);
+        assert_eq!(fein.alpha(200, 512), 0.0);
+    }
+
+    #[test]
+    fn ein_einzelner_zeitpunkt_sperrt_alles() {
+        // Ohne Spanne gibt es keine Position: alles bleibt gesperrt (wie
+        // bisher in `maske_aus_zeiten`, wenn nur ein Tipp da war).
+        let maske = ScanMaske::aus_zeiten(&[0.5], 16);
+        assert_eq!(maske.laenge(), 16);
+        assert!((0..16).all(|x| maske.alpha(x as i32, 16) == 0.0));
+    }
 
     #[test]
     fn neue_maske_ist_alles_durch() {
