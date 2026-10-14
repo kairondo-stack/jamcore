@@ -1,26 +1,78 @@
-//! Kleiner Klang auf dem Handy: kurze Sinus-Töne über `AudioTrack`
-//! (dasselbe Java-API-Muster wie der Modul-Player).
+//! Polyphoner Tongenerator: kurze Wellen-Toene ueber AudioTrack.
 //!
-//! Ein Thread mit Warteschlange spielt die Töne, damit Zeichnen und OSC
-//! nicht blockieren. Die Noten selbst liefern `jamcore::klang`.
+//! Ein Thread mischt die klingenden Stimmen in Bloecken (~10 ms) und schreibt
+//! sie in den AudioTrack. Stimmenzahl (1–256) und Tonlaenge (Notenwert 1/64
+//! bis 4 Takte, ms haengen am BPM) sind einstellbar; bei Ueberlast weicht die
+//! **aelteste** Stimme. Die Mixer-Mathematik liegt in `jamcore::klang`
+//! (`Stimme`, `mischen`, `Notenwert`), damit sie ohne Android testbar ist.
 
 use std::os::raw::c_int;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 
-use jamcore::klang::{frequenz, puffer_welle, Welle};
+use jamcore::klang::{frequenz, mischen, Notenwert, Stimme, Welle};
 use log::info;
 
 const RATE: c_int = 44100;
-const LAENGE_MS: u32 = 120;
 const STREAM_MUSIC: i32 = 3;
 const CHANNEL_OUT_STEREO: i32 = 12;
 const ENCODING_PCM_16BIT: i32 = 2;
 const MODE_STREAM: i32 = 1;
-/// So viele Toene duerfen sich hoechstens stauen, bevor die aeltesten
-/// verworfen werden. Ohne diese Grenze waechst die Warteschlange beim
-/// Bild-Scan unbegrenzt — der Klang hoert nie auf.
-const MAX_STAU: usize = 8;
+/// Blockgroesse des Mischers: ~10 ms. Fluessig genug und wenige JNI-Aufrufe.
+const BLOCK: usize = 441;
+
+/// Einstellungen des Tongenerators (Regler im Rhythmus-Tab und in Bild 2).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Einstellungen {
+    /// So viele Stimmen klingen hoechstens gleichzeitig (1–256).
+    pub stimmen: usize,
+    /// Tonlaenge als Notenwert (ms haengen am BPM).
+    pub notenwert: Notenwert,
+    /// Tempo fuer die ms-Anzeige und die Tonlaenge.
+    pub bpm: f32,
+}
+
+impl Default for Einstellungen {
+    fn default() -> Self {
+        Self {
+            stimmen: 8,
+            notenwert: Notenwert::Sechzehntel,
+            bpm: 120.0,
+        }
+    }
+}
+
+static EINSTELLUNGEN: OnceLock<Mutex<Einstellungen>> = OnceLock::new();
+
+fn slot() -> &'static Mutex<Einstellungen> {
+    EINSTELLUNGEN.get_or_init(|| Mutex::new(Einstellungen::default()))
+}
+
+/// Aktuelle Einstellungen (fuer die Anzeige der ms).
+pub fn einstellungen() -> Einstellungen {
+    slot().lock().map(|e| *e).unwrap_or_default()
+}
+
+/// Stimmenzahl setzen (1–256).
+pub fn stimmen_setzen(anzahl: usize) {
+    if let Ok(mut e) = slot().lock() {
+        e.stimmen = anzahl.clamp(1, 256);
+    }
+}
+
+/// Tonlaenge als Notenwert setzen.
+pub fn notenwert_setzen(notenwert: Notenwert) {
+    if let Ok(mut e) = slot().lock() {
+        e.notenwert = notenwert;
+    }
+}
+
+/// Tempo fuer die ms-Rechnung setzen.
+pub fn bpm_setzen(bpm: f32) {
+    if let Ok(mut e) = slot().lock() {
+        e.bpm = bpm.clamp(20.0, 300.0);
+    }
+}
 
 pub struct Spieler {
     tx: Sender<(i32, Welle)>,
@@ -28,16 +80,16 @@ pub struct Spieler {
 
 static SPIELER: OnceLock<Mutex<Option<Spieler>>> = OnceLock::new();
 
-/// Spielt eine MIDI-Note mit gewaehlter Wellenform kurz an.
+/// Spielt eine MIDI-Note mit gewaehlter Wellenform an.
 pub fn spielen_welle(midi: i32, welle: Welle) {
-    let slot = SPIELER.get_or_init(|| Mutex::new(None));
-    let mut guard = match slot.lock() {
+    let spieler = SPIELER.get_or_init(|| Mutex::new(None));
+    let mut guard = match spieler.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
     if guard.is_none() {
         match starten() {
-            Ok(spieler) => *guard = Some(spieler),
+            Ok(neu) => *guard = Some(neu),
             Err(e) => {
                 info!("klang: Start fehlgeschlagen: {e}");
                 return;
@@ -63,56 +115,64 @@ fn starten() -> Result<Spieler, String> {
             }
         })
         .map_err(|e| format!("Klang-Thread: {e}"))?;
-    info!("klang: Spieler bereit ({RATE} Hz, {LAENGE_MS} ms Töne)");
+    info!("klang: polyphoner Spieler bereit ({RATE} Hz, Block {BLOCK})");
     Ok(Spieler { tx })
 }
 
+/// Die Schleife: neue Auftraege einsammeln, Stimmen pflegen, Bloecke mischen.
 fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<(i32, Welle)>) -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let (track, array) = create_track(&mut env)?;
-    let rx = rx;
+    let mut stimmen: Vec<Stimme> = Vec::new();
+    let mut puffer = vec![0i16; BLOCK];
+    let mut welle = Welle::Sinus;
     loop {
-        let Ok((midi, welle)) = rx.recv() else {
-            break;
+        // Klingt nichts, wird gewartet statt gedreht; klingt etwas, werden
+        // alle wartenden Auftraege sofort aufgenommen.
+        let erster = if stimmen.is_empty() {
+            match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(auftrag) => Some(auftrag),
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            rx.try_recv().ok()
         };
-        // Was sich waehrend des Spielens gesammelt hat, auf die neuesten
-        // MAX_STAU kuerzen. Ohne das waechst die Warteschlange unbegrenzt:
-        // Der Bild-Scan liefert mehr Noten, als in der Zeit spielbar sind (Ton
-        // 120 ms, Spalte wenige ms) — der Klang hoert nie auf und man lauscht
-        // auf einen alten Rueckstand statt auf das Bild.
-        let mut naechste = vec![(midi, welle)];
-        while naechste.len() < MAX_STAU {
-            match rx.try_recv() {
-                Ok(weitere) => naechste.push(weitere),
-                Err(_) => break,
+        let mut auftrag = erster;
+        while let Some((midi, neue_welle)) = auftrag {
+            welle = neue_welle;
+            let e = einstellungen();
+            let laenge_ms = e.notenwert.ms(e.bpm).max(1);
+            stimmen.push(Stimme::neu(frequenz(midi), RATE as u32, laenge_ms));
+            // Ueberlast: die aelteste Stimme weicht.
+            while stimmen.len() > e.stimmen.max(1) {
+                stimmen.remove(0);
             }
+            auftrag = rx.try_recv().ok();
         }
-        let verworfen = rx.try_iter().count();
-        if verworfen > 0 {
-            info!("klang: {verworfen} veraltete Toene verworfen");
+        if stimmen.is_empty() {
+            continue;
         }
-        for (midi, welle) in naechste {
-            if !ton(&mut env, &track, &array, midi, welle) {
-                return Ok(());
-            }
+        // Kopfraum: wenige Stimmen bleiben laut, viele steuern sich nicht zu.
+        let gain = 1.0 / (stimmen.len().max(1) as f32).sqrt();
+        mischen(&mut puffer, &mut stimmen, RATE as u32, welle, gain);
+        if !block_schreiben(&mut env, &track, &array, &puffer) {
+            return Ok(());
         }
     }
     Ok(())
 }
 
-/// Einen Ton erzeugen und in den AudioTrack schreiben (blockiert). `false`,
-/// wenn der JNI-Aufruf gescheitert ist — dann aufgeben statt weiterzuprobieren.
-fn ton(
+/// Einen gemischten Block als Stereo-PCM16 in den AudioTrack schreiben
+/// (blockiert). `false`, wenn der JNI-Aufruf gescheitert ist.
+fn block_schreiben(
     env: &mut jni::JNIEnv,
     track: &jni::objects::GlobalRef,
     array: &jni::objects::GlobalRef,
-    midi: i32,
-    welle: Welle,
+    puffer: &[i16],
 ) -> bool {
-    let puffer = puffer_welle(frequenz(midi), RATE as u32, LAENGE_MS, welle);
-    // Stereo PCM16 little-endian, beide Kanaele gleich.
     let mut bytes: Vec<i8> = Vec::with_capacity(puffer.len() * 4);
-    for s in &puffer {
+    for s in puffer {
         let (lo, hi) = (s.to_le_bytes()[0] as i8, s.to_le_bytes()[1] as i8);
         bytes.push(lo);
         bytes.push(hi);
@@ -141,6 +201,7 @@ fn ton(
     }
     true
 }
+
 fn create_track(
     env: &mut jni::JNIEnv,
 ) -> Result<(jni::objects::GlobalRef, jni::objects::GlobalRef), String> {
@@ -171,8 +232,8 @@ fn create_track(
         let detail = crate::jniutil::describe_and_clear(env);
         return Err(format!("AudioTrack.play: {detail}"));
     }
-    // Das Array muss den ganzen Ton fassen (LAENGE_MS stereo PCM16).
-    let array_len = RATE * LAENGE_MS as i32 / 1000 * 4;
+    // Das Array fasst genau einen Mischblock (stereo PCM16).
+    let array_len = BLOCK as i32 * 4;
     let array = env
         .new_byte_array(array_len)
         .map_err(|e| format!("byte[]: {e}"))?;

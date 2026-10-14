@@ -10,6 +10,8 @@ pub struct OscPanel {
     out: Option<OscOut>,
     pub last: String,
     pub error: String,
+    /// Das gemerkte Ziel wurde einmal geladen; danach gilt das Feld.
+    geladen: bool,
 }
 
 impl Default for OscPanel {
@@ -20,6 +22,7 @@ impl Default for OscPanel {
             out: None,
             last: String::new(),
             error: String::new(),
+            geladen: false,
         }
     }
 }
@@ -29,6 +32,56 @@ impl OscPanel {
         self.port.trim().parse().unwrap_or(DEFAULT_BASE_PORT)
     }
 
+    /// Ziel, wie es im Feld steht.
+    fn ziel(&self) -> String {
+        format!("{}:{}", self.host.trim(), self.base_port())
+    }
+
+    /// Passt die bestehende Verbindung noch zum Feld?
+    fn verbunden_mit_feld(&self) -> bool {
+        self.out
+            .as_ref()
+            .is_some_and(|o| o.target().to_string() == self.ziel())
+    }
+
+    /// Pfad der kleinen Ziel-Datei (Host, Port) im App-Ordner.
+    fn datei() -> Option<std::path::PathBuf> {
+        let app = crate::current_app().ok()?;
+        let basis = crate::insets::external_files_dir(&app)?;
+        Some(std::path::Path::new(&basis).join("osc.txt"))
+    }
+
+    /// Einmal beim Start das gemerkte Ziel laden. Ohne das stand nach jedem
+    /// Neustart wieder 127.0.0.1 im Feld (gemessen 2026-10-12).
+    pub fn laden(&mut self) {
+        if self.geladen {
+            return;
+        }
+        self.geladen = true;
+        let Some(pfad) = Self::datei() else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&pfad) else {
+            return;
+        };
+        if let Some((host, port)) = jamcore::osc::settings_aus_text(&text) {
+            log::info!("OSC-Ziel geladen: {host}:{port}");
+            self.host = host;
+            self.port = port;
+        }
+    }
+
+    /// Das aktuelle Feld-Ziel merken, damit der naechste Start es kennt.
+    fn speichern(&self) {
+        let Some(pfad) = Self::datei() else {
+            return;
+        };
+        let text = jamcore::osc::settings_als_text(self.host.trim(), self.port.trim());
+        if let Err(e) = std::fs::write(&pfad, text) {
+            log::info!("OSC-Ziel nicht gespeichert: {e}");
+        }
+    }
+
     /// Baut die Verbindung neu auf (Host/Port können im UI geändert werden).
     pub fn connect(&mut self) {
         match OscOut::new(self.host.trim(), self.base_port()) {
@@ -36,6 +89,7 @@ impl OscPanel {
                 self.last = format!("verbunden mit {}", out.target());
                 self.error.clear();
                 self.out = Some(out);
+                self.speichern();
             }
             Err(e) => {
                 self.error = format!("Verbindung fehlgeschlagen: {e}");
@@ -49,9 +103,12 @@ impl OscPanel {
         self.last = "getrennt".to_string();
     }
 
-    /// Sendet über die bestehende Verbindung, baut sie bei Bedarf neu auf.
+    /// Sendet über die bestehende Verbindung; hat sich das Ziel im Feld
+    /// geaendert, wird vorher neu verbunden. Ohne den Vergleich gingen Noten
+    /// nach einer Feldänderung weiter an das **alte** Ziel (gemessen
+    /// 2026-10-12: Port 7009 im Feld, gesendet wurde an 7005).
     fn send(&mut self, label: &str, run: impl FnOnce(&Renoise) -> Result<u16, String>) {
-        if self.out.is_none() {
+        if !self.verbunden_mit_feld() {
             self.connect();
         }
         let Some(out) = self.out.as_ref() else {
@@ -97,7 +154,7 @@ impl OscPanel {
     #[allow(dead_code)]
     /// Roher Sendepfad für eigene Aufrufe (z. B. aus dem Rhythmus-Screen).
     pub fn raw(&mut self, port: u16, addr: &str, args: Vec<OscType>) -> bool {
-        if self.out.is_none() {
+        if !self.verbunden_mit_feld() {
             self.connect();
         }
         match self.out.as_ref().map(|o| o.send(port, addr, args)) {

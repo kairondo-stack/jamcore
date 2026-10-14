@@ -24,6 +24,11 @@ const CELL: f32 = 22.0;
 const BLOCK: u16 = 8;
 const DEFAULT_BPM: f32 = 128.0;
 
+/// „125 ms“ zur Tonlaenge — die ms haengen am aktuellen BPM.
+fn ms_text(e: crate::klang::Einstellungen) -> String {
+    format!("{} ms", e.notenwert.ms(e.bpm))
+}
+
 /// Woher der Klang des gerenderten Notenmaterials kommt.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Klangquelle {
@@ -57,6 +62,9 @@ pub struct RhythmPanel {
     presenter: bool,
     /// Instrumentnummer fuer neue Noten (Renoise-Instrument).
     instrument: u8,
+    /// Anzeige-Buendelung: so viele Schritte fasst eine Rasterzelle zusammen
+    /// (1 = ein Schritt; 2, 4, 8, 16, 32 fuer lange Patterns).
+    buendel: u16,
     /// Skalenfilter fuer gesetzte Toene (0 = aus).
     skala: usize,
     grundton: i32,
@@ -106,6 +114,7 @@ impl RhythmPanel {
             aufnahme: false,
             presenter: false,
             instrument: 0,
+            buendel: 1,
             skala: 0,
             grundton: 60,
             rampe_anzahl: 4,
@@ -165,6 +174,17 @@ impl RhythmPanel {
     /// Das eine Tempo der App (Follow gewinnt) fuer das Rendern setzen.
     pub fn set_tempo(&mut self, bpm: f32) {
         self.render_bpm = bpm.clamp(20.0, 300.0);
+    }
+
+    /// Eigenuhr-BPM (der Regler im Rhythmus-Tab) — ein zentraler Wert: die App
+    /// liest ihn zurueck und schreibt ihn in alle anderen Tabs.
+    pub fn eigenuhr_bpm(&self) -> f32 {
+        self.bpm
+    }
+
+    /// Die Eigenuhr von aussen stellen (App-Tempo).
+    pub fn set_eigenuhr(&mut self, bpm: f32) {
+        self.bpm = bpm.clamp(40.0, 220.0);
     }
 
     /// Notenrampe wie Taste `2` im Desktop-Recorder: `n + 1` Noten von 59
@@ -665,6 +685,29 @@ impl RhythmPanel {
         }
     }
 
+    /// Rasterzelle mit Buendelung: setzt oder loescht **alle** Schritte des
+    /// Buendels (bei Buendelung 1 genau wie [`Self::toggle_pad`]). In der
+    /// Aufnahme zaehlt weiter der laufende Schritt.
+    fn pad_buendel(&mut self, von: u16, bis: u16, pitch: i32) {
+        if von == bis || (self.aufnahme && self.render_laeuft) {
+            self.toggle_pad(von, pitch);
+            return;
+        }
+        let pitch = self.skaliere_pitch(pitch);
+        let gesetzt = self.pattern_mut().toggle_buendel(von, bis, pitch);
+        if gesetzt {
+            self.play(pitch, self.velocity);
+            self.note_klingen(pitch);
+        }
+        self.status = format!(
+            "{} Schritte {}: {} ({} Noten)",
+            bis - von + 1,
+            if gesetzt { "gesetzt" } else { "geloescht" },
+            note_name(pitch),
+            self.pattern().notes().len()
+        );
+    }
+
     /// Musterordner im externen App-Verzeichnis (ohne Berechtigung, per adb erreichbar).
     fn pattern_dir(&mut self) -> Option<String> {
         if self.dir.is_none() {
@@ -869,6 +912,21 @@ impl RhythmPanel {
                     self.status = "Patternlaenge: 16 Schritte".to_string();
                 }
             });
+            // Anzeige-Buendelung: lange Patterns in weniger Zellen, ohne die
+            // Patternlaenge zu aendern (Nutzerentscheidung 2026-10-14).
+            ui.horizontal(|ui| {
+                ui.label("Bündelung");
+                for wert in [1u16, 2, 4, 8, 16, 32] {
+                    if ui
+                        .selectable_label(self.buendel == wert, wert.to_string())
+                        .clicked()
+                    {
+                        self.buendel = wert;
+                        self.status = format!("Bündelung: {wert} Schritt(e) je Zelle");
+                        info!("Buendelung: {wert}");
+                    }
+                }
+            });
             ui.label("Bereich");
             ui.add(egui::DragValue::new(&mut self.bereich_von).range(0..=MAX_STEPS_PER_CYCLE - 1));
             ui.add(egui::DragValue::new(&mut self.bereich_bis).range(0..=MAX_STEPS_PER_CYCLE - 1));
@@ -911,6 +969,37 @@ impl RhythmPanel {
                         .color(Color32::GRAY),
                 );
             }
+        });
+        // Tongenerator: Stimmen und Tonlaenge (Nutzerentscheidung 2026-10-14).
+        // Gilt fuer alle lokalen Klaenge (Rhythmus, Bild-Scan, Rendern).
+        ui.horizontal(|ui| {
+            let e = crate::klang::einstellungen();
+            ui.label("Stimmen");
+            let mut stimmen = e.stimmen as i32;
+            if ui
+                .add(egui::DragValue::new(&mut stimmen).range(1..=256))
+                .changed()
+            {
+                crate::klang::stimmen_setzen(stimmen as usize);
+            }
+            ui.label("Länge");
+            egui::ComboBox::from_id_salt("klang_laenge")
+                .selected_text(format!("{} ({})", e.notenwert.name(), ms_text(e)))
+                .show_ui(ui, |ui| {
+                    for wert in jamcore::klang::Notenwert::ALLE {
+                        let ms = wert.ms(crate::klang::einstellungen().bpm);
+                        if ui
+                            .selectable_label(
+                                e.notenwert == wert,
+                                format!("{} ({ms} ms)", wert.name()),
+                            )
+                            .clicked()
+                        {
+                            crate::klang::notenwert_setzen(wert);
+                        }
+                    }
+                });
+            ui.label(egui::RichText::new(ms_text(e)).small().color(Color32::GRAY));
         });
         ui.label(
             egui::RichText::new(
@@ -1048,31 +1137,34 @@ impl RhythmPanel {
             self.presenter_zeichnen(ui);
         }
 
-        // Ein Block je 8 Schritte (16 passen nicht nebeneinander auf die
-        // Handy-Breite). Die Blockzahl folgt der **Patternlaenge**: bei der
-        // Vorgabe 512 sind das 64 Bloecke, die ScrollArea traegt sie. Vorher
-        // waren es fest zwei Bloecke (16 Schritte) — alles darueber war
-        // unsichtbar und damit nicht zu bearbeiten.
+        // Ein Block je 8 Zellen (16 passen nicht nebeneinander auf die
+        // Handy-Breite). Die Blockzahl folgt der **Patternlaenge** und der
+        // Buendelung: bei der Vorgabe 512 und Buendelung 1 sind das 64
+        // Bloecke, die ScrollArea traegt sie. Eine Zelle fasst `buendel`
+        // Schritte zusammen und leuchtet, wenn darin eine Note liegt.
         let schritte = self.pattern().steps_per_cycle().max(1);
-        let bloecke = schritte.div_ceil(BLOCK);
+        let buendel = self.buendel.max(1);
+        let je_block = BLOCK * buendel;
+        let bloecke = schritte.div_ceil(je_block);
         for block in 0..bloecke {
             Grid::new(format!("rhythm_block{block}"))
                 .spacing([2.0, 2.0])
                 .show(ui, |ui| {
-                    let erster = block * BLOCK;
-                    let letzter = (erster + BLOCK).min(schritte);
+                    let erster = block * je_block;
+                    let letzter = (erster + je_block).min(schritte);
                     ui.label(
                         RichText::new(format!("{}-{}", erster + 1, letzter))
                             .small()
                             .color(Color32::GRAY),
                     );
                     for i in 0..BLOCK {
-                        let step = block * BLOCK + i;
-                        if step >= schritte {
+                        let zelle = block * BLOCK + i;
+                        let anfang = zelle as u32 * buendel as u32;
+                        if anfang >= schritte as u32 {
                             _ = ui.allocate_painter(egui::vec2(CELL, 12.0), Sense::hover());
                         } else if i % 2 == 0 {
                             ui.label(
-                                RichText::new(format!("{}", step + 1))
+                                RichText::new(format!("{}", anfang + 1))
                                     .small()
                                     .color(Color32::GRAY),
                             );
@@ -1084,15 +1176,18 @@ impl RhythmPanel {
                     for pitch in ROWS {
                         ui.label(RichText::new(note_name(pitch)).small());
                         for i in 0..BLOCK {
-                            let step = block * BLOCK + i;
-                            if step >= schritte {
-                                // Laenge kein Vielfaches von 8: Restzelle leer,
-                                // aber gleiche Breite wie die anderen.
+                            let zelle = block * BLOCK + i;
+                            let anfang = zelle as u32 * buendel as u32;
+                            if anfang >= schritte as u32 {
+                                // Laenge kein Vielfaches: Restzelle leer, aber
+                                // gleiche Breite wie die anderen.
                                 _ = ui.allocate_painter(egui::vec2(CELL, CELL), Sense::hover());
                                 continue;
                             }
-                            let on = self.pattern().has_at(step, pitch);
-                            let played = step == self.current_step;
+                            let (von, bis) =
+                                jamcore::grid::buendel_spanne(zelle as usize, buendel, schritte);
+                            let on = self.pattern().hat_im_buendel(von, bis, pitch);
+                            let played = self.current_step >= von && self.current_step <= bis;
                             let color = if on {
                                 Color32::from_rgb(90, 200, 120)
                             } else if played {
@@ -1122,7 +1217,7 @@ impl RhythmPanel {
                                 );
                             }
                             if cell.clicked() {
-                                self.toggle_pad(step, pitch);
+                                self.pad_buendel(von, bis, pitch);
                             }
                         }
                         ui.end_row();

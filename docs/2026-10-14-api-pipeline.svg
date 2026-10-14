@@ -1,0 +1,318 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1200" width="1600" height="1200" font-family="DejaVu Sans, Arial, Helvetica, sans-serif">
+  <title>JamCore: Werte-Fluss zwischen den Dateien (2026-10-14)</title>
+  <desc>Wert-Fluesse zwischen core/src (links) und android/src (rechts). Gestrichelte Rechtecke sind neu/in Arbeit.</desc>
+  <defs>
+    <marker id="pfeil" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#44506a"/>
+    </marker>
+    <marker id="pfeilneu" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#b07a00"/>
+    </marker>
+    <style>
+      .kante { fill: none; stroke: #44506a; stroke-width: 1.4; }
+      .kanteneu { fill: none; stroke: #b07a00; stroke-width: 1.6; stroke-dasharray: 5 4; }
+      .box { fill: #ffffff; stroke: #4a6da8; stroke-width: 1.5; }
+      .boxa { fill: #ffffff; stroke: #3f8a5f; stroke-width: 1.5; }
+      .boxneu { fill: #fffcf0; stroke: #b07a00; stroke-width: 1.6; stroke-dasharray: 6 4; }
+      .name { font-size: 13px; font-weight: bold; fill: #1d2c3d; }
+      .rolle { font-size: 12px; fill: #5a6678; }
+      .label { font-size: 12px; fill: #2b3648; }
+      .gruppe { font-size: 15px; font-weight: bold; }
+      .hinweis { font-size: 12px; fill: #4a5568; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="1200" fill="#fbfcfe"/>
+  <text x="800" y="34" text-anchor="middle" font-size="24" font-weight="bold" fill="#16243a">JamCore: Werte-Fluss zwischen den Dateien (2026-10-14)</text>
+  <text x="800" y="56" text-anchor="middle" font-size="13" fill="#4a5568">Arbeitsbaum, nur gelesen · Kasten = Datei · Pfeil = uebergebener Wert · gestrichelt/ocker = neu bzw. geplant (maske2.rs, tasten.rs)</text>
+
+  <!-- Gruppierungen -->
+  <rect x="20" y="72" width="440" height="1090" rx="10" fill="#f2f6fd" stroke="#4a6da8" stroke-width="1.2"/>
+  <rect x="1140" y="72" width="440" height="1090" rx="10" fill="#f2fbf5" stroke="#3f8a5f" stroke-width="1.2"/>
+  <text x="36" y="98" class="gruppe" fill="#2c4a7c">jamcore — core/src (hardwarefrei)</text>
+  <text x="1156" y="98" class="gruppe" fill="#2c6a45">jamandroid — android/src (egui-App)</text>
+
+  <!-- ============ KANTEN (vor den Boxen) ============ -->
+  <!-- Maske/Schrittweite zum Bild -->
+  <path class="kante" d="M444 181 H480 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 181 H496 V481 H1156" marker-end="url(#pfeil)"/>
+  <path class="kanteneu" d="M444 181 H512 V531 H1156" marker-end="url(#pfeilneu)"/>
+  <path class="kante" d="M444 231 H530 V231 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 231 H546 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 281 H562 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 331 H578 V481 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 331 H594 V531 H1156" marker-end="url(#pfeil)"/>
+  <!-- OSC -->
+  <path class="kante" d="M444 381 H612 V431 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 381 H628 V231 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 381 H644 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 381 H660 V381 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 381 H676 V631 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 381 H692 V131 H1156" marker-end="url(#pfeil)"/>
+  <!-- Tempo/Session -->
+  <path class="kante" d="M444 431 H710 V131 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 431 H726 V681 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 481 H742 V381 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 531 H758 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 581 H774 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 631 H790 V181 H1156" marker-end="url(#pfeil)"/>
+  <!-- Klang/Openmpt -->
+  <path class="kante" d="M444 681 H808 V331 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 731 H826 V281 H1156" marker-end="url(#pfeil)"/>
+  <!-- Transformation/Diary -->
+  <path class="kante" d="M444 781 H844 V231 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 781 H862 V381 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 831 H880 V731 H1156" marker-end="url(#pfeil)"/>
+  <!-- Datei-IO/Pipes -->
+  <path class="kante" d="M444 931 H898 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 981 H916 V881 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 1031 H934 V631 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 1081 H952 V981 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 881 H970 V281 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 131 H984 V131 H1156" marker-end="url(#pfeil)"/>
+  <!-- Kern-interne Kanten -->
+  <path class="kante" d="M444 231 H466 V831 H444" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 731 H470 V881 H444" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 781 H474 V231 H444" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M444 281 H478 V181 H444" marker-end="url(#pfeil)"/>
+  <!-- App-interne Kanten -->
+  <path class="kante" d="M1156 881 H990 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 131 H1002 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 131 H1014 V231 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 831 H1026 V781 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 681 H1038 V131 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 381 H1050 V131 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 931 H1062 V881 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 481 H1074 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kanteneu" d="M1156 531 H1086 V181 H1156" marker-end="url(#pfeilneu)"/>
+  <path class="kante" d="M1156 181 H1098 V231 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 281 H1110 V231 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 281 H1122 V181 H1156" marker-end="url(#pfeil)"/>
+  <path class="kante" d="M1156 581 H1134 V481 H1156" marker-end="url(#pfeil)"/>
+
+  <!-- ============ BOXEN core/src ============ -->
+  <g>
+    <rect class="box" x="36" y="110" width="408" height="42"/>
+    <text class="name" x="46" y="127">LIB · lib.rs</text>
+    <text class="rolle" x="46" y="144">pub mod ...; rusty_link (Feature link)</text>
+
+    <rect class="box" x="36" y="160" width="408" height="42"/>
+    <text class="name" x="46" y="177">SW · schrittweite.rs</text>
+    <text class="rolle" x="46" y="194">Tipp, Rampen, modulieren, spalten()</text>
+
+    <rect class="box" x="36" y="210" width="408" height="42"/>
+    <text class="name" x="46" y="227">GR · grid.rs</text>
+    <text class="rolle" x="46" y="244">Pattern/Note, CSV/XML, Renoise-Notennamen</text>
+
+    <rect class="box" x="36" y="260" width="408" height="42"/>
+    <text class="name" x="46" y="277">SM · scanmask.rs</text>
+    <text class="rolle" x="46" y="294">ScanMaske, KeyEventRender.txt</text>
+
+    <rect class="box" x="36" y="310" width="408" height="42"/>
+    <text class="name" x="46" y="327">MK · maske.rs</text>
+    <text class="rolle" x="46" y="344">Ziffer zu Position, Verteilungen</text>
+
+    <rect class="box" x="36" y="360" width="408" height="42"/>
+    <text class="name" x="46" y="377">OSC · osc.rs</text>
+    <text class="rolle" x="46" y="394">OscOut/Renoise, bpm_und_teiler, osc.txt</text>
+
+    <rect class="box" x="36" y="410" width="408" height="42"/>
+    <text class="name" x="46" y="427">SES · session.rs</text>
+    <text class="rolle" x="46" y="444">tempo_gesamt/-folgen, naechster_beat</text>
+
+    <rect class="box" x="36" y="460" width="408" height="42"/>
+    <text class="name" x="46" y="477">MB · micbpm.rs</text>
+    <text class="rolle" x="46" y="494">Onsets, BpmEstimator, pcm16_le_to_f32</text>
+
+    <rect class="box" x="36" y="510" width="408" height="42"/>
+    <text class="name" x="46" y="527">TK · takte.rs</text>
+    <text class="rolle" x="46" y="544">sweep_sekunden(takte, bpm)</text>
+
+    <rect class="box" x="36" y="560" width="408" height="42"/>
+    <text class="name" x="46" y="577">LS · livescan.rs</text>
+    <text class="rolle" x="46" y="594">ScanFilter, scan_column, note_volume</text>
+
+    <rect class="box" x="36" y="610" width="408" height="42"/>
+    <text class="name" x="46" y="627">HA · harmonie.rs</text>
+    <text class="rolle" x="46" y="644">note_erlaubt, Notenmengen-Baender</text>
+
+    <rect class="box" x="36" y="660" width="408" height="42"/>
+    <text class="name" x="46" y="677">KL · klang.rs</text>
+    <text class="rolle" x="46" y="694">frequenz, puffer_welle (5 Wellen)</text>
+
+    <rect class="box" x="36" y="710" width="408" height="42"/>
+    <text class="name" x="46" y="727">OMPT · openmpt.rs</text>
+    <text class="rolle" x="46" y="744">Mod: from_bytes/read_stereo/play_note</text>
+
+    <rect class="box" x="36" y="760" width="408" height="42"/>
+    <text class="name" x="46" y="777">TR · transformation.rs</text>
+    <text class="rolle" x="46" y="794">transponieren/quantisieren, bpm_aus_taps</text>
+
+    <rect class="box" x="36" y="810" width="408" height="42"/>
+    <text class="name" x="46" y="827">DY · diary.rs</text>
+    <text class="rolle" x="46" y="844">Entry: to_text/from_text (CSV)</text>
+
+    <rect class="box" x="36" y="860" width="408" height="42"/>
+    <text class="name" x="46" y="877">WAV · wav.rs</text>
+    <text class="rolle" x="46" y="894">wav_variation zu WAV-Bytes</text>
+
+    <rect class="box" x="36" y="910" width="408" height="42"/>
+    <text class="name" x="46" y="927">BMP · bmp.rs</text>
+    <text class="rolle" x="46" y="944">bmp_aus_rgba</text>
+
+    <rect class="box" x="36" y="960" width="408" height="42"/>
+    <text class="name" x="46" y="977">YUV · yuv.rs</text>
+    <text class="rolle" x="46" y="994">yuv420_to_rgba (3 Planes)</text>
+
+    <rect class="box" x="36" y="1010" width="408" height="42"/>
+    <text class="name" x="46" y="1027">QZ · quint.rs</text>
+    <text class="rolle" x="46" y="1044">CIRCLE, note_classes, Segment-Hit</text>
+
+    <rect class="box" x="36" y="1060" width="408" height="42"/>
+    <text class="name" x="46" y="1077">GES · gesten.rs</text>
+    <text class="rolle" x="46" y="1094">Gesten: Zoom/Pan je Finger</text>
+  </g>
+
+  <!-- ============ BOXEN android/src ============ -->
+  <g>
+    <rect class="boxa" x="1156" y="110" width="408" height="42"/>
+    <text class="name" x="1166" y="127">LIB · lib.rs (JamApp)</text>
+    <text class="rolle" x="1166" y="144">tempo_bpm, Panels, Link-Session</text>
+
+    <rect class="boxa" x="1156" y="160" width="408" height="42"/>
+    <text class="name" x="1166" y="177">BILD · image.rs</text>
+    <text class="rolle" x="1166" y="194">Bild/Scan/Maske, RGBA-Textur</text>
+
+    <rect class="boxa" x="1156" y="210" width="408" height="42"/>
+    <text class="name" x="1166" y="227">RHY · rhythm.rs</text>
+    <text class="rolle" x="1166" y="244">Raster, Rendern (jam-render), Export</text>
+
+    <rect class="boxa" x="1156" y="260" width="408" height="42"/>
+    <text class="name" x="1166" y="277">PLR · player.rs</text>
+    <text class="rolle" x="1166" y="294">AudioTrack + ModulQuelle</text>
+
+    <rect class="boxa" x="1156" y="310" width="408" height="42"/>
+    <text class="name" x="1166" y="327">KLANG · klang.rs</text>
+    <text class="rolle" x="1166" y="344">AudioTrack-Tongenerator (jam-klang)</text>
+
+    <rect class="boxa" x="1156" y="360" width="408" height="42"/>
+    <text class="name" x="1166" y="377">MIC · mic.rs</text>
+    <text class="rolle" x="1166" y="394">AudioRecord zu BpmEstimator</text>
+
+    <rect class="boxa" x="1156" y="410" width="408" height="42"/>
+    <text class="name" x="1166" y="427">OSC · osc.rs</text>
+    <text class="rolle" x="1166" y="444">OSC-Ziel, osc.txt, Renoise-Befehle</text>
+
+    <rect class="boxa" x="1156" y="460" width="408" height="42"/>
+    <text class="name" x="1166" y="477">MASKE · maske.rs</text>
+    <text class="rolle" x="1166" y="494">Feld: Folge aus Zeit + Indexnum</text>
+
+    <rect class="boxneu" x="1156" y="510" width="408" height="42"/>
+    <text class="name" x="1166" y="527">MASKE2 · maske2.rs (neu)</text>
+    <text class="rolle" x="1166" y="544">10er-Numpad-Feld, Ende-Knopf</text>
+
+    <rect class="boxneu" x="1156" y="560" width="408" height="42"/>
+    <text class="name" x="1166" y="577">TASTEN · tasten.rs (neu)</text>
+    <text class="rolle" x="1166" y="594">Taste::Ziffer / Taste::Enter</text>
+
+    <rect class="boxa" x="1156" y="610" width="408" height="42"/>
+    <text class="name" x="1166" y="627">KREIS · quint.rs</text>
+    <text class="rolle" x="1166" y="644">Kreis-Touchscheibe, Notenklassen</text>
+
+    <rect class="boxa" x="1156" y="660" width="408" height="42"/>
+    <text class="name" x="1166" y="677">SESSION · session_ui.rs</text>
+    <text class="rolle" x="1166" y="694">Link-Anzeige, folgen, Quantum</text>
+
+    <rect class="boxa" x="1156" y="710" width="408" height="42"/>
+    <text class="name" x="1166" y="727">TAGE · diary.rs</text>
+    <text class="rolle" x="1166" y="744">Tagebuch-Dateien</text>
+
+    <rect class="boxa" x="1156" y="760" width="408" height="42"/>
+    <text class="name" x="1166" y="777">PFAD · paths.rs</text>
+    <text class="rolle" x="1166" y="794">Modulsuche (.it/.xm/.mod/.s3m/.mtm)</text>
+
+    <rect class="boxa" x="1156" y="810" width="408" height="42"/>
+    <text class="name" x="1166" y="827">INSETS · insets.rs</text>
+    <text class="rolle" x="1166" y="844">external_files_dir, Systemleisten</text>
+
+    <rect class="boxa" x="1156" y="860" width="408" height="42"/>
+    <text class="name" x="1166" y="877">CAM · camera.rs</text>
+    <text class="rolle" x="1166" y="894">CameraBridge, RGBA-Framepuffer</text>
+
+    <rect class="boxa" x="1156" y="910" width="408" height="42"/>
+    <text class="name" x="1166" y="927">VID · video.rs</text>
+    <text class="rolle" x="1166" y="944">VideoBridge zu camera::ablegen</text>
+
+    <rect class="boxa" x="1156" y="960" width="408" height="42"/>
+    <text class="name" x="1166" y="977">TOUCH · touch.rs</text>
+    <text class="rolle" x="1166" y="994">Touch-Events zu jamcore::gesten</text>
+
+    <rect class="boxa" x="1156" y="1010" width="408" height="42"/>
+    <text class="name" x="1166" y="1027">LAYOUT · layout.rs</text>
+    <text class="rolle" x="1166" y="1044">Kombi-Layout (zwei Bereiche)</text>
+
+    <rect class="boxa" x="1156" y="1060" width="408" height="42"/>
+    <text class="name" x="1166" y="1077">LINK · link_support.rs</text>
+    <text class="rolle" x="1166" y="1094">MulticastLock (Java)</text>
+
+    <rect class="boxa" x="1156" y="1110" width="408" height="42"/>
+    <text class="name" x="1166" y="1127">JNI · jniutil.rs</text>
+    <text class="rolle" x="1166" y="1144">with_env, jstring, Ausnahmen</text>
+  </g>
+
+  <!-- ============ LABELS an den Kanten (erst gedreht, dann waagerecht) ============ -->
+  <!-- gedrehte Labels -->
+  <g transform="translate(498,331) rotate(-90)"><rect x="-133" y="-19" width="266" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">Tipp{zeit,indexnum} &#8594; timestamps()</text></g>
+  <g transform="translate(514,356) rotate(-90)"><rect x="-102" y="-19" width="204" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">timestamps() (neu, geplant)</text></g>
+  <g transform="translate(580,406) rotate(-90)"><rect x="-67" y="-19" width="134" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">position_linear()</text></g>
+  <g transform="translate(596,431) rotate(-90)"><rect x="-88" y="-19" width="176" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">position_numpad() (neu)</text></g>
+  <g transform="translate(630,306) rotate(-90)"><rect x="-74" y="-19" width="148" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">note_on(pitch, vel)</text></g>
+  <g transform="translate(646,281) rotate(-90)"><rect x="-88" y="-19" width="176" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">note_on + trigger_midi</text></g>
+  <g transform="translate(678,506) rotate(-90)"><rect x="-91" y="-19" width="182" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">note_on(7000, note, 127)</text></g>
+  <g transform="translate(694,256) rotate(-90)"><rect x="-98" y="-19" width="196" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">bpm_und_teiler &#8594; 7000/7001</text></g>
+  <g transform="translate(712,281) rotate(-90)"><rect x="-137" y="-19" width="274" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">tempo_gesamt(folgen, session, eigen)</text></g>
+  <g transform="translate(728,556) rotate(-90)"><rect x="-112" y="-19" width="224" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">SessionZustand{bpm,beat,peers}</text></g>
+  <g transform="translate(760,356) rotate(-90)"><rect x="-98" y="-19" width="196" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">sweep_sekunden(takte, bpm)</text></g>
+  <g transform="translate(776,381) rotate(-90)"><rect x="-119" y="-19" width="238" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">scan_column() &#8594; Vec&lt;(y,r,g,b)&gt;</text></g>
+  <g transform="translate(792,406) rotate(-90)"><rect x="-81" y="-19" width="162" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">note_erlaubt(note, x)</text></g>
+  <g transform="translate(810,506) rotate(-90)"><rect x="-133" y="-19" width="266" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">puffer_welle(freq, rate, ms, welle)</text></g>
+  <g transform="translate(828,506) rotate(-90)"><rect x="-105" y="-19" width="210" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">Mod::from_bytes/read_stereo</text></g>
+  <g transform="translate(846,506) rotate(-90)"><rect x="-137" y="-19" width="274" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">transponieren/quantisieren/umkehren</text></g>
+  <g transform="translate(864,581) rotate(-90)"><rect x="-70" y="-19" width="140" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">bpm_aus_taps(taps)</text></g>
+  <g transform="translate(900,556) rotate(-90)"><rect x="-123" y="-19" width="246" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">bmp_aus_rgba() &#8594; frame4save.bmp</text></g>
+  <g transform="translate(936,831) rotate(-90)"><rect x="-123" y="-19" width="246" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">CIRCLE, note_classes(), Hit-Test</text></g>
+  <g transform="translate(972,581) rotate(-90)"><rect x="-112" y="-19" width="224" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">wav_variation(&amp;Mod, sekunden)</text></g>
+  <g transform="translate(468,531) rotate(-90)"><rect x="-18" y="-19" width="36" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">Mod</text></g>
+  <g transform="translate(476,506) rotate(-90)"><rect x="-49" y="-19" width="98" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">Note/Pattern</text></g>
+  <g transform="translate(992,531) rotate(-90)"><rect x="-98" y="-19" width="196" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">letztes_bild(): (w,h,RGBA)</text></g>
+  <g transform="translate(1040,406) rotate(-90)"><rect x="-109" y="-19" width="218" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">folgen: bool; SessionZustand</text></g>
+  <g transform="translate(1052,256) rotate(-90)"><rect x="-126" y="-19" width="252" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">uebernommenes_tempo() &#8594; tempo_bpm</text></g>
+  <g transform="translate(1076,331) rotate(-90)"><rect x="-98" y="-19" width="196" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">zeiten() + tempo: Vec&lt;f32&gt;</text></g>
+  <g transform="translate(1088,356) rotate(-90)"><rect x="-67" y="-19" width="134" height="17" fill="#ffffff" opacity="0.85"/><text class="label" text-anchor="middle" y="-6">geplant: zeiten()</text></g>
+
+  <!-- waagerechte Labels -->
+  <g transform="translate(484,175)"><rect x="-4" y="-19" width="245" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">zeiten: Vec&lt;f32&gt;; tempo: Vec&lt;f32&gt;</text></g>
+  <g transform="translate(550,210)"><rect x="-4" y="-19" width="217" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">steps_per_cycle, insert(Note)</text></g>
+  <g transform="translate(534,231)"><rect x="-4" y="-19" width="322" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">Pattern{steps_per_cycle, Note{step,pitch}}</text></g>
+  <g transform="translate(566,263)"><rect x="-4" y="-19" width="231" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">abschnitte() &#8594; (von,bis,alpha)</text></g>
+  <g transform="translate(616,407)"><rect x="-4" y="-19" width="217" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">note_on/bpm/transport/follow</text></g>
+  <g transform="translate(664,378)"><rect x="-4" y="-19" width="210" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">bpm: f32 &#8594; /renoise/song/bpm</text></g>
+  <g transform="translate(746,434)"><rect x="-4" y="-19" width="231" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">pcm16_le_to_f32(), BpmEstimator</text></g>
+  <g transform="translate(884,779)"><rect x="-4" y="-19" width="231" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">Entry::to_text/from_text (CSV)</text></g>
+  <g transform="translate(920,929)"><rect x="-4" y="-19" width="210" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">yuv420_to_rgba(Plane Y,U,V)</text></g>
+  <g transform="translate(956,1029)"><rect x="-4" y="-19" width="133" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">Punkt/Phase/Geste</text></g>
+  <g transform="translate(1148,129)"><rect x="-290" y="-19" width="294" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">pub mod ...; rusty_link (Feature link)</text></g>
+  <g transform="translate(458,227)"><rect x="-4" y="-19" width="77" height="17" fill="#ffffff" opacity="0.85"/><text class="label" y="-6">spalten()</text></g>
+  <g transform="translate(1148,171)"><rect x="-178" y="-19" width="182" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">set_bpm(tempo_aktuell())</text></g>
+  <g transform="translate(1148,201)"><rect x="-192" y="-19" width="196" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">set_tempo(tempo_aktuell())</text></g>
+  <g transform="translate(1148,227)"><rect x="-178" y="-19" width="182" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">insert(Note{step,pitch})</text></g>
+  <g transform="translate(1148,253)"><rect x="-199" y="-19" width="203" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">ModulQuelle.note_spielen()</text></g>
+  <g transform="translate(1148,277)"><rect x="-87" y="-19" width="91" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">ModulQuelle</text></g>
+  <g transform="translate(1148,525)"><rect x="-143" y="-19" width="147" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">Taste::Ziffer/Enter</text></g>
+  <g transform="translate(1148,801)"><rect x="-150" y="-19" width="154" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">external_files_dir()</text></g>
+  <g transform="translate(1148,901)"><rect x="-150" y="-19" width="154" height="17" fill="#ffffff" opacity="0.9"/><text class="label" text-anchor="end" y="-6">ablegen(YUV &#8594; RGBA)</text></g>
+
+  <!-- Fussnoten -->
+  <g transform="translate(36,1184)"><path class="kante" d="M0 0 H56" marker-end="url(#pfeil)"/><path class="kanteneu" d="M76 0 H128" marker-end="url(#pfeilneu)"/><text class="hinweis" x="140" y="4">durchgezogen: heutiger Wertfluss · gestrichelt (ocker): neu/in Arbeit bzw. geplant</text></g>
+  <text class="hinweis" x="1156" y="1188">rusty_link (SDK, Feature link): AblLink in lib.rs; Link-BPM siehe Pipeline c in docs/2026-10-14-api-pipeline.md</text>
+</svg>

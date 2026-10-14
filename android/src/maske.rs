@@ -103,6 +103,9 @@ pub struct MaskePanel {
     pan: egui::Vec2,
     /// Bildschirmgrenze des Fensters (für Zoom um die Fingerposition).
     sichtbar: egui::Rect,
+    /// Wann zuletzt etwas aufgenommen wurde — die zuletzt benutzte Maske
+    /// speist den gruenen Balken im Bild-Tab.
+    letzte_aenderung: Option<std::time::Instant>,
 }
 
 impl Default for MaskePanel {
@@ -133,7 +136,13 @@ impl MaskePanel {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             sichtbar: egui::Rect::NOTHING,
+            letzte_aenderung: None,
         }
+    }
+
+    /// Wann zuletzt etwas aufgenommen wurde (die neueste Maske gewinnt im Bild).
+    pub fn letzte_aenderung(&self) -> Option<std::time::Instant> {
+        self.letzte_aenderung
     }
 
     /// Die aufgezeichnete Folge (Zeitabstaende) fuer den Bild-Scan.
@@ -164,6 +173,7 @@ impl MaskePanel {
         self.auswahl = None;
         self.fest = false;
         self.anker = None;
+        self.letzte_aenderung = Some(std::time::Instant::now());
         self.status = "neu — Feld tippen nimmt auf".to_string();
         info!("Maske: neu");
     }
@@ -172,6 +182,34 @@ impl MaskePanel {
     /// beim C++-Recorder, wo der Timer beim ersten Tastendruck startet.
     fn zeit_seit_anker(&self) -> f32 {
         self.anker.map(|a| a.elapsed().as_secs_f32()).unwrap_or(0.0)
+    }
+
+    /// Einen Feldruck verarbeiten — gemeinsam fuer Touch und Nummernblock.
+    ///
+    /// Der C++-Recorder startet seinen Timer beim ersten Tastendruck; danach
+    /// laeuft die Aufnahme weiter (kein Ende), bis die Pause
+    /// `NEU_AFTER_SEKUNDEN` eine neue Folge beginnt. Eine festgehaltene Folge
+    /// bleibt stehen, bis „neu“ oder „leeren“ kommt.
+    fn feld_anschlagen(&mut self, taste: usize, pos: egui::Pos2) {
+        if self.fest {
+            return;
+        }
+        let neu = jamcore::schrittweite::beginnt_aufnahme(
+            true,
+            self.anker.map(|a| a.elapsed().as_secs_f32()),
+            NEU_AFTER_SEKUNDEN,
+        );
+        if neu {
+            self.anker = Some(std::time::Instant::now());
+            self.folge.clear();
+            self.zwischenschritte.clear();
+            self.regeln.clear();
+            self.auswahl = None;
+            self.spur.clear();
+            info!("Masken-Aufnahme durch ersten Tipp gestartet");
+        }
+        self.spur.clear();
+        self.druck_aufnehmen(taste, pos, Vec::new());
     }
 
     /// Einen Feldruck aufnehmen: Feldwert als Indexnum, Zeit und (beim Wisch)
@@ -191,6 +229,7 @@ impl MaskePanel {
         // die Bildspalten — sonst sind sie nach dem Bild-Tab weg). Die Regeln
         // (min/max aus der Zeitleiste) gehen mit ein.
         self.zwischenschritte = self.zeiten();
+        self.letzte_aenderung = Some(std::time::Instant::now());
         let anzahl = self.folge.len();
         let gesamt = self.zwischenschritte.len();
         self.status = format!("{anzahl} Toene, {gesamt} Zeitpunkte, {zeit:.1} s");
@@ -299,6 +338,7 @@ impl MaskePanel {
                 self.spur.clear();
                 self.fest = false;
                 self.anker = None;
+                self.letzte_aenderung = Some(std::time::Instant::now());
                 self.status = "Aufzeichnung geleert.".to_string();
             }
         });
@@ -442,9 +482,9 @@ impl MaskePanel {
         // letzter; ein Wisch ueber mehrere Felder zaehlt Anfangs- und
         // Endtaste als zwei Zeitpunkte mit dem Abstand dazwischen.
         for (id, pos) in rahmen.starts {
-            // Solange die Folge festgehalten ist (nach „leeren“), zeichnet ein
-            // Felddruck nichts auf — sonst waere die festgehaltene Folge beim
-            // naechsten Tippen weg.
+            // Solange die Folge festgehalten ist, zeichnet ein Felddruck
+            // nichts auf — sonst waere die festgehaltene Folge beim naechsten
+            // Tippen weg (und ein Wisch-Endpunkt wuerde trotzdem schreiben).
             if self.fest {
                 continue;
             }
@@ -459,28 +499,7 @@ impl MaskePanel {
             self.wisch.insert(id, (Some(taste), Some(taste)));
             self.wege.entry(id).or_default();
             self.spurpunkt.insert(id, (pos, std::time::Instant::now()));
-            // Der allererste Druckoeffnet die Aufnahme: der C++-Recorder
-            // startet seinen Timer beim ersten Tastendruck. Danach laeuft die
-            // Aufnahme weiter (es gibt kein Ende), bis die Pause
-            // `NEU_AFTER_SEKUNDEN` eine neue Folge beginnt — sonst haette der
-            // Anker aus der Vorsitzung (548 s) den ersten Tipp um 548 s
-            // verschoben.
-            let neu = jamcore::schrittweite::beginnt_aufnahme(
-                true,
-                self.anker.map(|a| a.elapsed().as_secs_f32()),
-                NEU_AFTER_SEKUNDEN,
-            );
-            if neu {
-                self.anker = Some(std::time::Instant::now());
-                self.folge.clear();
-                self.zwischenschritte.clear();
-                self.regeln.clear();
-                self.auswahl = None;
-                self.spur.clear();
-                info!("Masken-Aufnahme durch ersten Tipp gestartet");
-            }
-            self.spur.clear();
-            self.druck_aufnehmen(taste, pos, Vec::new());
+            self.feld_anschlagen(taste, pos);
         }
         for (id, pos) in rahmen.zuege {
             self.weg_messen(id, pos);
@@ -507,6 +526,20 @@ impl MaskePanel {
             if let Some(ende) = gewandert {
                 let pos = self.zentrum(rect, ende);
                 self.druck_aufnehmen(ende, pos, tempo);
+            }
+        }
+
+        // USB-Nummernblock: die Ziffern 1..9,0 treffen die ersten zehn
+        // Positionen in Leserichtung (Nutzerentscheidung 2026-10-14); Enter
+        // gibt es hier nicht — das „Ende“ gehoert zu Maske 2.
+        for taste in crate::tasten::tasten(ui) {
+            if let crate::tasten::Taste::Ziffer(ziffer) = taste {
+                if let Some(position) =
+                    jamcore::maske::position_linear(ziffer, self.tasten_anzahl())
+                {
+                    let pos = self.zentrum(rect, position);
+                    self.feld_anschlagen(position, pos);
+                }
             }
         }
 

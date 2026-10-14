@@ -17,6 +17,37 @@ pub enum Verteilung {
     Bremsend,
 }
 
+/// Position im Tastenfeld (0-basiert) fuer eine Nummernblock-Ziffer, wenn das
+/// Feld in **Leserichtung** liegt (alte Maske: 0,1,2,… von links oben).
+/// Ziffer 1..9 trifft die Positionen 0..8, die Ziffer 0 die neunte Position.
+pub fn position_linear(ziffer: u8, feld: usize) -> Option<usize> {
+    let index = match ziffer {
+        1..=9 => (ziffer - 1) as usize,
+        0 => 9,
+        _ => return None,
+    };
+    (index < feld).then_some(index)
+}
+
+/// Position im 10er-Feld von Maske 2: das Feld liegt in **Nummernblock-
+/// Anordnung** (7-8-9 / 4-5-6 / 1-2-3 / 0), die Ziffer trifft also den
+/// raeumlich gleichen Knopf.
+pub fn position_numpad(ziffer: u8) -> Option<usize> {
+    match ziffer {
+        7 => Some(0),
+        8 => Some(1),
+        9 => Some(2),
+        4 => Some(3),
+        5 => Some(4),
+        6 => Some(5),
+        1 => Some(6),
+        2 => Some(7),
+        3 => Some(8),
+        0 => Some(9),
+        _ => None,
+    }
+}
+
 /// Positionen der Zwischenschritte zwischen zwei Tastendrücken, als Anteil
 /// von 0.0 (erster Druck) bis 1.0 (zweiter Druck), ohne die Endpunkte.
 ///
@@ -158,5 +189,29 @@ mod tests {
         assert_eq!(schritte_aus_wisch(10_000.0, 60.0, 32), 32, "gedeckelt");
         assert_eq!(schritte_aus_wisch(0.0, 60.0, 32), 1);
         assert_eq!(schritte_aus_wisch(f32::NAN, 60.0, 32), 1);
+    }
+
+    #[test]
+    fn ziffer_trifft_position() {
+        // Nutzerwunsch 2026-10-14: der USB-Nummernblock waehlt die **Position**
+        // im Tastenfeld, nicht den Wert: Ziffer 1 = erste Taste, Ziffer 0 =
+        // zehnte.
+        assert_eq!(position_linear(1, 10), Some(0));
+        assert_eq!(position_linear(5, 10), Some(4));
+        assert_eq!(position_linear(9, 10), Some(8));
+        assert_eq!(position_linear(0, 10), Some(9), "die Null ist die zehnte");
+        assert_eq!(position_linear(5, 4), None, "das Feld hat nur vier Tasten");
+        assert_eq!(position_linear(4, 4), Some(3), "die letzte passt noch");
+    }
+
+    #[test]
+    fn ziffer_trifft_den_raeumlich_gleichen_knopf() {
+        // Maske 2: Feld in Nummernblock-Anordnung (7-8-9 / 4-5-6 / 1-2-3 / 0).
+        assert_eq!(position_numpad(7), Some(0), "oben links");
+        assert_eq!(position_numpad(9), Some(2), "oben rechts");
+        assert_eq!(position_numpad(4), Some(3), "mitte links");
+        assert_eq!(position_numpad(5), Some(4), "Mitte");
+        assert_eq!(position_numpad(1), Some(6), "unten links");
+        assert_eq!(position_numpad(0), Some(9), "die Null ganz unten");
     }
 }

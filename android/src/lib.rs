@@ -10,6 +10,7 @@ mod klang;
 mod layout;
 mod link_support;
 mod maske;
+mod maske2;
 mod mic;
 mod osc;
 mod paths;
@@ -17,6 +18,7 @@ mod player;
 mod quint;
 mod rhythm;
 mod session_ui;
+mod tasten;
 mod touch;
 mod video;
 
@@ -46,9 +48,10 @@ enum Tab {
     Tempo,
     Bild,
     Kreis,
-    Session,
     Tagebuch,
     Maske,
+    Maske2,
+    Bild2,
     Kombi,
 }
 
@@ -79,11 +82,18 @@ struct JamApp {
     kombi_unten: KombiTeil,
     diary: diary::DiaryPanel,
     maske: maske::MaskePanel,
+    maske2: maske2::Maske2Panel,
     /// Wie stark die Wischgeschwindigkeit die Schrittweite im Maske-Tab kippt.
     maske_staerke: f32,
     /// **Ein** BPM für Tempo-Tab, Takt-Scan, Rendern und Tagebuch. Mit aktivem
     /// Link-Follow gewinnt das Session-Tempo (siehe `tempo_aktuell`).
     tempo_bpm: f32,
+    /// Das eine BPM der App zuletzt — ein Reglerzug irgendwo schreibt es ins
+    /// Link-Netz (Nutzerentscheidung 2026-10-14).
+    tempo_zuletzt: f32,
+    /// Zuletzt an Bild bzw. Rhythmus gereichter Wert (Rueckmeldung der Regler).
+    bild_tempo_sync: f32,
+    rhythm_tempo_sync: f32,
     /// Tempo-Teiler fuer Renoise-Port 7001 (wie rrn5 send_bpm; 1.0 = aus).
     tempo_teiler: f32,
     /// Laenge des WAV-Renders im Player-Tab (Sekunden).
@@ -122,8 +132,12 @@ impl Default for JamApp {
             kombi_unten: KombiTeil::Rhythmus,
             diary: diary::DiaryPanel::default(),
             maske: maske::MaskePanel::default(),
+            maske2: maske2::Maske2Panel::default(),
             maske_staerke: 0.5,
             tempo_bpm: 128.0,
+            tempo_zuletzt: 128.0,
+            bild_tempo_sync: 0.0,
+            rhythm_tempo_sync: 0.0,
             tempo_teiler: 1.0,
             wav_sekunden: 60.0,
             last_peak: 0.0,
@@ -153,13 +167,14 @@ impl JamApp {
             }
             let app = self.android_app.clone()?;
             self.frames += 1;
-            let found = insets::root_insets_px(&app).or_else(|| {
-                if self.frames > 180 {
-                    insets::status_bar_px(&app)
-                } else {
-                    None
-                }
-            });
+            // Die echten Fenster-Insets zuerst; (0,0) heisst meist „Fenster
+            // noch nicht angehaengt“ und wird nicht gecacht. Der Rueckfall auf
+            // die Statusleistenhoehe laeuft **sofort** mit: frueher wartete er
+            // 180 Frames, auf dem Pixel 4a lag die Tab-Leiste dadurch ~30 s
+            // unter der Statusleiste (gemessen 2026-11-14).
+            let found = insets::root_insets_px(&app)
+                .filter(|px| px.0 > 0.0 || px.1 > 0.0)
+                .or_else(|| insets::status_bar_px(&app));
             if let Some(px) = found {
                 log::info!("systemleisten {px:?}px");
                 self.insets_px = Some(px);
@@ -282,6 +297,9 @@ impl eframe::App for JamApp {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
 
+        // Das gemerkte OSC-Ziel (Laptop-IP/Port) einmal laden.
+        self.osc.laden();
+
         let px = self.insets_px();
         if px.is_none() {
             ui.ctx().request_repaint();
@@ -304,9 +322,10 @@ impl eframe::App for JamApp {
                     ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
                     ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
                     ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
-                    ui.selectable_value(&mut self.tab, Tab::Session, "Session");
                     ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
                     ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
+                    ui.selectable_value(&mut self.tab, Tab::Maske2, "M2");
+                    ui.selectable_value(&mut self.tab, Tab::Bild2, "B2");
                     ui.selectable_value(&mut self.tab, Tab::Kombi, "Kombi");
                 });
             });
@@ -341,11 +360,21 @@ impl eframe::App for JamApp {
             Tab::Tempo => self.view_mic(ui),
             Tab::Bild => self.view_bild(ui),
             Tab::Kreis => self.view_kreis(ui),
-            Tab::Session => self.view_session(ui),
             Tab::Tagebuch => self.view_tagebuch(ui),
             Tab::Maske => self.view_maske(ui),
+            Tab::Maske2 => self.view_maske2(ui),
+            Tab::Bild2 => self.view_bild2(ui),
             Tab::Kombi => self.view_kombi(ui),
         }
+
+        // Ein zentraler BPM-Wert: hat ihn irgendein Regler (oder die Messung)
+        // bewegt, geht er ins Link-Netz (Nutzerentscheidung 2026-10-14).
+        if (self.tempo_bpm - self.tempo_zuletzt).abs() > 0.01 {
+            self.tempo_zuletzt = self.tempo_bpm;
+            self.tempo_ins_link(self.tempo_bpm);
+        }
+        // Der Tongenerator rechnet Tonlaengen (Notenwert -> ms) mit diesem Tempo.
+        crate::klang::bpm_setzen(self.tempo_bpm);
     }
 }
 
@@ -354,7 +383,30 @@ impl JamApp {
     /// sonst der im OSC-Tab eingestellte Wert. Bild-Scan, Rendern und Tagebuch
     /// benutzen alle diese Zahl.
     fn tempo_aktuell(&self) -> f32 {
-        jamcore::session::tempo_gesamt(self.session.folgen(), self.session.tempo(), self.tempo_bpm)
+        // Den Link-Zustand **live** holen: der zwischengespeicherte Wert des
+        // Session-Panels ist nur so frisch wie sein letzter Tab-Besuch, und
+        // Bild/Rhythmus sollen dem Link-Tempo sofort folgen.
+        let mut s = jamcore::rusty_link::SessionState::new();
+        self.link.capture_app_session_state(&mut s);
+        jamcore::session::tempo_gesamt(self.session.folgen(), s.tempo(), self.tempo_bpm)
+    }
+
+    /// Das eine BPM setzen (Regler in Rhythmus, Bild, OSC und die Messung im
+    /// Tempo-Tab landen alle hier).
+    fn tempo_setzen(&mut self, bpm: f32) {
+        self.tempo_bpm = bpm.clamp(30.0, 300.0);
+    }
+
+    /// Einen Reglerzug ins Link-Netz schreiben: App-Zustand holen, Tempo
+    /// setzen, zurueckgeben (rusty_link: capture/set_tempo/commit). Damit
+    /// folgen andere Teilnehmer dem Regler (Nutzerentscheidung 2026-10-14);
+    /// ohne Link schreibt es nur in die eigene Session (harmlos).
+    fn tempo_ins_link(&mut self, bpm: f32) {
+        let mut zustand = jamcore::rusty_link::SessionState::new();
+        self.link.capture_app_session_state(&mut zustand);
+        zustand.set_tempo(bpm as f64, 0);
+        self.link.commit_app_session_state(&zustand);
+        log::info!("Tempo {bpm:.1} ins Link geschrieben");
     }
 
     fn view_ueberblick(&mut self, ui: &mut egui::Ui) {
@@ -457,22 +509,60 @@ impl JamApp {
             );
         });
         self.maske.ui(ui, self.rhythm.pattern_mut());
-        // Die aufgezeichnete Folge in den Bild-Scan: der Maske-Tab liefert die
-        // fertigen Zeitpunkte (Rampen + min/max-Regeln), der Bild-Tab legt
-        // sie auf die gemeinsame Patternlaenge.
-        let staerke = self.maske_staerke;
-        let zeiten = self.maske.zeiten();
-        let tempo: Vec<f32> = self
-            .maske
-            .folge()
-            .iter()
-            .flat_map(|a| a.tempo.iter().copied())
-            .collect();
-        if !zeiten.is_empty() {
-            let schritte = self.rhythm.pattern().steps_per_cycle();
-            self.bild
-                .maske_aus_zeiten(&zeiten, &tempo, staerke, schritte);
+        // Der Bild-Tab bekommt die Zeitpunkte der **zuletzt benutzten** Maske
+        // (Maske oder Maske 2) — beide schreiben in dieselbe gruene Maske.
+        self.bild_maske_aktualisieren();
+    }
+
+    /// Die Zeitpunkte der zuletzt benutzten Maske in die Bild-Maske legen.
+    fn bild_maske_aktualisieren(&mut self) {
+        let eins = self.maske.letzte_aenderung();
+        let zwei = self.maske2.letzte_aenderung();
+        let (zeiten, tempo) = match (eins, zwei) {
+            (Some(a), Some(b)) if b > a => (
+                self.maske2.zeiten(),
+                self.maske2
+                    .folge()
+                    .iter()
+                    .flat_map(|a| a.tempo.iter().copied())
+                    .collect::<Vec<f32>>(),
+            ),
+            (None, Some(_)) => (
+                self.maske2.zeiten(),
+                self.maske2
+                    .folge()
+                    .iter()
+                    .flat_map(|a| a.tempo.iter().copied())
+                    .collect::<Vec<f32>>(),
+            ),
+            _ => (
+                self.maske.zeiten(),
+                self.maske
+                    .folge()
+                    .iter()
+                    .flat_map(|a| a.tempo.iter().copied())
+                    .collect::<Vec<f32>>(),
+            ),
+        };
+        if zeiten.is_empty() {
+            return;
         }
+        let staerke = self.maske_staerke;
+        let schritte = self.rhythm.pattern().steps_per_cycle();
+        self.bild
+            .maske_aus_zeiten(&zeiten, &tempo, staerke, schritte);
+    }
+
+    fn view_maske2(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
+                .id_salt("maske2_inhalt")
+                .show(ui, |ui| {
+                    self.maske2.ui(ui, self.rhythm.pattern_mut());
+                    self.bild_maske_aktualisieren();
+                });
+        });
     }
 
     /// Kombi-Ansicht: zwei Module gleichzeitig (im Hochformat untereinander,
@@ -496,14 +586,31 @@ impl JamApp {
             KombiTeil::Bild => {
                 let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
                 self.bild.set_target(&host, &port);
-                let tempo = self.tempo_aktuell();
-                self.bild.set_bpm(tempo);
+                let effektiv = self.tempo_aktuell();
+                if (effektiv - self.bild_tempo_sync).abs() > 0.01 {
+                    self.bild.set_bpm(effektiv);
+                    self.bild_tempo_sync = effektiv;
+                }
                 self.bild.ui(ui, self.rhythm.pattern_mut());
+                let nach = self.bild.scan_bpm();
+                if (nach - effektiv).abs() > 0.01 {
+                    self.tempo_setzen(nach);
+                    self.bild_tempo_sync = self.tempo_bpm;
+                }
             }
             KombiTeil::Rhythmus => {
                 let tempo = self.tempo_aktuell();
                 self.rhythm.set_tempo(tempo);
+                if (self.tempo_bpm - self.rhythm_tempo_sync).abs() > 0.01 {
+                    self.rhythm.set_eigenuhr(self.tempo_bpm);
+                    self.rhythm_tempo_sync = self.tempo_bpm;
+                }
                 self.rhythm.ui(ui);
+                let nach = self.rhythm.eigenuhr_bpm();
+                if (nach - self.tempo_bpm).abs() > 0.01 {
+                    self.tempo_setzen(nach);
+                    self.rhythm_tempo_sync = self.tempo_bpm;
+                }
             }
             KombiTeil::Maske => self.maske_bereich(ui),
             KombiTeil::Tempo => {
@@ -525,6 +632,28 @@ impl JamApp {
                         .harmonie_band(klassen, self.bild.aktuelle_tipp_spalte());
                 }
             }
+        }
+    }
+
+    fn view_bild2(&mut self, ui: &mut egui::Ui) {
+        let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
+        self.bild.set_target(&host, &port);
+        // Gleiche Klangquelle und gleiches Tempo wie im Bild-Tab — es ist
+        // derselbe Panel-Zustand, nur das Layout ist anders.
+        let (quelle, welle, modul) = self.rhythm.klang_zustand();
+        self.bild.set_klang_zustand(quelle, welle, modul);
+        let effektiv = self.tempo_aktuell();
+        if (effektiv - self.bild_tempo_sync).abs() > 0.01 {
+            self.bild.set_bpm(effektiv);
+            self.bild_tempo_sync = effektiv;
+        }
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.bild.ui_vollbild(ui, self.rhythm.pattern_mut());
+        });
+        let nach = self.bild.scan_bpm();
+        if (nach - effektiv).abs() > 0.01 {
+            self.tempo_setzen(nach);
+            self.bild_tempo_sync = self.tempo_bpm;
         }
     }
 
@@ -564,10 +693,6 @@ impl JamApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.diary.ui(ui, bpm, &noten);
         });
-    }
-
-    fn view_session(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| self.session_block(ui));
     }
 
     /// Session-Inhalt ohne eigenen Rahmen (fuer den Kombi-Tab).
@@ -630,14 +755,22 @@ impl JamApp {
         let (quelle, welle, modul) = self.rhythm.klang_zustand();
         self.bild.set_klang_zustand(quelle, welle, modul);
         // Das eine Tempo (Follow gewinnt) — der Takt-Scan rechnet daraus die
-        // Sweep-Dauer.
-        let tempo = self.tempo_aktuell();
-        self.bild.set_bpm(tempo);
+        // Sweep-Dauer. Der BPM-Regler im Bild-Tab schreibt zurueck in die App.
+        let effektiv = self.tempo_aktuell();
+        if (effektiv - self.bild_tempo_sync).abs() > 0.01 {
+            self.bild.set_bpm(effektiv);
+            self.bild_tempo_sync = effektiv;
+        }
         egui::CentralPanel::default().show(ui, |ui| {
             // Das Bild darf Scan-Treffer ins Rhythmus-Pattern schreiben
             // (Bild-Follow, Desktop `L`/bpmo3).
             self.bild.ui(ui, self.rhythm.pattern_mut());
         });
+        let nach = self.bild.scan_bpm();
+        if (nach - effektiv).abs() > 0.01 {
+            self.tempo_setzen(nach);
+            self.bild_tempo_sync = self.tempo_bpm;
+        }
     }
 
     fn view_mic(&mut self, ui: &mut egui::Ui) {
@@ -645,15 +778,33 @@ impl JamApp {
         // durchgereicht (sonst müsste die IP zweimal eingetippt werden).
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.mic.set_target(&host, &port);
-        egui::CentralPanel::default().show(ui, |ui| self.mic.ui(ui));
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
+                .id_salt("tempo_inhalt")
+                .show(ui, |ui| {
+                    self.mic.ui(ui);
+                    ui.separator();
+                    // Link/Session gehoeren zum selben Tab wie die Messung
+                    // (Nutzerentscheidung 2026-10-14).
+                    self.session_block(ui);
+                });
+        });
     }
 
     fn view_rhythm(&mut self, ui: &mut egui::Ui) {
         let (host, port) = (self.osc.host.clone(), self.osc.port.clone());
         self.rhythm.set_target(&host, &port);
-        // Rendern benutzt dasselbe Tempo wie der Takt-Scan.
+        // Rendern benutzt dasselbe Tempo wie der Takt-Scan. Der Eigenuhr-
+        // Regler im Rhythmus-Tab schreibt zurueck in die App (ein BPM-Wert).
         let tempo = self.tempo_aktuell();
         self.rhythm.set_tempo(tempo);
+        // Den App-Wert in die Eigenuhr spiegeln, wenn er sich anderswo
+        // geaendert hat; die Anzeige folgt damit dem einen Wert.
+        if (self.tempo_bpm - self.rhythm_tempo_sync).abs() > 0.01 {
+            self.rhythm.set_eigenuhr(self.tempo_bpm);
+            self.rhythm_tempo_sync = self.tempo_bpm;
+        }
         if self.rhythm.follow() {
             if let Some(player) = self.player.as_ref() {
                 self.rhythm.set_follow_step(player.grid_step(4));
@@ -665,6 +816,14 @@ impl JamApp {
                 .id_salt("rhythmus_inhalt")
                 .show(ui, |ui| self.rhythm.ui(ui));
         });
+        // Der Eigenuhr-Regler schreibt zurueck in das eine BPM der App.
+        let nach = self.rhythm.eigenuhr_bpm();
+        if (nach - self.tempo_bpm).abs() > 0.01 {
+            self.tempo_setzen(nach);
+            self.rhythm_tempo_sync = self.tempo_bpm;
+            self.status = format!("Tempo: {:.0} BPM", self.tempo_bpm);
+            log::info!("Tempo aus dem Rhythmus: {:.1} BPM", self.tempo_bpm);
+        }
     }
 
     /// Das eine Tempo an Renoise schicken (`/renoise/song/bpm`).

@@ -54,6 +54,17 @@ impl Default for Pattern {
     }
 }
 
+/// Schritte, die eine Rasterzelle bei `buendel` Schritten je Zelle abdeckt
+/// (Anzeige-Regler im Rhythmus-Tab). Die letzte Zelle wird am Patternende
+/// gekappt.
+pub fn buendel_spanne(zelle: usize, buendel: u16, schritte: u16) -> (u16, u16) {
+    let buendel = buendel.max(1) as u32;
+    let letzter = schritte.saturating_sub(1) as u32;
+    let von = ((zelle as u32) * buendel).min(letzter) as u16;
+    let bis = (((zelle as u32 + 1) * buendel).saturating_sub(1)).min(letzter) as u16;
+    (von, bis)
+}
+
 impl Pattern {
     pub fn new() -> Self {
         Self::with_steps(STEPS_PER_CYCLE)
@@ -164,6 +175,36 @@ impl Pattern {
         self.notes
             .iter()
             .any(|n| n.step == step && n.pitch == pitch)
+    }
+
+    /// Buendel (Anzeige): liegt in `[von, bis]` (beide eingeschlossen) eine
+    /// Note dieser Hoehe?
+    pub fn hat_im_buendel(&self, von: u16, bis: u16, pitch: i32) -> bool {
+        let n = self.steps_per_cycle;
+        let (von, bis) = (von % n, bis % n);
+        self.notes
+            .iter()
+            .any(|note| note.pitch == pitch && note.step >= von && note.step <= bis)
+    }
+
+    /// Buendel schalten: hat es schon eine Note dieser Hoehe, werden **alle**
+    /// Schritte des Buendels entfernt; sonst werden **alle** Schritte gesetzt
+    /// (Nutzerentscheidung 2026-10-14: „Tippen setzt/loescht alle Schritte
+    /// der Zelle“). `true` heisst „gesetzt“.
+    pub fn toggle_buendel(&mut self, von: u16, bis: u16, pitch: i32) -> bool {
+        let n = self.steps_per_cycle;
+        let (von, bis) = (von % n, bis % n);
+        let (von, bis) = (von.min(bis), von.max(bis));
+        if self.hat_im_buendel(von, bis, pitch) {
+            self.notes
+                .retain(|note| !(note.pitch == pitch && note.step >= von && note.step <= bis));
+            false
+        } else {
+            for step in von..=bis {
+                self.toggle(step, pitch);
+            }
+            true
+        }
     }
 
     pub fn clear(&mut self) {
@@ -468,6 +509,36 @@ mod tests {
             MAX_STEPS_PER_CYCLE >= STEPS_PER_CYCLE,
             "die Vorgabe muss waehlbar sein"
         );
+    }
+
+    #[test]
+    fn buendel_spanne_deckt_die_zelle() {
+        // Nutzerwunsch 2026-10-14: bei Buendelung 16 deckt eine Zelle die
+        // Schritte ab, die sie zusammenfasst.
+        assert_eq!(buendel_spanne(0, 2, 512), (0, 1));
+        assert_eq!(buendel_spanne(255, 2, 512), (510, 511));
+        assert_eq!(buendel_spanne(2, 4, 10), (8, 9), "letzte Zelle gekappt");
+        assert_eq!(buendel_spanne(9, 4, 10), (9, 9), "hinter dem Ende");
+        assert_eq!(buendel_spanne(3, 1, 512), (3, 3), "Buendel 1 = Schritt");
+    }
+
+    #[test]
+    fn buendel_leuchtet_bei_einer_note() {
+        let mut p = Pattern::with_steps(16);
+        p.toggle(3, 60);
+        assert!(p.hat_im_buendel(2, 3, 60), "Note 3 im Buendel 2..3");
+        assert!(!p.hat_im_buendel(4, 5, 60));
+        assert!(!p.hat_im_buendel(2, 3, 62), "andere Hoehe");
+    }
+
+    #[test]
+    fn toggle_buendel_setzt_und_loescht_das_ganze_buendel() {
+        let mut p = Pattern::with_steps(512);
+        assert!(p.toggle_buendel(4, 7, 60), "leer -> setzen");
+        assert_eq!(p.notes().len(), 4, "vier Schritte");
+        assert!((4..=7).all(|s| p.has_at(s, 60)));
+        assert!(!p.toggle_buendel(4, 7, 60), "belegt -> loeschen");
+        assert!(p.is_empty());
     }
 
     #[test]

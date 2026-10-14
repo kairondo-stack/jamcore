@@ -114,6 +114,197 @@ pub fn neueste_woertlich<T>(schlange: &[T], max: usize) -> Vec<&T> {
     schlange[start..].iter().collect()
 }
 
+/// Tonlaenge als Notenwert (Nutzerentscheidung 2026-10-14: 1/64 bis 4 Takte,
+/// die Millisekunden zeigt die App an).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Notenwert {
+    Vierundsechzigstel,
+    Zweiunddreissigstel,
+    Sechzehntel,
+    Achtel,
+    Viertel,
+    Halbe,
+    Ganze,
+    ZweiTakte,
+    VierTakte,
+}
+
+impl Notenwert {
+    pub const ALLE: [Notenwert; 9] = [
+        Notenwert::Vierundsechzigstel,
+        Notenwert::Zweiunddreissigstel,
+        Notenwert::Sechzehntel,
+        Notenwert::Achtel,
+        Notenwert::Viertel,
+        Notenwert::Halbe,
+        Notenwert::Ganze,
+        Notenwert::ZweiTakte,
+        Notenwert::VierTakte,
+    ];
+
+    /// Dauer in Millisekunden bei `bpm` (4/4: ein Takt sind vier Viertel).
+    pub fn ms(self, bpm: f32) -> u32 {
+        let bpm = bpm.clamp(20.0, 300.0);
+        let viertel_ms = 60_000.0 / bpm;
+        let faktor = match self {
+            Notenwert::Vierundsechzigstel => 1.0 / 16.0,
+            Notenwert::Zweiunddreissigstel => 1.0 / 8.0,
+            Notenwert::Sechzehntel => 1.0 / 4.0,
+            Notenwert::Achtel => 0.5,
+            Notenwert::Viertel => 1.0,
+            Notenwert::Halbe => 2.0,
+            Notenwert::Ganze => 4.0,
+            Notenwert::ZweiTakte => 8.0,
+            Notenwert::VierTakte => 16.0,
+        };
+        (viertel_ms * faktor).round() as u32
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Notenwert::Vierundsechzigstel => "1/64",
+            Notenwert::Zweiunddreissigstel => "1/32",
+            Notenwert::Sechzehntel => "1/16",
+            Notenwert::Achtel => "1/8",
+            Notenwert::Viertel => "1/4",
+            Notenwert::Halbe => "1/2",
+            Notenwert::Ganze => "1",
+            Notenwert::ZweiTakte => "2 Takte",
+            Notenwert::VierTakte => "4 Takte",
+        }
+    }
+}
+
+/// Eine klingende Stimme des Tongenerators: Frequenz, Position und Laenge in
+/// Samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Stimme {
+    pub freq: f32,
+    pub position: u64,
+    pub laenge: u64,
+}
+
+impl Stimme {
+    /// Stimme fuer eine Frequenz und Laenge in Millisekunden.
+    pub fn neu(freq: f32, rate: u32, laenge_ms: u32) -> Self {
+        let laenge = (rate as u64 * laenge_ms as u64 / 1000).max(1);
+        Self {
+            freq,
+            position: 0,
+            laenge,
+        }
+    }
+}
+
+/// Wert der Wellenform bei Phase 0..1; Rauschen ist ueber die Sample-Position
+/// deterministisch (kein Zustand noetig).
+pub fn wellen_wert(welle: Welle, phase: f32, position: u64) -> f32 {
+    match welle {
+        Welle::Sinus => (phase * std::f32::consts::TAU).sin(),
+        Welle::Dreieck => 4.0 * (phase - 0.5).abs() - 1.0,
+        Welle::Saegezahn => 2.0 * phase - 1.0,
+        Welle::Rechteck => {
+            if phase < 0.5 {
+                1.0
+            } else {
+                -1.0
+            }
+        }
+        Welle::Rauschen => {
+            let mut x = position.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            x ^= x >> 33;
+            x = x.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+            x ^= x >> 33;
+            (x as f32 / u64::MAX as f32) * 2.0 - 1.0
+        }
+    }
+}
+
+/// Einen Block aus allen klingenden Stimmen mischen: die Wellen addieren sich
+/// (mit `gain` als Kopfraum), jede Stimme klingt linear aus, das Ergebnis wird
+/// auf i16 geklemmt. Danach sind alle Stimmen einen Block weitergerueckt;
+/// fertige Stimmen fallen aus der Liste (der Aufrufer entscheidet, wann eine
+/// neue hinzukommt und welche bei Ueberlast weicht).
+pub fn mischen(puffer: &mut [i16], stimmen: &mut Vec<Stimme>, rate: u32, welle: Welle, gain: f32) {
+    let mut roh = vec![0.0f32; puffer.len()];
+    for stimme in stimmen.iter_mut() {
+        for (i, wert) in roh.iter_mut().enumerate() {
+            let pos = stimme.position + i as u64;
+            if pos >= stimme.laenge {
+                break;
+            }
+            let phase = (stimme.freq * pos as f32 / rate as f32).fract();
+            let huelle = 1.0 - pos as f32 / stimme.laenge as f32;
+            *wert += wellen_wert(welle, phase, pos) * huelle * gain;
+        }
+        stimme.position += puffer.len() as u64;
+    }
+    stimmen.retain(|s| s.position < s.laenge);
+    for (i, wert) in roh.iter().enumerate() {
+        puffer[i] = (wert.clamp(-1.0, 1.0) * 32767.0) as i16;
+    }
+}
+
+#[cfg(test)]
+mod tests_mixer {
+    use super::*;
+
+    #[test]
+    fn notenwert_in_millisekunden() {
+        // 120 BPM: eine Viertel ist 500 ms.
+        assert_eq!(Notenwert::Viertel.ms(120.0), 500);
+        assert_eq!(Notenwert::Vierundsechzigstel.ms(120.0), 31);
+        assert_eq!(Notenwert::Ganze.ms(120.0), 2000);
+        assert_eq!(Notenwert::VierTakte.ms(120.0), 8000, "4 Takte = 16 Viertel");
+        // 60 BPM: alles doppelt so lang.
+        assert_eq!(Notenwert::Viertel.ms(60.0), 1000);
+    }
+
+    #[test]
+    fn eine_stimme_klingt_und_laeuft_aus() {
+        let rate = 44_100;
+        // 5 ms sind 220 Samples: nach zwei kurzen Bloecken ist die Stimme durch.
+        let mut stimmen = vec![Stimme::neu(440.0, rate, 5)];
+        let mut puffer = [0i16; 64];
+        mischen(&mut puffer, &mut stimmen, rate, Welle::Sinus, 0.5);
+        assert!(puffer.iter().any(|v| *v != 0), "es klingt");
+        assert_eq!(stimmen.len(), 1, "noch nicht fertig");
+        let mut rest = [0i16; 512];
+        mischen(&mut rest, &mut stimmen, rate, Welle::Sinus, 0.5);
+        assert!(stimmen.is_empty(), "nach der Laenge ist die Stimme weg");
+    }
+
+    #[test]
+    fn zwei_stimmen_addieren_sich() {
+        let rate = 44_100;
+        let mut einzeln = vec![Stimme::neu(440.0, rate, 500)];
+        let mut doppelt = vec![Stimme::neu(440.0, rate, 500), Stimme::neu(440.0, rate, 500)];
+        let (mut a, mut b) = ([0i16; 256], [0i16; 256]);
+        mischen(&mut a, &mut einzeln, rate, Welle::Sinus, 0.25);
+        mischen(&mut b, &mut doppelt, rate, Welle::Sinus, 0.25);
+        let spitze = |x: &[i16]| x.iter().map(|v| v.abs()).max().unwrap_or(0);
+        assert!(
+            spitze(&b) > spitze(&a),
+            "zwei Stimmen sind lauter: {} vs {}",
+            spitze(&b),
+            spitze(&a)
+        );
+    }
+
+    #[test]
+    fn uebersteuerung_klemmt_statt_zu_ueberlaufen() {
+        let rate = 44_100;
+        let mut stimmen: Vec<Stimme> = (0..64).map(|_| Stimme::neu(440.0, rate, 500)).collect();
+        let mut puffer = [0i16; 128];
+        mischen(&mut puffer, &mut stimmen, rate, Welle::Sinus, 1.0);
+        assert!(puffer.iter().all(|v| *v != i16::MIN), "kein Ueberlauf");
+        assert!(
+            puffer.iter().any(|v| *v == i16::MAX || *v == -i16::MAX),
+            "viel Pegel klemmt am Anschlag"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests_warteschlange {
     use super::neueste_woertlich;

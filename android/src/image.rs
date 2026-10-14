@@ -352,6 +352,12 @@ impl ImagePanel {
         self.scan_bpm = bpm.clamp(20.0, 300.0);
     }
 
+    /// Das BPM-Feld des Sweeps — die App liest es zurueck, wenn der Regler
+    /// im Bild-Tab bewegt wurde (ein zentraler BPM-Wert).
+    pub fn scan_bpm(&self) -> f32 {
+        self.scan_bpm
+    }
+
     fn note_senden(&mut self, note: i32, volume: i32) {
         self.note_lokal(note, volume);
         let (host, port) = (
@@ -1019,17 +1025,9 @@ impl ImagePanel {
         });
     }
 
-    fn inhalt(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
-        // Dekodierfehler aus Java einmal je Sekunde sichtbar machen.
-        if self.video_laeuft && self.video_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
-            self.video_pruefung = std::time::Instant::now();
-            if let Ok(app) = crate::current_app() {
-                let meldung = video::java_meldung(&app);
-                if !meldung.is_empty() {
-                    self.status = format!("Video: {meldung}");
-                }
-            }
-        }
+    /// Quellen (Kamera/Video) waehlen — eigene Zeile, damit Bild 2 sie in der
+    /// linken Leiste zeigen kann.
+    fn zeile_quelle(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("Quellen suchen").clicked() {
                 self.videos_scannen();
@@ -1069,22 +1067,155 @@ impl ImagePanel {
                 }
             }
         });
+    }
 
-        // Live-Textur: laeuft auch mit bestehender Auswahl weiter (dann mit
-        // Markierung) — kein Standbild nach dem Farbwaehlen. Nur der Scan
-        // uebernimmt die Anzeige.
+    /// Die Live-Vorschau in die Textur legen (Bild **und** Bild 2): laeuft
+    /// auch mit bestehender Auswahl weiter (dann mit Markierung) — kein
+    /// Standbild nach dem Farbwaehlen. Nur der Scan uebernimmt die Anzeige.
+    fn textur_aktualisieren(&mut self, ctx: &egui::Context) {
         let (nummer, _, _) = camera::stand();
         if !self.scan_an && nummer != self.letzte_nummer {
             if let Some((w, h, rgba)) = camera::letztes_bild() {
                 if self.sel.is_some() {
-                    self.markieren_bild(ui.ctx(), w, h, rgba);
+                    self.markieren_bild(ctx, w, h, rgba);
                 } else {
-                    self.textur_setzen(ui.ctx(), w, h, &rgba);
+                    self.textur_setzen(ctx, w, h, &rgba);
                 }
                 self.letzte_nummer = nummer;
                 self.status = format!("Frame {nummer} ({w}x{h})");
             }
         }
+    }
+
+    /// Maske an eine geaenderte Patternlaenge anpassen: aus den Zeitpunkten
+    /// **neu rechnen**, ausser die Maske wurde von Hand getippt — dann wird sie
+    /// gestreckt. Sonst buendelten die alten Spalten links und das Muster
+    /// ginge verloren (gemessen 2026-10-10).
+    fn laenge_anpassen(&mut self, schritte: u16) {
+        if schritte == self.letzte_schritte {
+            return;
+        }
+        let alt_ende = self.letzte_schritte.saturating_sub(1);
+        let war_ganz = self.letzte_schritte > 0
+            && self.abschnitt_von == 0
+            && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= alt_ende);
+        if !self.tipp_zeiten.is_empty() && !self.maske_von_hand {
+            self.maske = ScanMaske::aus_zeiten(&self.tipp_zeiten, schritte as usize);
+            log::info!("Schritte {schritte}: Maske aus den Zeitpunkten neu gerechnet");
+        } else {
+            self.maske
+                .auf_breite_mit(schritte as usize, self.maske_anteil as f32 / 100.0);
+            log::info!(
+                "Schritte {schritte}: Maske neu abgebildet (Mindestanteil {} %)",
+                self.maske_anteil
+            );
+        }
+        self.letzte_schritte = schritte;
+        if war_ganz {
+            self.abschnitt_bis = schritte.saturating_sub(1);
+        }
+    }
+
+    /// Bild 2: die Quelle im Vollbild, die Regler als halbtransparente,
+    /// **immer sichtbare**, scrollbare Leisten darueber
+    /// (Nutzerentscheidung 2026-10-14). Es ist derselbe Zustand wie im
+    /// Bild-Tab — Kamera, Scan und Maske laufen nur einmal.
+    pub fn ui_vollbild(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
+        let platz = ui.available_width();
+        let flaeche = ui.available_height().max(160.0);
+        let schritte = pattern.steps_per_cycle();
+        self.schritte_wahl = schritte;
+        self.laenge_anpassen(schritte);
+        self.textur_aktualisieren(ui.ctx());
+        self.scan_schritt(ui.ctx(), pattern);
+        self.bild_zeichnen(ui, platz, flaeche, schritte, true);
+
+        let basis = ui.min_rect().min;
+        let leiste_breite = (platz * 0.44).min(220.0);
+        let oben_hoehe = 104.0;
+
+        // Oben: Kamera, Scan, „ins Pattern“ — die Zeilen liegen ueber dem Bild.
+        egui::Area::new("bild2_oben".into())
+            .fixed_pos(basis)
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_black_alpha(150))
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(platz);
+                        self.zeilen_kamera(ui);
+                    });
+            });
+
+        // Links: Quelle, Zoom, Takt, BPM, Schritte.
+        egui::Area::new("bild2_links".into())
+            .fixed_pos(egui::pos2(basis.x + 6.0, basis.y + oben_hoehe))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_black_alpha(150))
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(leiste_breite);
+                        egui::ScrollArea::vertical()
+                            .max_height((flaeche - oben_hoehe - 20.0).max(120.0))
+                            .id_salt("bild2_links_scroll")
+                            .show(ui, |ui| {
+                                self.zeile_quelle(ui);
+                                self.zeile_zoom(ui);
+                                self.zeile_takte(ui);
+                                self.zeile_bpm(ui);
+                                self.zeile_schritte(ui, pattern);
+                            });
+                    });
+            });
+
+        // Rechts: Maske, Toleranz, Auswahl, Malen, Kanal, Harmonics, Notenmenge.
+        egui::Area::new("bild2_rechts".into())
+            .fixed_pos(egui::pos2(
+                basis.x + platz - leiste_breite - 6.0,
+                basis.y + oben_hoehe,
+            ))
+            .order(egui::Order::Foreground)
+            .show(ui.ctx(), |ui| {
+                egui::Frame::NONE
+                    .fill(Color32::from_black_alpha(150))
+                    .inner_margin(6.0)
+                    .show(ui, |ui| {
+                        ui.set_max_width(leiste_breite);
+                        egui::ScrollArea::vertical()
+                            .max_height((flaeche - oben_hoehe - 20.0).max(120.0))
+                            .id_salt("bild2_rechts_scroll")
+                            .show(ui, |ui| {
+                                self.zeile_maske(ui);
+                                self.zeile_toleranz(ui);
+                                self.zeile_auswahl(ui);
+                                self.zeile_malen(ui);
+                                self.zeile_kanal(ui);
+                                self.zeile_harmonics(ui);
+                                self.zeile_notenmenge(ui);
+                            });
+                    });
+            });
+    }
+
+    fn inhalt(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
+        // Dekodierfehler aus Java einmal je Sekunde sichtbar machen.
+        if self.video_laeuft && self.video_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
+            self.video_pruefung = std::time::Instant::now();
+            if let Ok(app) = crate::current_app() {
+                let meldung = video::java_meldung(&app);
+                if !meldung.is_empty() {
+                    self.status = format!("Video: {meldung}");
+                }
+            }
+        }
+        self.zeile_quelle(ui);
+
+        self.textur_aktualisieren(ui.ctx());
 
         // X-Aufloesung (Schrittzahl) aus der Anzeigebreite mal Zoom — ist
         // zugleich die Patternlaenge. Die Maske waechst mit. Die Bildbreite
@@ -1103,34 +1234,7 @@ impl ImagePanel {
         // Laenge dort schreiben beide hinein).
         let schritte = pattern.steps_per_cycle();
         self.schritte_wahl = schritte;
-        if schritte != self.letzte_schritte {
-            // Laenge geaendert: die Maske wird **auf die neuen Schritte
-            // abgebildet** (nicht nur gestreckt) — sonst buendeln die alten
-            // Spalten links und das Muster geht verloren.
-            let alt_ende = self.letzte_schritte.saturating_sub(1);
-            let war_ganz = self.letzte_schritte > 0
-                && self.abschnitt_von == 0
-                && (self.abschnitt_bis == u16::MAX || self.abschnitt_bis >= alt_ende);
-            if !self.tipp_zeiten.is_empty() && !self.maske_von_hand {
-                // Aus den Zeitpunkten **neu rechnen**: jede Spalte sitzt dort,
-                // wo die Zeit sie hinlegt. Das Strecken der alten Maske machte
-                // aus einer 16er-Spalte bei 512 einen 32 breiten Block
-                // (gemessen 2026-10-10).
-                self.maske = ScanMaske::aus_zeiten(&self.tipp_zeiten, schritte as usize);
-                log::info!("Schritte {schritte}: Maske aus den Zeitpunkten neu gerechnet");
-            } else {
-                self.maske
-                    .auf_breite_mit(schritte as usize, self.maske_anteil as f32 / 100.0);
-                log::info!(
-                    "Schritte {schritte}: Maske neu abgebildet (Mindestanteil {} %)",
-                    self.maske_anteil
-                );
-            }
-            self.letzte_schritte = schritte;
-            if war_ganz {
-                self.abschnitt_bis = schritte.saturating_sub(1);
-            }
-        }
+        self.laenge_anpassen(schritte);
 
         self.scan_schritt(ui.ctx(), pattern);
 
@@ -1141,7 +1245,7 @@ impl ImagePanel {
             let hoehe = flaeche;
             ui.horizontal_top(|ui| {
                 ui.allocate_ui(egui::vec2(links, hoehe), |ui| {
-                    self.bild_zeichnen(ui, links, hoehe, schritte);
+                    self.bild_zeichnen(ui, links, hoehe, schritte, false);
                 });
                 ui.separator();
                 ui.allocate_ui(egui::vec2(platz - links - 8.0, hoehe), |ui| {
@@ -1163,7 +1267,7 @@ impl ImagePanel {
             return;
         }
 
-        self.bild_zeichnen(ui, platz, flaeche, schritte);
+        self.bild_zeichnen(ui, platz, flaeche, schritte, false);
         self.steuerung(ui, pattern);
     }
 
@@ -1628,7 +1732,14 @@ impl ImagePanel {
     }
 
     /// Bild mit Zoom (zwei Finger), Verschiebung (drei Finger) und Maskenleiste.
-    fn bild_zeichnen(&mut self, ui: &mut egui::Ui, platz: f32, flaeche: f32, schritte: u16) {
+    fn bild_zeichnen(
+        &mut self,
+        ui: &mut egui::Ui,
+        platz: f32,
+        flaeche: f32,
+        schritte: u16,
+        vollbild: bool,
+    ) {
         // Mehrfinger: zwei Finger zoomen, drei Finger verschieben.
         if let Some((zoom, pan)) = self.finger.schritt(ui).geste {
             self.bild_zoom = (self.bild_zoom * zoom).clamp(ZOOM_MIN, ZOOM_MAX);
@@ -1652,14 +1763,27 @@ impl ImagePanel {
             return;
         }
         let verhaeltnis = h as f32 / w as f32;
-        // Bildgroesse in Punkten; bei Zoom 1 passt es in die Breite.
-        let bild_b = platz * self.bild_zoom;
+        // Bildgroesse in Punkten. Normal passt das Bild bei Zoom 1 in die
+        // Breite; in Bild 2 **deckt** es die ganze Flaeche (4:3 auf einem
+        // 20:9-Schirm liesse sonst oben und unten schwarze Balken).
+        let basis = if vollbild {
+            (platz / w as f32).max(flaeche / h as f32)
+        } else {
+            platz / w as f32
+        };
+        let bild_b = w as f32 * basis * self.bild_zoom;
         let bild_h = bild_b * verhaeltnis;
         // Der Kasten ist hoechstens so hoch wie der Anteil der Flaeche, damit die
         // Regler darunter im Querformat sichtbar bleiben.
-        let kasten_h = bild_h
-            .min(flaeche * Self::bild_anteil(platz, flaeche))
-            .max(60.0);
+        let kasten_h = if vollbild {
+            // Bild 2: die Quelle fuellt die ganze Flaeche (die Regler liegen
+            // als halbtransparente Leisten darueber).
+            flaeche
+        } else {
+            bild_h
+                .min(flaeche * Self::bild_anteil(platz, flaeche))
+                .max(60.0)
+        };
         let kasten = egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(platz, kasten_h));
         // Bild mittig im Kasten, plus Verschiebung.
         // Das Bild bleibt im Kasten: verschoben werden darf nur, was wirklich

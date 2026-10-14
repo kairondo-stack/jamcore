@@ -52,11 +52,6 @@ impl SessionPanel {
         self.folgen
     }
 
-    /// Tempo, mit dem gerechnet wird (Session-Tempo, wenn gefolgt wird).
-    pub fn tempo(&self) -> f64 {
-        jamcore::session::tempo_folgen(120.0, self.zustand.bpm, self.folgen)
-    }
-
     pub fn ui(&mut self, ui: &mut egui::Ui, link_aktiv: bool) -> Option<SessionAktion> {
         let mut aktion = None;
 

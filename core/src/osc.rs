@@ -21,6 +21,23 @@ pub fn mapped_port(port: u16, base: u16) -> u16 {
     }
 }
 
+/// Host und Port aus der kleinen Ziel-Datei lesen: Zeile 1 Host, Zeile 2 Port.
+/// Ohne Port gilt [`DEFAULT_BASE_PORT`]; eine leere Datei ergibt `None`.
+pub fn settings_aus_text(text: &str) -> Option<(String, String)> {
+    let mut zeilen = text.lines().map(str::trim).filter(|z| !z.is_empty());
+    let host = zeilen.next()?.to_string();
+    let port = zeilen
+        .next()
+        .unwrap_or(&DEFAULT_BASE_PORT.to_string())
+        .to_string();
+    Some((host, port))
+}
+
+/// Gegenstueck zu [`settings_aus_text`]: beide Werte als Zeilen.
+pub fn settings_als_text(host: &str, port: &str) -> String {
+    format!("{host}\n{port}\n")
+}
+
 /// Oszillierender Ausgang zu einem festen Ziel.
 pub struct OscOut {
     socket: UdpSocket,
@@ -135,6 +152,25 @@ pub fn bpm_und_teiler(bpm: f32, teiler: f32) -> (f32, Option<f32>) {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn ziel_einstellungen_lesen_und_schreiben() {
+        // Kleine Datei mit zwei Zeilen (Host, Port) — damit die App das
+        // Laptop-Ziel nicht bei jedem Start vergisst (gemessen 2026-10-12:
+        // nach dem Neustart stand wieder 127.0.0.1 im Feld).
+        let text = settings_als_text("172.22.99.181", "7005");
+        assert_eq!(text, "172.22.99.181\n7005\n");
+        assert_eq!(
+            settings_aus_text(&text),
+            Some(("172.22.99.181".to_string(), "7005".to_string()))
+        );
+        // Ohne Port gilt der Vorgabe-Port; leere Datei heisst "nichts gemerkt".
+        assert_eq!(
+            settings_aus_text("172.22.99.181\n"),
+            Some(("172.22.99.181".to_string(), DEFAULT_BASE_PORT.to_string()))
+        );
+        assert_eq!(settings_aus_text("\n\n"), None);
+    }
 
     /// Bindet einen Empfänger auf einem freien Port und liefert (Port, Socket).
     fn receiver() -> (u16, UdpSocket) {
