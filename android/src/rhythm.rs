@@ -29,6 +29,18 @@ fn ms_text(e: crate::klang::Einstellungen) -> String {
     format!("{} ms", e.notenwert.ms(e.bpm))
 }
 
+/// Note ueber das Modul spielen — mit der Zuordnung aus dem Instrument-Tab.
+/// `true`, wenn das Modul geklungen hat; sonst faellt der Tongenerator ein.
+fn modul_gespielt(modul: &Option<crate::player::ModulQuelle>, pitch: i32) -> bool {
+    let Some(quelle) = modul.as_ref() else {
+        return false;
+    };
+    match crate::instr::spielen(quelle, pitch, 0.8) {
+        Some(gespielt) => gespielt,
+        None => quelle.note_spielen(30, pitch, 0.8).is_some(),
+    }
+}
+
 /// Woher der Klang des gerenderten Notenmaterials kommt.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Klangquelle {
@@ -163,8 +175,15 @@ impl RhythmPanel {
     fn note_klingen(&self, pitch: i32) {
         if self.klangquelle == Klangquelle::Modul {
             if let Some(quelle) = self.modul_quelle.as_ref() {
-                if quelle.note_spielen(30, pitch, 0.8).is_some() {
-                    return;
+                // Zuordnung aus dem Instrument-Tab: mehrere Bereiche klingen
+                // zusammen, ausserhalb der Bereiche bleibt es still.
+                match crate::instr::spielen(quelle, pitch, 0.8) {
+                    Some(_) => return,
+                    None => {
+                        if quelle.note_spielen(30, pitch, 0.8).is_some() {
+                            return;
+                        }
+                    }
                 }
             }
         }
@@ -356,11 +375,8 @@ impl RhythmPanel {
                     let start = Instant::now();
                     for (s, pitch) in &noten {
                         if *s == i {
-                            let gespielt = klangquelle == Klangquelle::Modul
-                                && modul
-                                    .as_ref()
-                                    .and_then(|q| q.note_spielen(30, *pitch, 0.8))
-                                    .is_some();
+                            let gespielt =
+                                klangquelle == Klangquelle::Modul && modul_gespielt(&modul, *pitch);
                             if !gespielt {
                                 if !klang_gemeldet {
                                     info!("Klang: Tongenerator ({})", welle.name());
@@ -445,11 +461,8 @@ impl RhythmPanel {
                     if rest > 0.0 {
                         std::thread::sleep(Duration::from_secs_f32(rest));
                     }
-                    let gespielt = klangquelle == Klangquelle::Modul
-                        && modul
-                            .as_ref()
-                            .and_then(|q| q.note_spielen(30, *pitch, 0.8))
-                            .is_some();
+                    let gespielt =
+                        klangquelle == Klangquelle::Modul && modul_gespielt(&modul, *pitch);
                     if !gespielt {
                         crate::klang::spielen_welle(*pitch, welle);
                     }

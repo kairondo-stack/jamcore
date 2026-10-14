@@ -7,6 +7,7 @@ pub mod diary;
 pub mod gesten;
 pub mod grid;
 pub mod harmonie;
+pub mod instrument;
 pub mod klang;
 pub mod livescan;
 pub mod maske;

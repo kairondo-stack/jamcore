@@ -67,6 +67,28 @@ impl ModulQuelle {
         let modul = self.shared.module.lock().ok()?;
         modul.note_spielen(instrument, note, volume)
     }
+
+    /// Instrumente als (0-basierter Index, Name)-Paare. Leere Plaetze bekommen
+    /// einen Platzhalter, damit man ihnen trotzdem einen Bereich zuweisen kann.
+    /// Bei Modulen ohne Instrumente (MOD/S3M) bleibt die Liste leer.
+    pub fn instrument_liste(&self) -> Vec<(i32, String)> {
+        let Ok(module) = self.shared.module.lock() else {
+            return Vec::new();
+        };
+        (0..module.num_instruments())
+            .map(|i| (i, name_oder_platz(module.instrument_name(i), i)))
+            .collect()
+    }
+
+    /// Samples als (0-basierter Index, Name)-Paare (dieselbe Regel).
+    pub fn sample_liste(&self) -> Vec<(i32, String)> {
+        let Ok(module) = self.shared.module.lock() else {
+            return Vec::new();
+        };
+        (0..module.num_samples())
+            .map(|i| (i, name_oder_platz(module.sample_name(i), i)))
+            .collect()
+    }
 }
 
 impl Player {
@@ -182,6 +204,9 @@ impl Player {
         namen
     }
 
+    /// Instrumente als (0-basierter Index, Name)-Paare. Leere Plaetze bekommen
+    /// einen Platzhalter, damit man ihnen trotzdem einen Bereich zuweisen kann.
+    /// Bei Modulen ohne Instrumente (MOD/S3M) bleibt die Liste leer.
     /// Pfad der geladenen Datei.
     pub fn pfad(&self) -> &str {
         &self.path
@@ -455,4 +480,13 @@ fn call_void(
     let res = env.call_method(object.as_obj(), name, sig, &[]).map(|_| ());
     crate::jniutil::clear(&mut env);
     res.map_err(|e| e.to_string())
+}
+
+/// Name oder Platzhalter („Instrument 3“ heisst Index 2) fuer leere Plaetze.
+fn name_oder_platz(name: String, index: i32) -> String {
+    if name.trim().is_empty() {
+        format!("Instrument {}", index + 1)
+    } else {
+        name
+    }
 }

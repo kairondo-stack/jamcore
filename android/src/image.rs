@@ -398,11 +398,18 @@ impl ImagePanel {
         }
         if self.klangquelle == crate::rhythm::Klangquelle::Modul {
             if let Some(quelle) = self.modul_quelle.as_ref() {
-                if quelle
-                    .note_spielen(30, note, volume as f32 / 127.0)
-                    .is_some()
-                {
-                    return;
+                // Zuordnung aus dem Instrument-Tab: mehrere Bereiche klingen
+                // zusammen, ausserhalb der Bereiche bleibt es still.
+                match crate::instr::spielen(quelle, note, volume as f32 / 127.0) {
+                    Some(_) => return,
+                    None => {
+                        if quelle
+                            .note_spielen(30, note, volume as f32 / 127.0)
+                            .is_some()
+                        {
+                            return;
+                        }
+                    }
                 }
             }
         }

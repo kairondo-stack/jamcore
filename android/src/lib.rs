@@ -5,6 +5,7 @@ mod camera;
 mod diary;
 mod image;
 mod insets;
+mod instr;
 mod jniutil;
 mod klang;
 mod layout;
@@ -52,6 +53,7 @@ enum Tab {
     Maske,
     Maske2,
     Bild2,
+    Instr,
     Kombi,
 }
 
@@ -70,6 +72,7 @@ struct JamApp {
     selected: Option<usize>,
     looping: bool,
     player: Option<player::Player>,
+    instr: instr::InstrumentPanel,
     osc: osc::OscPanel,
     rhythm: rhythm::RhythmPanel,
     mic: mic::MicPanel,
@@ -120,6 +123,7 @@ impl Default for JamApp {
             selected: None,
             looping: true,
             player: None,
+            instr: instr::InstrumentPanel::default(),
             osc: osc::OscPanel::default(),
             rhythm: rhythm::RhythmPanel::default(),
             mic: mic::MicPanel::default(),
@@ -317,6 +321,7 @@ impl eframe::App for JamApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
                     ui.selectable_value(&mut self.tab, Tab::Player, "Player");
+                    ui.selectable_value(&mut self.tab, Tab::Instr, "Instr");
                     ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
                     ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
                     ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
@@ -355,6 +360,7 @@ impl eframe::App for JamApp {
         match self.tab {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),
+            Tab::Instr => self.view_instr(ui),
             Tab::Osc => self.view_osc(ui),
             Tab::Rhythmus => self.view_rhythm(ui),
             Tab::Tempo => self.view_mic(ui),
@@ -973,6 +979,17 @@ impl JamApp {
             }
             Err(e) => self.meldung = format!("WAV-Fehler: {e}"),
         }
+    }
+
+    fn view_instr(&mut self, ui: &mut egui::Ui) {
+        // Das Modul des Players an die Zuordnung reichen (Klon der Quelle).
+        let quelle = self.player.as_ref().map(|p| p.modul_quelle());
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
+                .id_salt("instr_inhalt")
+                .show(ui, |ui| self.instr.ui(ui, quelle.as_ref()));
+        });
     }
 
     fn view_player(&mut self, ui: &mut egui::Ui) {

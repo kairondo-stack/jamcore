@@ -143,6 +143,10 @@ extern "C" {
         mod_: *mut openmpt_module,
         sample: c_int,
     ) -> *const c_char;
+    pub fn openmpt_module_get_instrument_name(
+        mod_: *mut openmpt_module,
+        instrument: c_int,
+    ) -> *const c_char;
 }
 
 /// Geladenes Modul. `ptr` bleibt sichtbar für die Desktop-Taktlogik, die direkt
@@ -357,6 +361,19 @@ impl Mod {
             }
             // libopenmpt gibt den String dynamisch heraus — ohne
             // openmpt_free_string leckt jede Abfrage (der Player fragt je Frame).
+            let name = CStr::from_ptr(p).to_string_lossy().into_owned();
+            openmpt_free_string(p);
+            name
+        }
+    }
+
+    /// Name eines Instruments (0-basiert); leer, wenn der Platz leer ist.
+    pub fn instrument_name(&self, i: i32) -> String {
+        unsafe {
+            let p = openmpt_module_get_instrument_name(self.ptr, i);
+            if p.is_null() {
+                return String::new();
+            }
             let name = CStr::from_ptr(p).to_string_lossy().into_owned();
             openmpt_free_string(p);
             name
