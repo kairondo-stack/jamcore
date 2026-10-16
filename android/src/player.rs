@@ -10,6 +10,7 @@ use std::os::raw::c_int;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use jamcore::openmpt::Mod;
 use log::info;
@@ -21,6 +22,11 @@ const MODE_STREAM: i32 = 1;
 const FRAMES_PER_BLOCK: usize = 2048;
 const BYTES_PER_FRAME: usize = 4;
 const BLOCKS: usize = 4;
+/// Klingende Noten für die Akkord-Anzeige: älter als so viel gilt als
+/// verklungen (die UI liest nur, der Eintrag wird beim nächsten Zugriff
+/// verworfen), und höchstens so viele Einträge werden geführt.
+const KLINGEND_ALTER: Duration = Duration::from_secs(2);
+const KLINGEND_MAX: usize = 32;
 
 struct Shared {
     module: Mutex<Mod>,
@@ -35,6 +41,9 @@ struct Shared {
     /// Audio-Threads nicht anreifen.
     row: AtomicI32,
     rows_per_beat: AtomicI32,
+    /// Angespielte Noten als (Kanal, Note, Zeitpunkt) — Grundlage der
+    /// Akkord-Anzeige. Nur die UI-Seite schreibt/liest sie (kleine Liste).
+    klingend: Mutex<Vec<(i32, i32, Instant)>>,
 }
 
 pub struct Player {
@@ -65,7 +74,38 @@ impl ModulQuelle {
             return None;
         }
         let modul = self.shared.module.lock().ok()?;
-        modul.note_spielen(instrument, note, volume)
+        let kanal = modul.note_spielen(instrument, note, volume)?;
+        if let Ok(mut liste) = self.shared.klingend.lock() {
+            liste.retain(|(_, _, zeit)| zeit.elapsed() < KLINGEND_ALTER);
+            if liste.len() >= KLINGEND_MAX {
+                liste.remove(0);
+            }
+            liste.push((kanal, note, Instant::now()));
+        }
+        Some(kanal)
+    }
+
+    /// Einen zuvor gespielten Kanal wieder stoppen (für „Ton aus").
+    pub fn note_stoppen(&self, kanal: i32) {
+        if let Ok(module) = self.shared.module.lock() {
+            module.note_stoppen(kanal);
+        }
+        if let Ok(mut liste) = self.shared.klingend.lock() {
+            liste.retain(|(k, _, _)| *k != kanal);
+        }
+    }
+
+    /// Noten, die gerade klingen (bis 2 s alt, ohne Doppelte, aufsteigend
+    /// sortiert) — Grundlage der Akkord-Anzeige im Player-Tab.
+    pub fn klingende_noten(&self) -> Vec<i32> {
+        let Ok(mut liste) = self.shared.klingend.lock() else {
+            return Vec::new();
+        };
+        liste.retain(|(_, _, zeit)| zeit.elapsed() < KLINGEND_ALTER);
+        let mut noten: Vec<i32> = liste.iter().map(|(_, note, _)| *note).collect();
+        noten.sort_unstable();
+        noten.dedup();
+        noten
     }
 
     /// Instrumente als (0-basierter Index, Name)-Paare. Leere Plaetze bekommen
@@ -129,6 +169,7 @@ impl Player {
             running: AtomicBool::new(true),
             row: AtomicI32::new(0),
             rows_per_beat: AtomicI32::new(4),
+            klingend: Mutex::new(Vec::new()),
         });
 
         let worker_shared = Arc::clone(&shared);

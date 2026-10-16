@@ -12,11 +12,12 @@ use eframe::egui::{self, Color32, TextureOptions};
 
 use jamcore::grid::{Note, Pattern};
 use jamcore::livescan::{
-    build_palette, note_volume, note_volume_farbe, pixel_matches, scale_rgb, scan_column,
-    ScanFilter,
+    build_palette, note_volume, note_volume_farbe, palette_match, pixel_matches, scale_rgb,
+    scan_column, ScanFilter,
 };
 use jamcore::osc::{OscOut, Renoise};
 use jamcore::scanmask::{Aufloesung, ScanMaske};
+use jamcore::spirale::{Familie, Spirale};
 
 use crate::camera;
 use crate::video;
@@ -58,6 +59,118 @@ fn ist_bild(pfad: &str) -> bool {
         })
         .unwrap_or(false)
 }
+
+// ==== SPIRAL-HELFER: reine Rechnung (auf dem Host pruefbar) =================
+// Nur `jamcore` — kein egui, keine Kamera. Zustand und Verdrahtung liegen im
+// `ImagePanel`; diese Helfer sind der Teil, den die Host-Probe ohne Android
+// ausfuehren kann (das Android-Crate baut nur mit `cargo ndk`).
+
+/// Name der Spiralfamilie wie im Patch („arch ln" für die Logarithmus-Familie).
+fn familie_name(familie: Familie) -> &'static str {
+    match familie {
+        Familie::Archimedes => "Archimedes",
+        Familie::Log => "arch ln",
+    }
+}
+
+/// Statuszeile: „Scan: Spirale (Archimedes, Schritt 2,0)".
+fn spirale_text(s: &Spirale) -> String {
+    format!(
+        "Scan: Spirale ({}, Schritt {})",
+        familie_name(s.familie),
+        zahl(s.schritt)
+    )
+}
+
+/// Zahl mit einer Nachkommastelle und Komma (die Statuszeile ist deutsch).
+fn zahl(v: f64) -> String {
+    format!("{v:.1}").replace('.', ",")
+}
+
+/// Größter Radius im Bild: Abstand von der Mitte zur Ecke (Patch: `sqrtmax`).
+fn radius_max(w: usize, h: usize) -> f64 {
+    let (w, h) = (w as f64, h as f64);
+    ((w / 2.0).powi(2) + (h / 2.0).powi(2)).sqrt()
+}
+
+/// Obergrenze der Bahnpunkte: die Log-Familie (r = ln(a·φ)) wächst so langsam,
+/// dass sie das Bild rechnerisch nie verlässt — ohne Deckel liefe die
+/// Anzeige-Schleife endlos.
+const SPIRALE_BAHN_MAX: usize = 512;
+
+/// Bahn der Spirale in Bildkoordinaten (Ansicht), von innen nach außen, bis
+/// der Radius das Bild verlassen hat.
+fn spirale_bahn(s: &Spirale, w: usize, h: usize) -> Vec<(i32, i32)> {
+    let max = radius_max(w, h);
+    let mut s = *s;
+    let mut punkte = Vec::new();
+    for _ in 0..SPIRALE_BAHN_MAX {
+        punkte.push(s.punkt(w as f64, h as f64));
+        if s.radius_roh() >= max {
+            break;
+        }
+        s.weiter();
+    }
+    punkte
+}
+
+/// Die Bildzelle (x, y) am Spiralpunkt, wenn sie den Filter trifft — dieselbe
+/// Trefferlogik wie `scan_column`, nur für einen Pixel (Palette wie der
+/// Linien-Sweep, sonst die Einzelfarbe). `None` = keine Note.
+fn zelle_trifft(
+    frame: &[u8],
+    w: i32,
+    h: i32,
+    x: i32,
+    y: i32,
+    filter: &ScanFilter,
+    palette: Option<&std::collections::HashSet<u32>>,
+) -> Option<(u8, u8, u8)> {
+    if w <= 0 || h <= 0 || x < 0 || x >= w || y < 0 || y >= h {
+        return None;
+    }
+    let idx = ((y * w + x) * 4) as usize;
+    if idx + 3 >= frame.len() {
+        return None;
+    }
+    let (r, g, b) = (frame[idx], frame[idx + 1], frame[idx + 2]);
+    let treffer = match palette {
+        Some(p) => palette_match(r, g, b, p),
+        None => pixel_matches(r, g, b, filter),
+    };
+    treffer.then_some((r, g, b))
+}
+
+/// Dünne Linie (Bresenham) zwischen zwei Bildpunkten — die Spur des
+/// Spiral-Scans im Sweep-Puffer. Enthält beide Endpunkte.
+fn linie(von: (i32, i32), bis: (i32, i32)) -> Vec<(i32, i32)> {
+    let (x0, y0) = von;
+    let (x1, y1) = bis;
+    let dx = (x1 - x0).abs();
+    let dy = (y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut punkte = Vec::with_capacity((dx.max(dy) + 1) as usize);
+    let (mut x, mut y) = (x0, y0);
+    let mut fehler = dx - dy;
+    loop {
+        punkte.push((x, y));
+        if (x, y) == (x1, y1) {
+            break;
+        }
+        let e2 = 2 * fehler;
+        if e2 > -dy {
+            fehler -= dy;
+            x += sx;
+        }
+        if e2 < dx {
+            fehler += dx;
+            y += sy;
+        }
+    }
+    punkte
+}
+// ==== ENDE SPIRAL-HELFER ====================================================
 
 pub struct ImagePanel {
     texture: Option<egui::TextureHandle>,
@@ -149,6 +262,34 @@ pub struct ImagePanel {
     scan_naechste_spalte: std::time::Instant,
     sweep_noten: u64,
     sweep_gezeichnet: u64,
+    /// Stroboskop-Ansicht: das Bild liegt mehrfach und wird mit der
+    /// Lissajous-Phase synchron zum Takt in eine Richtung bewegt; der Scan
+    /// liest diese bewegte Ansicht (jamcore::stroboskop).
+    strobo_an: bool,
+    strobo_rechts: bool,
+    strobo_umdrehungen: f64,
+    strobo_takte: f64,
+    strobo_takte_seit_start: f64,
+    strobo_letzte_zeit: std::time::Instant,
+    /// Versatz der Ansicht in Pixeln (je Frame einmal gerechnet).
+    strobo_versatz_px: i32,
+    /// Spiral-Scan (Desktop: Shift+F8): statt der Sweep-Spalte wird die Zelle
+    /// am Spiralpunkt gelesen, die Tonhöhe kommt aus dem **Radius**
+    /// (jamcore::spirale, Patch `spiralobpm`/`Matrizenleser_Spiral_archimedisch`).
+    spirale_an: bool,
+    /// Familie, `a`, φ und Schrittweite der Spirale (φ läuft je Sweep).
+    spirale: Spirale,
+    /// Tonumfang (Tasten) und Grundton (Offset) der Radius→Note-Zuordnung
+    /// (Patch: `expr ($f1*$f3/$f2+$f4)`); Vorgabe wie beim Linien-Scan.
+    spirale_tasten: i32,
+    spirale_offset: i32,
+    /// Letzter Spiralpunkt (Ansicht) für die dünne Spur im Sweep-Puffer.
+    spirale_letzter: Option<(i32, i32)>,
+    /// Lokaler Klang des Scans (Tongenerator/Modul-Samples). Aus = still,
+    /// OSC an Renoise bleibt unberührt.
+    ton_an: bool,
+    /// Modul-Kanäle, die der Scan selbst gestartet hat (für „Ton aus").
+    noten_kanaele: Vec<i32>,
     /// Treffer, die die Bremse (Noten pro Sekunde / Spalte) wegschmeissen hat.
     /// Sichtbar, damit „es klingt nicht" nicht an einer stillen Bremse liegt.
     sweep_doppelt: u64,
@@ -225,6 +366,21 @@ impl ImagePanel {
             scan_naechste_spalte: std::time::Instant::now(),
             sweep_noten: 0,
             sweep_gezeichnet: 0,
+            strobo_an: false,
+            strobo_rechts: true,
+            strobo_umdrehungen: 1.0,
+            strobo_takte: 2.0,
+            strobo_takte_seit_start: 0.0,
+            strobo_letzte_zeit: std::time::Instant::now(),
+            strobo_versatz_px: 0,
+            spirale_an: false,
+            spirale: Spirale::neu(Familie::Archimedes),
+            // Wie der Linien-Scan: Note 0…36 aus dem Radius plus Grundton 36.
+            spirale_tasten: 36,
+            spirale_offset: 36,
+            spirale_letzter: None,
+            ton_an: true,
+            noten_kanaele: Vec::new(),
             sweep_doppelt: 0,
             host: jamcore::osc::DEFAULT_HOST.to_string(),
             port: jamcore::osc::DEFAULT_BASE_PORT.to_string(),
@@ -358,8 +514,12 @@ impl ImagePanel {
         self.scan_bpm
     }
 
-    fn note_senden(&mut self, note: i32, volume: i32) {
-        self.note_lokal(note, volume);
+    /// Eine Note senden und lokal klingen lassen.
+    ///
+    /// `x`/`y` sind die Bildanteile des Treffers (0..=1) fuer die x/y-Bereiche
+    /// des Instrument-Tabs; `None` = ohne Einschraenkung.
+    fn note_senden(&mut self, note: i32, volume: i32, x: Option<f32>, y: Option<f32>) {
+        self.note_lokal(note, volume, x, y);
         let (host, port) = (
             self.host.clone(),
             self.port.parse().unwrap_or(jamcore::osc::DEFAULT_BASE_PORT),
@@ -392,21 +552,36 @@ impl ImagePanel {
     /// stumm, sobald kein Renoise auf dem Laptop laeuft: er ging ausschliesslich
     /// per OSC an `127.0.0.1:7003`. Quelle ist derselbe Schalter wie im
     /// Rhythmus-Tab (Modul-Samples, sonst Tongenerator).
-    fn note_lokal(&self, note: i32, volume: i32) {
-        if volume <= 0 {
+    ///
+    /// `x`/`y` (Anteile 0..=1) gehen an die x/y-Bereiche des Instrument-Tabs.
+    fn note_lokal(&mut self, note: i32, volume: i32, x: Option<f32>, y: Option<f32>) {
+        if volume <= 0 || !self.ton_an {
             return;
         }
         if self.klangquelle == crate::rhythm::Klangquelle::Modul {
             if let Some(quelle) = self.modul_quelle.as_ref() {
                 // Zuordnung aus dem Instrument-Tab: mehrere Bereiche klingen
-                // zusammen, ausserhalb der Bereiche bleibt es still.
-                match crate::instr::spielen(quelle, note, volume as f32 / 127.0) {
-                    Some(_) => return,
+                // zusammen, ausserhalb der Bereiche (Note, x, y) bleibt es still.
+                let (ergebnis, kanaele) =
+                    crate::instr::spielen_mit_kanaelen(quelle, note, volume as f32 / 127.0, x, y);
+                match ergebnis {
+                    Some(_) => {
+                        // Kanäle merken, damit „Ton aus" sie stoppen kann
+                        // (Modul-Samples klingen sonst bis zum Sample-Ende).
+                        for kanal in kanaele {
+                            self.noten_kanaele.push(kanal);
+                        }
+                        while self.noten_kanaele.len() > 64 {
+                            self.noten_kanaele.remove(0);
+                        }
+                        return;
+                    }
                     None => {
-                        if quelle
-                            .note_spielen(30, note, volume as f32 / 127.0)
-                            .is_some()
-                        {
+                        if let Some(kanal) = quelle.note_spielen(30, note, volume as f32 / 127.0) {
+                            self.noten_kanaele.push(kanal);
+                            while self.noten_kanaele.len() > 64 {
+                                self.noten_kanaele.remove(0);
+                            }
                             return;
                         }
                     }
@@ -414,6 +589,18 @@ impl ImagePanel {
             }
         }
         crate::klang::spielen_welle(note, self.welle);
+    }
+
+    /// Alle vom Scan gestarteten lokalen Klänge sofort beenden („Ton aus").
+    fn ton_stoppen(&mut self) {
+        crate::klang::stimmen_aus();
+        if let Some(quelle) = self.modul_quelle.as_ref() {
+            for kanal in self.noten_kanaele.drain(..) {
+                quelle.note_stoppen(kanal);
+            }
+        } else {
+            self.noten_kanaele.clear();
+        }
     }
 
     fn kamera_an(&mut self) {
@@ -667,6 +854,28 @@ impl ImagePanel {
         }
     }
 
+    /// x-Bereich als Anteile 0..1 — **geteilter Wert mit dem Kreis-Tab**
+    /// (dort „x von"/„x bis"; Nutzerwunsch 2026-10-16).
+    pub fn x_bereich(&self) -> (f32, f32) {
+        self.bereich()
+    }
+
+    /// x-Bereich setzen (geklemmt, links ≤ rechts); Quelle ist der Kreis-Tab.
+    pub fn setze_x_bereich(&mut self, von: f32, bis: f32) {
+        let v = if von.is_finite() {
+            von.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let b = if bis.is_finite() {
+            bis.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        self.scan_links = v.min(b);
+        self.scan_rechts = v.max(b);
+    }
+
     /// Pfad einer Austauschdatei im App-Ordner (KeyEventRender.txt, Snapshot …).
     fn app_datei(&self, name: &str) -> Option<std::path::PathBuf> {
         let app = crate::current_app().ok()?;
@@ -770,6 +979,45 @@ impl ImagePanel {
         }
     }
 
+    /// Nimmt der Bildtipp diese Stelle an? Beim Stroboskop füllen die Kopien
+    /// auch die Ränder links/rechts — dort gehört der Tipp demselben Inhalt.
+    fn bild_tipp_erlaubt(
+        &self,
+        bild_rect: &egui::Rect,
+        kasten: &egui::Rect,
+        pos: egui::Pos2,
+    ) -> bool {
+        if bild_rect.contains(pos) {
+            return true;
+        }
+        self.strobo_an && kasten.x_range().contains(pos.x) && bild_rect.y_range().contains(pos.y)
+    }
+
+    /// Stroboskop-Versatz fortschreiben (je Frame einmal): Takte laufen mit dem
+    /// Scan-Tempo, der Versatz kommt aus der Lissajous-Phase (endlos, Richtung).
+    fn strobo_schritt(&mut self) {
+        if !self.strobo_an {
+            self.strobo_versatz_px = 0;
+            self.strobo_letzte_zeit = std::time::Instant::now();
+            return;
+        }
+        let jetzt = std::time::Instant::now();
+        let dt = jetzt
+            .duration_since(self.strobo_letzte_zeit)
+            .as_secs_f64()
+            .min(0.25);
+        self.strobo_letzte_zeit = jetzt;
+        self.strobo_takte_seit_start += dt * self.scan_bpm.max(1.0) as f64 / 60.0;
+        let anteil = jamcore::stroboskop::versatz_anteil(
+            self.strobo_takte_seit_start,
+            self.strobo_takte,
+            self.strobo_umdrehungen,
+            self.strobo_rechts,
+        );
+        let (w, _) = self.textur_masse;
+        self.strobo_versatz_px = jamcore::stroboskop::versatz_pixel(anteil, w as i32);
+    }
+
     /// Ein Sweep-Schritt: Spalten scannen, Treffer als OSC-Noten senden.
     ///
     /// Wie im Desktop-rrn5: Der Sweep läuft über die X-Auflösung (Schritte), ein
@@ -811,7 +1059,9 @@ impl ImagePanel {
         } else {
             None
         };
-        let mut noten: Vec<(i32, i32)> = Vec::new();
+        // Pro Treffer: Note, Lautstaerke und die Bildstelle als Anteile (x/y)
+        // fuer die x/y-Bereiche des Instrument-Tabs.
+        let mut noten: Vec<(i32, i32, f32, f32)> = Vec::new();
         while start.elapsed() < budget {
             let jetzt = std::time::Instant::now();
             if jetzt < self.scan_naechste_spalte {
@@ -820,6 +1070,24 @@ impl ImagePanel {
                 // Spalte dran ist.
                 ctx.request_repaint_after(self.scan_naechste_spalte - jetzt);
                 break;
+            }
+            // Zweiter Scan-Modus: die Spirale liest die Zelle am Spiralpunkt
+            // statt der Sweep-Spalte; der Linien-Sweep bleibt unberuehrt.
+            if self.spirale_an {
+                self.spiral_schritt(
+                    pattern,
+                    &live,
+                    w,
+                    h,
+                    wi,
+                    hi,
+                    schritte,
+                    &filter,
+                    palette.as_ref(),
+                    sel,
+                );
+                self.scan_naechste_spalte += std::time::Duration::from_nanos(schritt_ns);
+                continue;
             }
             if self.scan_x == 0 {
                 // Sweep beginnt: Puffer leeren (nur die Treffer leuchten).
@@ -835,6 +1103,13 @@ impl ImagePanel {
                 self.scan_rechts,
                 wi,
             );
+            // Stroboskop: die Ansicht ist verschoben — gelesen wird die
+            // Quellspalte dahinter.
+            let x = if self.strobo_an {
+                jamcore::stroboskop::quell_spalte(x, self.strobo_versatz_px, wi)
+            } else {
+                x
+            };
             // Takt-Maske (rrn5 `biialpha`): 0.0 sperrt die Spalte, sonst
             // skaliert der Wert Farbe und Lautstaerke.
             let alpha = if self.maske_an {
@@ -887,7 +1162,17 @@ impl ImagePanel {
                             });
                             self.aufgenommen += 1;
                         }
-                        noten.push((note, ((vol as f32 * alpha) as i32).clamp(0, 127)));
+                        // Die Bildstelle des Treffers als Anteile der Bildbreite
+                        // und -hoehe (die Spalte `x` und die Zeile `*y` liegen
+                        // hier vor) — damit greifen die x/y-Bereiche.
+                        let x_anteil = (x as f32 / wi.max(1) as f32).clamp(0.0, 1.0);
+                        let y_anteil = (*y as f32 / hi.max(1) as f32).clamp(0.0, 1.0);
+                        noten.push((
+                            note,
+                            ((vol as f32 * alpha) as i32).clamp(0, 127),
+                            x_anteil,
+                            y_anteil,
+                        ));
                         self.sweep_gezeichnet += 1;
                     }
                 }
@@ -900,18 +1185,21 @@ impl ImagePanel {
             //
             // Also: pro Spalte die Noten entdoppeln, dann alle spielen. Ohne
             // Deckel — die Harmonie-Auswahl ist die gewollte Menge, und nach dem
-            // Entfernen der Duplikate ist sie klein genug.
-            noten.sort_unstable();
+            // Entfernen der Duplikate ist sie klein genug. Entdoppelt wird nach
+            // (Note, Lautstaerke); die Bildstelle des ersten Treffers bleibt.
+            noten.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
             let alle = noten.len();
-            noten.dedup();
+            noten.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
             // Die Doppel zaehlen, damit im Log sichtbar bleibt, wie viel von
             // einer Spalte wirklich dieselbe Note war.
             self.sweep_doppelt += (alle - noten.len()) as u64;
             // Pro Spalte: welche Noten mit welcher Lautstaerke. Das ist die
             // Zeile, an der man im Log sieht, ob „y faellt" wirklich faellt.
             if !noten.is_empty() {
-                let spalte_text: Vec<String> =
-                    noten.iter().map(|(n, v)| format!("{n}/{v}")).collect();
+                let spalte_text: Vec<String> = noten
+                    .iter()
+                    .map(|(n, v, _, _)| format!("{n}/{v}"))
+                    .collect();
                 log::info!(
                     "Spalte {}: {} Noten {}",
                     schritt,
@@ -919,8 +1207,8 @@ impl ImagePanel {
                     spalte_text.join(" ")
                 );
             }
-            for (note, vol) in noten.drain(..) {
-                self.note_senden(note, vol);
+            for (note, vol, x_anteil, y_anteil) in noten.drain(..) {
+                self.note_senden(note, vol, Some(x_anteil), Some(y_anteil));
                 self.sweep_noten += 1;
             }
             let naechster = schritt + 1;
@@ -947,6 +1235,168 @@ impl ImagePanel {
         }
         if let Some((w, h, puffer)) = self.scan_puffer.clone() {
             self.textur_setzen(ctx, w, h, &puffer);
+        }
+    }
+
+    /// Ein Schritt des Spiral-Scans: Spirale fortschreiben, die Zelle am
+    /// Spiralpunkt lesen, die Note aus dem **Radius** senden (Patch
+    /// `expr ($f1*$f3/$f2+$f4)`) und die Spur in den Sweep-Puffer zeichnen.
+    ///
+    /// Ein Schritt je Taktzeit wie beim Linien-Sweep; der Sweep endet, wenn
+    /// der Radius das Bild verlassen hat — danach beginnt die Spirale wieder
+    /// im Zentrum. Die Lautstärke kommt wie beim Linien-Scan aus der Zelle,
+    /// die Tonhöhe allein aus dem Radius.
+    #[allow(clippy::too_many_arguments)]
+    fn spiral_schritt(
+        &mut self,
+        pattern: &mut Pattern,
+        live: &[u8],
+        w: usize,
+        h: usize,
+        wi: i32,
+        hi: i32,
+        schritte: i32,
+        filter: &ScanFilter,
+        palette: Option<&std::collections::HashSet<u32>>,
+        sel: (u8, u8, u8),
+    ) {
+        self.spirale.weiter();
+        let (px, py) = self.spirale.punkt(w as f64, h as f64);
+        let radius = self.spirale.radius(w as f64, h as f64);
+        let radius_roh = self.spirale.radius_roh();
+        let radius_ende = radius_max(w, h);
+        if self.spirale_letzter.is_none() {
+            // Sweep beginnt: Puffer leeren (nur Spur und Treffer leuchten).
+            self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
+        }
+        // Stroboskop: gelesen wird die Quellspalte hinter der bewegten
+        // Ansicht. Die Spur steht in Quellkoordinaten im Puffer; der wird
+        // (wie das Bild) um denselben Versatz geschoben — auf dem Schirm
+        // landet die Spur damit genau auf dem gelesenen Pixel.
+        let x_quelle = if self.strobo_an {
+            jamcore::stroboskop::quell_spalte(px, self.strobo_versatz_px, wi)
+        } else {
+            px
+        };
+        // Takt-Maske (rrn5 `biialpha`): 0.0 sperrt den Punkt. Am Desktop hängt
+        // die Maske an der x-Stelle im Bild; hier wird sie auf die Schritte
+        // der X-Auflösung abgebildet.
+        let schritt_maske = if wi > 0 {
+            (px * schritte / wi).clamp(0, (schritte - 1).max(0))
+        } else {
+            0
+        };
+        let alpha = if self.maske_an {
+            self.maske.alpha(schritt_maske, schritte.max(1) as usize)
+        } else {
+            1.0
+        };
+        // Die dünne Spur vom letzten zum aktuellen Punkt — in der
+        // Auswahlfarbe; wäre sie der Hintergrundfarbe gleich, bliebe sie
+        // unsichtbar (wie im Desktop).
+        let (sr, sg, sb) = if sel == self.bg { (255, 255, 255) } else { sel };
+        let spur = match self.spirale_letzter {
+            Some(von) => linie(von, (px, py)),
+            None => vec![(px, py)],
+        };
+        let treffer = if alpha > 0.0 {
+            zelle_trifft(live, wi, hi, x_quelle, py, filter, palette)
+        } else {
+            None
+        };
+        let mut noten: Vec<(i32, i32, f32, f32)> = Vec::new();
+        if let Some((_, _, puffer)) = self.scan_puffer.as_mut() {
+            let (strobo, versatz) = (self.strobo_an, self.strobo_versatz_px);
+            for (lx, ly) in spur {
+                let sx = if strobo {
+                    jamcore::stroboskop::quell_spalte(lx, versatz, wi)
+                } else {
+                    lx
+                };
+                let idx = ((ly.max(0) as usize) * w + sx.max(0) as usize) * 4;
+                if idx + 2 < puffer.len() {
+                    puffer[idx] = sr;
+                    puffer[idx + 1] = sg;
+                    puffer[idx + 2] = sb;
+                    puffer[idx + 3] = 255;
+                }
+            }
+            if let Some((r, g, b)) = treffer {
+                // Lautstaerke wie beim Linien-Scan aus der Zelle (Modus 0 =
+                // Farbe); die Tonhoehe kommt allein aus dem Radius.
+                let (_, vol) = if self.note_modus == 0 {
+                    note_volume_farbe(r, g, b, 36, 36)
+                } else {
+                    note_volume(x_quelle, py, wi, hi, self.note_modus, 36, 36)
+                };
+                // Tonhoehe aus dem Radius, normiert auf die halbe Diagonale
+                // (Patch: `sqrtmax`), mit Tasten/Offset wie der Linien-Scan.
+                let note = jamcore::spirale::note_aus_radius(
+                    radius,
+                    radius_ende,
+                    self.spirale_tasten,
+                    self.spirale_offset,
+                );
+                // Harmonics-Filter wie beim Linien-Scan: gesperrte Noten fallen
+                // ganz weg (kein Pixel, kein Ton).
+                if self.harmonie.note_erlaubt(note, x_quelle) {
+                    let idx = ((py.max(0) as usize) * w + x_quelle.max(0) as usize) * 4;
+                    if idx + 2 < puffer.len() {
+                        let (dr, dg, db) = scale_rgb(r, g, b, alpha);
+                        puffer[idx] = dr;
+                        puffer[idx + 1] = dg;
+                        puffer[idx + 2] = db;
+                        puffer[idx + 3] = 255;
+                    }
+                    // Bild-Follow: den Treffer ins Rhythmus-Pattern schreiben
+                    // (wie der Linien-Scan, eine Note je Schritt).
+                    if self.scan_aufnahme {
+                        let steps = pattern.steps_per_cycle().max(1) as i64;
+                        let step = ((x_quelle as i64 * steps) / wi.max(1) as i64)
+                            .clamp(0, steps - 1) as u16;
+                        pattern.insert(Note {
+                            step,
+                            instrument: 0,
+                            pitch: note,
+                            glide: false,
+                        });
+                        self.aufgenommen += 1;
+                    }
+                    let x_anteil = (x_quelle as f32 / wi.max(1) as f32).clamp(0.0, 1.0);
+                    let y_anteil = (py as f32 / hi.max(1) as f32).clamp(0.0, 1.0);
+                    noten.push((
+                        note,
+                        ((vol as f32 * alpha) as i32).clamp(0, 127),
+                        x_anteil,
+                        y_anteil,
+                    ));
+                    self.sweep_gezeichnet += 1;
+                }
+            }
+        }
+        for (note, vol, x_anteil, y_anteil) in noten {
+            self.note_senden(note, vol, Some(x_anteil), Some(y_anteil));
+            self.sweep_noten += 1;
+        }
+        // Sweep-Ende: die Spirale hat das Bild verlassen (Radius groesser als
+        // die halbe Diagonale) — Zaehler melden, dann von vorn im Zentrum.
+        if radius_roh >= radius_ende {
+            log::info!(
+                "Sweep beendet, {} Noten, {} gezeichnet, {} doppelt, {} ({:.2} s, Spirale)",
+                self.sweep_noten,
+                self.sweep_gezeichnet,
+                self.sweep_doppelt,
+                jamcore::takte::text(self.takte),
+                jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64)
+            );
+            self.sweep_noten = 0;
+            self.sweep_gezeichnet = 0;
+            self.sweep_doppelt = 0;
+            self.scan_puffer = None;
+            self.spirale.phi = 0.0;
+            self.spirale_letzter = None;
+        } else {
+            self.spirale_letzter = Some((px, py));
         }
     }
 
@@ -999,9 +1449,25 @@ impl ImagePanel {
                 self.scan_an = !self.scan_an;
                 self.scan_puffer = None;
                 self.scan_x = 0;
+                // Die Spirale beginnt mit dem Scan wieder im Zentrum (sonst
+                // hing die Spur am alten Punkt).
+                self.spirale_letzter = None;
                 // Ohne Ruecksetzen wuerde der erste Schritt sofort „aufholen“.
                 self.scan_naechste_spalte = std::time::Instant::now();
                 self.status = format!("Scan {}", if self.scan_an { "an" } else { "aus" });
+            }
+            // Lokaler Klang des Scans; OSC zu Renoise bleibt unberührt.
+            if ui
+                .button(if self.ton_an { "Ton aus" } else { "Ton an" })
+                .clicked()
+            {
+                self.ton_an = !self.ton_an;
+                if !self.ton_an {
+                    // Laufende Stimmen sofort beenden — sonst klingt der Knopf
+                    // kaputt (Modul-Samples laufen bis zum Sample-Ende).
+                    self.ton_stoppen();
+                }
+                log::info!("bild: Ton {}", if self.ton_an { "an" } else { "aus" });
             }
             let namen = [
                 "Note: Farbe",
@@ -1128,6 +1594,7 @@ impl ImagePanel {
     /// (Nutzerentscheidung 2026-10-14). Es ist derselbe Zustand wie im
     /// Bild-Tab — Kamera, Scan und Maske laufen nur einmal.
     pub fn ui_vollbild(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
+        self.strobo_schritt();
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
         let platz = ui.available_width();
@@ -1175,6 +1642,8 @@ impl ImagePanel {
                                 self.zeile_zoom(ui);
                                 self.zeile_takte(ui);
                                 self.zeile_bpm(ui);
+                                self.zeile_stroboskop(ui);
+                                self.zeile_spirale(ui);
                                 self.zeile_schritte(ui, pattern);
                             });
                     });
@@ -1210,6 +1679,7 @@ impl ImagePanel {
     }
 
     fn inhalt(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
+        self.strobo_schritt();
         // Dekodierfehler aus Java einmal je Sekunde sichtbar machen.
         if self.video_laeuft && self.video_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
             self.video_pruefung = std::time::Instant::now();
@@ -1280,7 +1750,7 @@ impl ImagePanel {
 
     /// Wie viele Zeilen die Steuerung hat. Jede Zeile ist schmal genug für eine
     /// Spalte; im Querformat wechseln sie zwischen zwei Spalten ab.
-    const STEUERUNG_ZEILEN: usize = 11;
+    const STEUERUNG_ZEILEN: usize = 13;
 
     /// Eine Zeile der Steuerung. Jede Zeile ist schmal genug für eine Spalte;
     /// im Querformat wechseln sie sich zwischen zwei Spalten ab.
@@ -1297,8 +1767,182 @@ impl ImagePanel {
             8 => self.zeile_kanal(ui),
             9 => self.zeile_harmonics(ui),
             10 => self.zeile_notenmenge(ui),
+            11 => self.zeile_stroboskop(ui),
+            12 => self.zeile_spirale(ui),
             _ => {}
         }
+    }
+
+    /// Stroboskop-Ansicht: an/aus, Richtung und Rate (wie im Lissa-Tab).
+    fn zeile_stroboskop(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(self.strobo_an, "Stroboskop").clicked() {
+                self.strobo_an = !self.strobo_an;
+                self.strobo_takte_seit_start = 0.0;
+                self.strobo_letzte_zeit = std::time::Instant::now();
+                log::info!(
+                    "bild: Stroboskop {}",
+                    if self.strobo_an { "an" } else { "aus" }
+                );
+            }
+            if self.strobo_an {
+                // Parameterwechsel halten die Phase (sonst springt das Bild).
+                if ui.selectable_label(!self.strobo_rechts, "◀").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_rechts = false;
+                }
+                if ui.selectable_label(self.strobo_rechts, "▶").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_rechts = true;
+                }
+                if ui.small_button("÷2").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_umdrehungen =
+                        jamcore::lissa::teile_umdrehungen(self.strobo_umdrehungen, 2.0);
+                }
+                if ui.small_button("×2").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_umdrehungen =
+                        jamcore::lissa::vielfache_umdrehungen(self.strobo_umdrehungen, 2.0);
+                }
+                if ui.small_button("÷3").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_umdrehungen =
+                        jamcore::lissa::teile_umdrehungen(self.strobo_umdrehungen, 3.0);
+                }
+                if ui.small_button("×3").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_umdrehungen =
+                        jamcore::lissa::vielfache_umdrehungen(self.strobo_umdrehungen, 3.0);
+                }
+                ui.label(format!(
+                    "{} / {}",
+                    jamcore::lissa::text_umdrehungen(self.strobo_umdrehungen),
+                    jamcore::takte::text(self.strobo_takte)
+                ));
+                if ui.small_button("÷2 Takt").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_takte = jamcore::takte::teile(self.strobo_takte, 2.0);
+                }
+                if ui.small_button("×2 Takt").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_takte = jamcore::takte::vielfache(self.strobo_takte, 2.0);
+                }
+                if ui.small_button("÷3 Takt").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_takte = jamcore::takte::teile(self.strobo_takte, 3.0);
+                }
+                if ui.small_button("×3 Takt").clicked() {
+                    self.strobo_phase_erhalten();
+                    self.strobo_takte = jamcore::takte::vielfache(self.strobo_takte, 3.0);
+                }
+            }
+        });
+    }
+
+    /// Spiral-Scan (Desktop: Shift+F8): an/aus, Familie, Schrittweite ÷2/×2
+    /// und Tasten/Offset der Radius→Note-Zuordnung.
+    fn zeile_spirale(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(self.spirale_an, "Spirale").clicked() {
+                self.spirale_an = !self.spirale_an;
+                // Neuer Sweep von vorn: die Spirale beginnt im Zentrum, die
+                // Spur im Sweep-Puffer wird neu aufgesetzt.
+                self.spirale.phi = 0.0;
+                self.spirale_letzter = None;
+                self.scan_puffer = None;
+                self.scan_x = 0;
+                self.scan_naechste_spalte = std::time::Instant::now();
+                log::info!(
+                    "bild: Scan Spirale {} ({})",
+                    if self.spirale_an { "an" } else { "aus" },
+                    if self.spirale_an {
+                        familie_name(self.spirale.familie)
+                    } else {
+                        "Linie"
+                    }
+                );
+                self.status = if self.spirale_an {
+                    spirale_text(&self.spirale)
+                } else {
+                    "Scan: Linie".to_string()
+                };
+            }
+            if self.spirale_an {
+                // Familie (Patch: Archimedes `r = a·φ` / „arch ln" `r = ln(a·φ)`);
+                // ein Wechsel beginnt wie das Einschalten im Zentrum.
+                if ui
+                    .selectable_label(self.spirale.familie == Familie::Archimedes, "Archimedes")
+                    .clicked()
+                    && self.spirale.familie != Familie::Archimedes
+                {
+                    self.spirale.familie = Familie::Archimedes;
+                    self.spirale.phi = 0.0;
+                    self.spirale_letzter = None;
+                    log::info!("bild: Spirale Familie Archimedes (r = a*phi)");
+                    self.status = spirale_text(&self.spirale);
+                }
+                if ui
+                    .selectable_label(self.spirale.familie == Familie::Log, "Log")
+                    .clicked()
+                    && self.spirale.familie != Familie::Log
+                {
+                    self.spirale.familie = Familie::Log;
+                    self.spirale.phi = 0.0;
+                    self.spirale_letzter = None;
+                    log::info!("bild: Spirale Familie arch ln (r = ln(a*phi))");
+                    self.status = spirale_text(&self.spirale);
+                }
+                // Schrittweite in rad (Patch-Reihe 1/2/5/9 rad).
+                if ui.small_button("÷2").clicked() {
+                    self.spirale.setze_schritt(self.spirale.schritt / 2.0);
+                    log::info!("bild: Spirale Schritt {}", zahl(self.spirale.schritt));
+                    self.status = spirale_text(&self.spirale);
+                }
+                if ui.small_button("×2").clicked() {
+                    self.spirale.setze_schritt(self.spirale.schritt * 2.0);
+                    log::info!("bild: Spirale Schritt {}", zahl(self.spirale.schritt));
+                    self.status = spirale_text(&self.spirale);
+                }
+                // Tasten (Tonumfang) und Offset (Grundton) der
+                // Radius→Note-Zuordnung; klein, weil die Zeile schmal ist.
+                ui.label("Tasten");
+                let tasten = ui.add(egui::DragValue::new(&mut self.spirale_tasten).range(1..=120));
+                ui.label("Offset");
+                let offset = ui.add(egui::DragValue::new(&mut self.spirale_offset).range(-60..=60));
+                if tasten.changed() || offset.changed() {
+                    log::info!(
+                        "bild: Spirale Tasten {} Offset {}",
+                        self.spirale_tasten,
+                        self.spirale_offset
+                    );
+                }
+            }
+        });
+        if self.spirale_an {
+            ui.label(
+                egui::RichText::new(spirale_text(&self.spirale))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
+    }
+
+    /// Aktuellen Versatz in „Takte seit Start" umrechnen, damit ein
+    /// Parameterwechsel (Richtung, Umdrehungen, Zyklus) die Phase hält.
+    fn strobo_phase_erhalten(&mut self) {
+        if !self.strobo_an {
+            return;
+        }
+        let anteil = jamcore::stroboskop::versatz_anteil(
+            self.strobo_takte_seit_start,
+            self.strobo_takte,
+            self.strobo_umdrehungen,
+            self.strobo_rechts,
+        );
+        let vorzeichen = if self.strobo_rechts { 1.0 } else { -1.0 };
+        self.strobo_takte_seit_start =
+            vorzeichen * anteil * self.strobo_takte / self.strobo_umdrehungen.max(1e-9);
     }
 
     /// Alle Regler unterhalb des Bildes (Hochformat, eine Spalte).
@@ -1812,12 +2456,64 @@ impl ImagePanel {
             // Auf den Kasten beschnitten: Zoom darf ueber den Rand hinausgehen.
             let painter = ui.painter().with_clip_rect(kasten);
             painter.rect_filled(kasten, 0.0, Color32::from_rgb(12, 12, 14));
-            painter.image(
-                texture.id(),
-                bild_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                Color32::WHITE,
-            );
+            let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            if self.strobo_an {
+                // Ein Vielfaches der Bildquelle: das Bild liegt mehrfach und ist
+                // um den Stroboskop-Versatz geschoben (synchron zum Takt).
+                let dx = self.strobo_versatz_px as f32 * skala;
+                let sichtbar = (kasten.width() / bild_b.max(1.0)).ceil() as i32 + 2;
+                for k in -sichtbar..=sichtbar {
+                    let versatz = egui::vec2(k as f32 * bild_b + dx, 0.0);
+                    painter.image(
+                        texture.id(),
+                        bild_rect.translate(versatz),
+                        uv,
+                        Color32::WHITE,
+                    );
+                }
+            } else {
+                painter.image(texture.id(), bild_rect, uv, Color32::WHITE);
+            }
+        }
+        // Spiralbahn als dünne Linie über dem Bild: gezeichnet wird an der
+        // Ansichtsstelle — dort liest der Scan (gelesen wird die Quellspalte
+        // hinter der bewegten Ansicht, siehe `spiral_schritt`). Während eines
+        // Sweeps zeigt der Sweep-Puffer die Spur selbst.
+        if self.spirale_an && self.scan_puffer.is_none() {
+            let bahn = spirale_bahn(&self.spirale, w, h);
+            if bahn.len() >= 2 {
+                let farbe = match self.sel {
+                    Some(farbe) if farbe != self.bg => Color32::from_rgb(farbe.0, farbe.1, farbe.2),
+                    _ => Color32::WHITE,
+                };
+                let punkte: Vec<egui::Pos2> = bahn
+                    .iter()
+                    .map(|(px, py)| {
+                        egui::pos2(
+                            bild_rect.min.x + *px as f32 * skala,
+                            bild_rect.min.y + *py as f32 * skala,
+                        )
+                    })
+                    .collect();
+                let painter = ui.painter().with_clip_rect(kasten);
+                // Wie die Bildkopien: mit Stroboskop liegt das Bild mehrfach
+                // und ist um den Versatz geschoben.
+                let dx = if self.strobo_an {
+                    self.strobo_versatz_px as f32 * skala
+                } else {
+                    0.0
+                };
+                let sichtbar = if self.strobo_an {
+                    (kasten.width() / bild_b.max(1.0)).ceil() as i32 + 2
+                } else {
+                    0
+                };
+                for k in -sichtbar..=sichtbar {
+                    let versatz = egui::vec2(k as f32 * bild_b + dx, 0.0);
+                    let verschoben: Vec<egui::Pos2> = punkte.iter().map(|p| *p + versatz).collect();
+                    painter.add(egui::Shape::line(verschoben, egui::Stroke::new(1.0, farbe)));
+                }
+            }
         }
         let finger_unten = response.is_pointer_button_down_on()
             || response.dragged_by(egui::PointerButton::Primary);
@@ -1883,13 +2579,21 @@ impl ImagePanel {
                         );
                     }
                 }
-            } else if finger_unten && bild_rect.contains(pos) {
+            } else if finger_unten && self.bild_tipp_erlaubt(&bild_rect, &kasten, pos) {
                 // Finger im Bild: einfrieren + Farbe waehlen.
                 if self.eingefroren.is_none() {
                     self.eingefroren = camera::letztes_bild();
                 }
-                let px = ((pos.x - bild_rect.min.x) / skala) as usize;
+                let ansicht_x = ((pos.x - bild_rect.min.x) / skala).floor() as i32;
                 let py = ((pos.y - bild_rect.min.y) / skala) as usize;
+                // Stroboskop: der Tipp gilt der Quellspalte hinter der
+                // bewegten Ansicht.
+                let px = if self.strobo_an {
+                    jamcore::stroboskop::quell_spalte(ansicht_x, self.strobo_versatz_px, w as i32)
+                        as usize
+                } else {
+                    ansicht_x.max(0) as usize
+                };
                 if let Some(farbe) = self.farbe_an(px, py) {
                     // Die x-Stelle merken, an der gerade getippt wurde: der
                     // Harmoniekreis setzt dort seine Grenze (Desktop
@@ -1921,5 +2625,176 @@ impl ImagePanel {
             self.maske_pinsel = None;
             self.eingefroren = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Filter wie im Bild-Tab (Hintergrund schwarz, Auswahl 200/40/120).
+    fn filter() -> ScanFilter {
+        ScanFilter {
+            bg: (0, 0, 0),
+            sel: (200, 40, 120),
+            range: (10, 10, 10),
+        }
+    }
+
+    /// RGBA-Puffer aus (r, g, b)-Pixeln.
+    fn frame(pixel: &[(u8, u8, u8)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for &(r, g, b) in pixel {
+            out.extend_from_slice(&[r, g, b, 255]);
+        }
+        out
+    }
+
+    #[test]
+    fn statuszeile_zeigt_familie_und_schritt() {
+        // Wortlaut wie am Desktop: „Scan: Spirale (Archimedes, Schritt 2,0)".
+        let mut s = Spirale::neu(Familie::Archimedes);
+        assert_eq!(spirale_text(&s), "Scan: Spirale (Archimedes, Schritt 2,0)");
+        s.setze_schritt(1.0);
+        assert_eq!(spirale_text(&s), "Scan: Spirale (Archimedes, Schritt 1,0)");
+        s.setze_schritt(4.0);
+        assert_eq!(spirale_text(&s), "Scan: Spirale (Archimedes, Schritt 4,0)");
+        // Die zweite Familie heisst wie im Patch „arch ln".
+        let log = Spirale::neu(Familie::Log);
+        assert_eq!(spirale_text(&log), "Scan: Spirale (arch ln, Schritt 2,0)");
+        assert_eq!(zahl(2.0), "2,0", "Komma statt Punkt");
+    }
+
+    #[test]
+    fn radius_max_ist_die_halbe_diagonale() {
+        assert_eq!(radius_max(640, 480), 400.0, "3-4-5: sqrt(320²+240²)");
+        assert_eq!(radius_max(320, 240), 200.0);
+        assert_eq!(radius_max(0, 0), 0.0, "ohne Bild kein Radius");
+    }
+
+    #[test]
+    fn zelle_trifft_liest_genau_den_punkt() {
+        // 2x2: Hintergrund, Treffer, Marker, Treffer.
+        let f = filter();
+        let bild = frame(&[(0, 0, 0), (200, 40, 120), (255, 0, 0), (205, 45, 115)]);
+        assert_eq!(
+            zelle_trifft(&bild, 2, 2, 1, 0, &f, None),
+            Some((200, 40, 120)),
+            "Treffer in der Auswahlfarbe"
+        );
+        assert_eq!(
+            zelle_trifft(&bild, 2, 2, 1, 1, &f, None),
+            Some((205, 45, 115)),
+            "innerhalb der Toleranz"
+        );
+        assert_eq!(
+            zelle_trifft(&bild, 2, 2, 0, 0, &f, None),
+            None,
+            "Hintergrund"
+        );
+        assert_eq!(zelle_trifft(&bild, 2, 2, 0, 1, &f, None), None, "Marker");
+        assert_eq!(
+            zelle_trifft(&bild, 2, 2, 2, 0, &f, None),
+            None,
+            "ausserhalb"
+        );
+        assert_eq!(
+            zelle_trifft(&bild, 2, 2, 1, -1, &f, None),
+            None,
+            "ausserhalb"
+        );
+        assert_eq!(
+            zelle_trifft(&[], 2, 2, 1, 0, &f, None),
+            None,
+            "leerer Puffer"
+        );
+        assert_eq!(zelle_trifft(&bild, 0, 0, 0, 0, &f, None), None, "kein Bild");
+        // Mit Palette zaehlt die gemerkte Farbe statt der Einzelauswahl.
+        let mut pal = std::collections::HashSet::new();
+        pal.insert(jamcore::livescan::quantize(10, 20, 30));
+        let gemalt = frame(&[(10, 20, 30), (0, 0, 0), (0, 0, 0), (0, 0, 0)]);
+        assert_eq!(
+            zelle_trifft(&gemalt, 2, 2, 0, 0, &f, Some(&pal)),
+            Some((10, 20, 30)),
+            "Palette trifft"
+        );
+        assert_eq!(
+            zelle_trifft(&gemalt, 2, 2, 1, 0, &f, Some(&pal)),
+            None,
+            "Hintergrund trifft auch mit Palette nicht"
+        );
+    }
+
+    #[test]
+    fn linie_verbindet_die_punkte() {
+        assert_eq!(linie((0, 0), (3, 0)), vec![(0, 0), (1, 0), (2, 0), (3, 0)]);
+        assert_eq!(
+            linie((5, 5), (5, 5)),
+            vec![(5, 5)],
+            "ein Punkt bleibt einer"
+        );
+        assert_eq!(
+            linie((0, 0), (2, 2)),
+            vec![(0, 0), (1, 1), (2, 2)],
+            "diagonal"
+        );
+        // Auch rueckwaerts und steil: Endpunkte bleiben, keine Luecke groesser 1.
+        let s = linie((10, 0), (0, 3));
+        assert_eq!(s.first(), Some(&(10, 0)));
+        assert_eq!(s.last(), Some(&(0, 3)));
+        assert!(
+            s.windows(2)
+                .all(|w| (w[0].0 - w[1].0).abs() <= 1 && (w[0].1 - w[1].1).abs() <= 1),
+            "zusammenhaengende Spur: {s:?}"
+        );
+    }
+
+    #[test]
+    fn bahn_beginnt_im_zentrum_und_bleibt_im_bild() {
+        for familie in [Familie::Archimedes, Familie::Log] {
+            let bahn = spirale_bahn(&Spirale::neu(familie), 320, 240);
+            assert!(bahn.len() >= 2, "{familie:?}: Bahn hat Punkte");
+            assert_eq!(bahn[0], (160, 120), "{familie:?} startet im Zentrum");
+            assert!(
+                bahn.iter()
+                    .all(|(x, y)| (0..320).contains(x) && (0..240).contains(y)),
+                "{familie:?}: jeder Bahnpunkt liegt im Bild"
+            );
+            assert!(
+                bahn.len() <= SPIRALE_BAHN_MAX,
+                "{familie:?}: Bahn ist gedeckelt"
+            );
+        }
+        // Archimedes (a = 1, 2 rad je Schritt) verlaesst das Bild: der letzte
+        // Punkt liegt am Rand.
+        let bahn = spirale_bahn(&Spirale::neu(Familie::Archimedes), 320, 240);
+        let (lx, ly) = *bahn.last().unwrap();
+        assert!(
+            lx <= 1 || ly <= 1 || lx >= 318 || ly >= 238,
+            "letzter Punkt liegt am Rand: ({lx}, {ly})"
+        );
+    }
+
+    #[test]
+    fn bahn_der_log_familie_ist_gedeckelt() {
+        // ln(a·φ) waechst so langsam, dass der Radius das Bild nie verlaesst —
+        // ohne Deckel liefe die Anzeige-Schleife endlos.
+        let bahn = spirale_bahn(&Spirale::neu(Familie::Log), 320, 240);
+        assert_eq!(bahn.len(), SPIRALE_BAHN_MAX, "Deckel greift");
+    }
+
+    #[test]
+    fn note_folgt_dem_radius() {
+        // Der Scan liest innen den Grundton (Offset) und aussen hoeher
+        // (Patch: `radius/max · tasten + offset`).
+        let max = radius_max(640, 480);
+        let mut s = Spirale::neu(Familie::Archimedes);
+        let innen = jamcore::spirale::note_aus_radius(s.radius(640.0, 480.0), max, 36, 36);
+        assert_eq!(innen, 36, "Zentrum = Offset");
+        for _ in 0..50 {
+            s.weiter();
+        }
+        let aussen = jamcore::spirale::note_aus_radius(s.radius(640.0, 480.0), max, 36, 36);
+        assert!(aussen > innen, "aussen hoeher: {innen} -> {aussen}");
     }
 }

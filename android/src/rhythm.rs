@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Grid, RichText, Sense};
+use jamcore::euclid;
 use jamcore::grid::{note_name, Note, Pattern, MAX_STEPS_PER_CYCLE, STEPS_PER_CYCLE as STEP_COUNT};
 use jamcore::osc::{OscOut, Renoise, DEFAULT_BASE_PORT};
 use jamcore::transformation;
@@ -23,6 +24,9 @@ const ROWS: [i32; 4] = [36, 48, 60, 72];
 const CELL: f32 = 22.0;
 const BLOCK: u16 = 8;
 const DEFAULT_BPM: f32 = 128.0;
+/// Tonzeile, auf die das Euklid-Muster schreibt: die erste Rasterzeile
+/// (36, Kick/Bass). Die anderen Zeilen bleiben fürs Antippen frei.
+const EUCLID_PITCH: i32 = ROWS[0];
 
 /// „125 ms“ zur Tonlaenge — die ms haengen am aktuellen BPM.
 fn ms_text(e: crate::klang::Einstellungen) -> String {
@@ -48,6 +52,9 @@ pub enum Klangquelle {
     Modul,
     /// Immer der Tongenerator mit gewaehlter Wellenform.
     Welle,
+    /// Slices aus dem Slicer-Tab (Instrument-Index = Slice-Nummer), sonst
+    /// Tongenerator.
+    Slices,
 }
 
 pub struct RhythmPanel {
@@ -96,6 +103,11 @@ pub struct RhythmPanel {
     welle: jamcore::klang::Welle,
     /// Handgriff auf das Modul des Players (von JamApp gesetzt).
     modul_quelle: Option<crate::player::ModulQuelle>,
+    /// Euklid-Werkzeug (Max-Patch `eucl-midi-in out`): Schläge, Schritte und
+    /// Rotation des Musters. Das Muster selbst wird daraus berechnet.
+    euclid_schlag: usize,
+    euclid_schritte: usize,
+    euclid_versatz: usize,
 }
 
 impl Default for RhythmPanel {
@@ -139,6 +151,10 @@ impl RhythmPanel {
             klangquelle: Klangquelle::Modul,
             welle: jamcore::klang::Welle::Sinus,
             modul_quelle: None,
+            // Vorgabe aus dem Max-Patch: 5 Schläge auf 16 Schritte.
+            euclid_schlag: 5,
+            euclid_schritte: 16,
+            euclid_versatz: 0,
         }
     }
 
@@ -170,9 +186,16 @@ impl RhythmPanel {
         (self.klangquelle, self.welle, self.modul_quelle.clone())
     }
 
-    /// Eine Note klingen lassen: Modul-Sample (wenn moeglich) oder Tongenerator.
+    /// Eine Note klingen lassen: Modul-Sample, Slice oder Tongenerator.
     /// Ausserhalb von Threads; fuer die Threads wird die Logik dort wiederholt.
-    fn note_klingen(&self, pitch: i32) {
+    /// `instrument` ist die Instrumentnummer des Rasters — bei der Klangquelle
+    /// „Slices" ist sie der Slice-Index.
+    fn note_klingen(&self, pitch: i32, instrument: i32) {
+        if self.klangquelle == Klangquelle::Slices
+            && crate::slicer::slice_spielen(instrument.max(0) as usize)
+        {
+            return;
+        }
         if self.klangquelle == Klangquelle::Modul {
             if let Some(quelle) = self.modul_quelle.as_ref() {
                 // Zuordnung aus dem Instrument-Tab: mehrere Bereiche klingen
@@ -226,6 +249,57 @@ impl RhythmPanel {
             "Rampe: {} Noten (59 … {})",
             self.pattern().notes().len(),
             59 + self.rampe_anzahl
+        );
+    }
+
+    /// Euklidisches Muster (0/1 je Zelle) aus den Reglern, inklusive Rotation
+    /// („Rotieren +1“ zählt `euclid_versatz` hoch).
+    fn euclid_muster(&self) -> Vec<bool> {
+        let basis = euclid::muster(self.euclid_schritte, self.euclid_schlag);
+        euclid::rotiere(&basis, self.euclid_versatz)
+    }
+
+    /// Das Euklid-Muster als Noten ins aktuelle Pattern schreiben
+    /// (Max-Patch `eucl-midi-in out`): 1 = Note auf den Schritt.
+    ///
+    /// Abbildung auf die Patternlänge: Das Muster wird **wiederholt** — Schritt
+    /// `i` liest die Zelle `i % muster.len()`. Damit liegt 5/16 auch in einer
+    /// 512er-Pattern als durchlaufendes Riff (32 Wiederholungen); ist die
+    /// Patternlänge kürzer als das Muster, ist es entsprechend nur dessen
+    /// Anfang (Klemmen). Wie die übrigen Werkzeuge (Rampe, Skalieren,
+    /// Interpolieren) ersetzt es das Raster: erst `clear`, dann `insert` mit
+    /// dem eingestellten Instrument. Die Tonzeile ist [`EUCLID_PITCH`], der
+    /// Skalenfilter bleibt außen vor — die Zeile ist ein Schlagzeug-Schritt,
+    /// kein Ton (sonst wanderten die Noten auf eine andere Rasterzeile).
+    fn euclid_setzen(&mut self) {
+        let muster = self.euclid_muster();
+        if muster.iter().all(|zelle| !*zelle) {
+            self.status = "Euklid: kein Schlag im Muster — Schläge auf 1 stellen.".to_string();
+            return;
+        }
+        let schritte = self.pattern().steps_per_cycle().max(1);
+        let instrument = self.instrument;
+        self.pattern_mut().clear();
+        for step in 0..schritte {
+            if muster[step as usize % muster.len()] {
+                self.pattern_mut().insert(Note {
+                    step,
+                    instrument,
+                    pitch: EUCLID_PITCH,
+                    glide: false,
+                });
+            }
+        }
+        // Nur ein Probe-Ton: das Muster kann hunderte Noten setzen, alle
+        // gleichzeitig wären auf dem Handy nur ein Knall.
+        self.play(EUCLID_PITCH, self.velocity);
+        self.note_klingen(EUCLID_PITCH, instrument as i32);
+        let noten = self.pattern().notes().len();
+        self.status = format!(
+            "Euklid {}/{}: {noten} Noten (Muster wiederholt, {})",
+            self.euclid_schlag,
+            self.euclid_schritte,
+            note_name(EUCLID_PITCH)
         );
     }
 
@@ -336,11 +410,11 @@ impl RhythmPanel {
         if self.render_laeuft {
             return;
         }
-        let noten: Vec<(u16, i32)> = self
+        let noten: Vec<(u16, i32, i32)> = self
             .pattern()
             .notes()
             .iter()
-            .map(|n| (n.step, n.pitch))
+            .map(|n| (n.step, n.pitch, n.instrument as i32))
             .collect();
         // Die Laenge des Zyklus fuer den Render-Thread: die gemeinsame
         // Patternlaenge (frueher fest 16).
@@ -373,18 +447,25 @@ impl RhythmPanel {
                 let mut klang_gemeldet = false;
                 while !stopp_c.load(Ordering::Relaxed) {
                     let start = Instant::now();
-                    for (s, pitch) in &noten {
+                    for (s, pitch, instrument) in &noten {
                         if *s == i {
-                            let gespielt =
-                                klangquelle == Klangquelle::Modul && modul_gespielt(&modul, *pitch);
-                            if !gespielt {
-                                if !klang_gemeldet {
-                                    info!("Klang: Tongenerator ({})", welle.name());
-                                    klang_gemeldet = true;
+                            let gespielt = match klangquelle {
+                                Klangquelle::Modul => modul_gespielt(&modul, *pitch),
+                                Klangquelle::Slices => {
+                                    crate::slicer::slice_spielen((*instrument).max(0) as usize)
                                 }
+                                Klangquelle::Welle => false,
+                            };
+                            if !gespielt {
                                 crate::klang::spielen_welle(*pitch, welle);
-                            } else if !klang_gemeldet {
-                                info!("Klang: Modul-Samples");
+                            }
+                            if !klang_gemeldet {
+                                let name = match (gespielt, klangquelle) {
+                                    (true, Klangquelle::Modul) => "Modul-Samples",
+                                    (true, Klangquelle::Slices) => "Slices",
+                                    _ => "Tongenerator",
+                                };
+                                info!("Klang: {name}");
                                 klang_gemeldet = true;
                             }
                             if let Some(o) = out.as_ref() {
@@ -425,17 +506,17 @@ impl RhythmPanel {
         if self.render_laeuft {
             self.rendern_stoppen();
         }
-        let mut noten: Vec<(u16, i32)> = self
+        let mut noten: Vec<(u16, i32, i32)> = self
             .pattern()
             .notes()
             .iter()
-            .map(|n| (n.step, n.pitch))
+            .map(|n| (n.step, n.pitch, n.instrument as i32))
             .collect();
         if noten.is_empty() {
             self.status = "Slot ist leer.".to_string();
             return;
         }
-        noten.sort_by_key(|(s, _)| *s);
+        noten.sort_by_key(|(s, _, _)| *s);
         let bpm = self.render_bpm.max(20.0);
         let (host, port) = self.target.clone();
         let basis = self.clock;
@@ -455,14 +536,19 @@ impl RhythmPanel {
                 }
                 let out = OscOut::new(&host, port).ok();
                 let start = Instant::now();
-                for (step, pitch) in &noten {
+                for (step, pitch, instrument) in &noten {
                     let ziel = *step as f32 * schrittzeit;
                     let rest = ziel - start.elapsed().as_secs_f32();
                     if rest > 0.0 {
                         std::thread::sleep(Duration::from_secs_f32(rest));
                     }
-                    let gespielt =
-                        klangquelle == Klangquelle::Modul && modul_gespielt(&modul, *pitch);
+                    let gespielt = match klangquelle {
+                        Klangquelle::Modul => modul_gespielt(&modul, *pitch),
+                        Klangquelle::Slices => {
+                            crate::slicer::slice_spielen((*instrument).max(0) as usize)
+                        }
+                        Klangquelle::Welle => false,
+                    };
                     if !gespielt {
                         crate::klang::spielen_welle(*pitch, welle);
                     }
@@ -655,7 +741,7 @@ impl RhythmPanel {
                     glide: false,
                 });
                 self.play(pitch, self.velocity);
-                self.note_klingen(pitch);
+                self.note_klingen(pitch, instrument as i32);
                 self.status = format!(
                     "Aufnahme: Schritt {} <- {} ({} Noten)",
                     ziel + 1,
@@ -682,7 +768,7 @@ impl RhythmPanel {
             self.play(pitch, self.velocity);
             // Der Ton klingt auch lokal (im Demo-Video hoerbar) — mit der
             // gewaehlten Klangquelle.
-            self.note_klingen(pitch);
+            self.note_klingen(pitch, instrument as i32);
             self.status = format!(
                 "Schritt {}: {} ({} Noten)",
                 step + 1,
@@ -710,7 +796,7 @@ impl RhythmPanel {
         let gesetzt = self.pattern_mut().toggle_buendel(von, bis, pitch);
         if gesetzt {
             self.play(pitch, self.velocity);
-            self.note_klingen(pitch);
+            self.note_klingen(pitch, self.instrument as i32);
         }
         self.status = format!(
             "{} Schritte {}: {} ({} Noten)",
@@ -954,8 +1040,59 @@ impl RhythmPanel {
                 self.slot_spielen();
             }
         });
-        // Klangquelle für das gerenderte Material: Modul-Samples oder
-        // Tongenerator mit Wellenform.
+        // Euklid (Max-Patch `eucl-midi-in out`): „N Schläge / M Schritte“ als
+        // Regler, das Muster steht als Text daneben. „Muster setzen“ schreibt
+        // es als Noten (1 = Note) auf die Tonzeile EUCLID_PITCH, „Rotieren +1“
+        // dreht das Muster weiter, „löschen“ räumt das Raster wieder.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Euklid:");
+            let max = euclid::MAX_SCHRITTE as i32;
+            let mut schlag = self.euclid_schlag as i32;
+            if ui
+                .add(egui::DragValue::new(&mut schlag).range(1..=max))
+                .changed()
+            {
+                self.euclid_schlag = (schlag.max(1) as usize).min(euclid::MAX_SCHRITTE);
+                self.status = format!(
+                    "Euklid: {} Schläge / {} Schritte",
+                    self.euclid_schlag, self.euclid_schritte
+                );
+            }
+            ui.label("Schläge /");
+            let mut schritte = self.euclid_schritte as i32;
+            if ui
+                .add(egui::DragValue::new(&mut schritte).range(1..=max))
+                .changed()
+            {
+                self.euclid_schritte = (schritte.max(1) as usize).min(euclid::MAX_SCHRITTE);
+                self.status = format!(
+                    "Euklid: {} Schläge / {} Schritte",
+                    self.euclid_schlag, self.euclid_schritte
+                );
+            }
+            ui.label("Schritte");
+            if ui.button("Muster setzen").clicked() {
+                self.euclid_setzen();
+            }
+            if ui.button("Rotieren +1").clicked() {
+                self.euclid_versatz = self.euclid_versatz.wrapping_add(1);
+                self.status = format!(
+                    "Euklid: Muster rotiert (Versatz {} Zellen) — „Muster setzen“ schreibt es ins Raster",
+                    self.euclid_versatz
+                );
+            }
+            if ui.button("löschen").clicked() {
+                self.pattern_mut().clear();
+                self.status = "Euklid: Raster geleert (Muster bleibt erhalten)".to_string();
+            }
+            ui.label(
+                RichText::new(format!("Muster: {}", euclid::als_text(&self.euclid_muster())))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
+        // Klangquelle für das gerenderte Material: Modul-Samples, Slices aus
+        // dem Slicer oder Tongenerator mit Wellenform.
         ui.horizontal_wrapped(|ui| {
             ui.label("Klang");
             if ui
@@ -970,6 +1107,16 @@ impl RhythmPanel {
             {
                 self.klangquelle = Klangquelle::Welle;
             }
+            if ui
+                .selectable_label(self.klangquelle == Klangquelle::Slices, "Slices")
+                .clicked()
+            {
+                self.klangquelle = Klangquelle::Slices;
+                self.status = format!(
+                    "Klang: Slices ({} im Slicer geladen, Instr = Slice-Nummer)",
+                    crate::slicer::slice_anzahl()
+                );
+            }
             if self.klangquelle == Klangquelle::Welle && ui.button(self.welle.name()).clicked() {
                 let alle = jamcore::klang::Welle::ALLE;
                 let idx = alle.iter().position(|w| *w == self.welle).unwrap_or(0);
@@ -981,6 +1128,25 @@ impl RhythmPanel {
                         .small()
                         .color(Color32::GRAY),
                 );
+            }
+            if self.klangquelle == Klangquelle::Slices {
+                let anzahl = crate::slicer::slice_anzahl();
+                if anzahl == 0 {
+                    ui.label(
+                        egui::RichText::new("keine Slices — im Slicer-Tab Audio laden")
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                } else {
+                    ui.label(
+                        egui::RichText::new(format!("{anzahl} Slices, Instr = Slice-Nummer"))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                    if ui.button("Slice hören").clicked() {
+                        crate::slicer::slice_spielen(self.instrument as usize);
+                    }
+                }
             }
         });
         // Tongenerator: Stimmen und Tonlaenge (Nutzerentscheidung 2026-10-14).
@@ -1136,9 +1302,24 @@ impl RhythmPanel {
             if ui.button("Instr -").clicked() {
                 self.instrument = self.instrument.saturating_sub(1);
             }
-            ui.label(format!("Instr {}", self.instrument));
+            if self.klangquelle == Klangquelle::Slices {
+                ui.label(format!(
+                    "Slice {} / {}",
+                    self.instrument as usize + 1,
+                    crate::slicer::slice_anzahl()
+                ));
+            } else {
+                ui.label(format!("Instr {}", self.instrument));
+            }
             if ui.button("Instr +").clicked() {
-                self.instrument = (self.instrument + 1).min(15);
+                // Bei der Klangquelle „Slices" ist die Instrumentnummer der
+                // Slice-Index; mehr als geladene Slices gibt es nicht.
+                let max = if self.klangquelle == Klangquelle::Slices {
+                    crate::slicer::slice_anzahl().saturating_sub(1).min(255) as u8
+                } else {
+                    15
+                };
+                self.instrument = (self.instrument + 1).min(max);
             }
             if ui.button("Instr auf alle").clicked() {
                 let inst = self.instrument;

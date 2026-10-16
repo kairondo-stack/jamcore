@@ -5,12 +5,20 @@
 //! bis 4 Takte, ms haengen am BPM) sind einstellbar; bei Ueberlast weicht die
 //! **aelteste** Stimme. Die Mixer-Mathematik liegt in `jamcore::klang`
 //! (`Stimme`, `mischen`, `Notenwert`), damit sie ohne Android testbar ist.
+//!
+//! Dritter Auftragstyp neben Note und Dauerton: fertige PCM-Puffer
+//! ([`puffer_spielen`], z. B. Slices aus dem Slicer). Sie klingen **einmal**
+//! (keine Schleife), werden auf die Ausgaberate umgerechnet und bei Ueberlast
+//! fällt der **aelteste** Puffer raus — wie bei den Stimmen.
 
+use std::collections::VecDeque;
 use std::os::raw::c_int;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 
 use jamcore::klang::{frequenz, mischen, Notenwert, Stimme, Welle};
+use jamcore::lissa::dauerton_mischen;
 use log::info;
 
 const RATE: c_int = 44100;
@@ -20,6 +28,73 @@ const ENCODING_PCM_16BIT: i32 = 2;
 const MODE_STREAM: i32 = 1;
 /// Blockgroesse des Mischers: ~10 ms. Fluessig genug und wenige JNI-Aufrufe.
 const BLOCK: usize = 441;
+/// So viele fertige Puffer warten hoechstens; der aelteste faellt raus.
+const PUFFER_MAX: usize = 8;
+
+/// Ein Auftrag an den Klang-Thread.
+enum Auftrag {
+    /// Kurzer Wellen-Ton (Tongenerator, MIDI-Note + Wellenform).
+    Note(i32, Welle),
+    /// Fertiger PCM-Puffer (mono, 16 Bit), einmal abspielen.
+    Puffer { pcm: Vec<i16>, rate: u32, gain: f32 },
+}
+
+/// Ein Puffer, der gerade klingt: Quelle, Position und Schrittweite fuer die
+/// Umrechnung auf die Ausgaberate (lineare Interpolation).
+struct KlingenderPuffer {
+    pcm: Vec<i16>,
+    /// Position in Quell-Samples (gebrochen, fuer die Interpolation).
+    pos: f64,
+    /// So viele Quell-Samples je Ausgabe-Sample.
+    schritt: f64,
+    gain: f32,
+}
+
+impl KlingenderPuffer {
+    fn neu(pcm: Vec<i16>, rate: u32, gain: f32) -> Self {
+        let schritt = if rate == 0 {
+            1.0
+        } else {
+            rate as f64 / RATE as f64
+        };
+        Self {
+            pcm,
+            pos: 0.0,
+            schritt,
+            gain: gain.clamp(0.0, 1.0),
+        }
+    }
+
+    fn fertig(&self) -> bool {
+        self.pos >= self.pcm.len() as f64
+    }
+
+    /// In den Block mischen (addieren) und die Position weiterruecken. Am Ende
+    /// des Puffers bleibt der Rest des Blocks still.
+    fn mischen(&mut self, block: &mut [i16]) {
+        let n = self.pcm.len();
+        if n == 0 {
+            self.pos = 0.0;
+            return;
+        }
+        for wert in block.iter_mut() {
+            if self.pos >= (n - 1) as f64 {
+                self.pos = n as f64;
+                break;
+            }
+            let i = self.pos.floor() as usize; // 0 … n-2 (siehe Abbruch oben)
+            let anteil = (self.pos - i as f64) as f32;
+            let quelle =
+                self.pcm[i] as f32 + (self.pcm[i + 1] as f32 - self.pcm[i] as f32) * anteil;
+            let add = (quelle * self.gain) as i32;
+            *wert = (*wert as i32 + add).clamp(-32768, 32767) as i16;
+            self.pos += self.schritt;
+        }
+        if self.pos >= (n - 1) as f64 {
+            self.pos = n as f64;
+        }
+    }
+}
 
 /// Einstellungen des Tongenerators (Regler im Rhythmus-Tab und in Bild 2).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,8 +119,43 @@ impl Default for Einstellungen {
 
 static EINSTELLUNGEN: OnceLock<Mutex<Einstellungen>> = OnceLock::new();
 
+/// Zähler: springt, wenn alle Tongenerator-Stimmen sofort verstummen sollen
+/// („Ton aus" im Bild-Tab). Der Klang-Thread leert dann seine Stimmenliste.
+static STOP_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Alle klingenden Tongenerator-Stimmen sofort beenden.
+pub fn stimmen_aus() {
+    STOP_GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 fn slot() -> &'static Mutex<Einstellungen> {
     EINSTELLUNGEN.get_or_init(|| Mutex::new(Einstellungen::default()))
+}
+
+/// Zwei Dauertöne (Lissa-Tab: X- und Y-Stimme der Figur). `None` = aus.
+static DAUERTON: OnceLock<Mutex<Option<[f32; 2]>>> = OnceLock::new();
+
+fn dauerton_slot() -> &'static Mutex<Option<[f32; 2]>> {
+    DAUERTON.get_or_init(|| Mutex::new(None))
+}
+
+/// Die zwei Dauertöne setzen (Hz) oder mit `None` abschalten. Startet den
+/// Klang-Thread, wenn er noch nicht läuft.
+pub fn dauerton_setzen(frequenzen: Option<[f32; 2]>) {
+    if let Ok(mut d) = dauerton_slot().lock() {
+        *d = frequenzen;
+    }
+    if frequenzen.is_some() {
+        let mut guard = match spieler_slot().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        sicherstellen(&mut guard);
+    }
+}
+
+fn dauerton_aktuell() -> Option<[f32; 2]> {
+    dauerton_slot().lock().ok().and_then(|d| *d)
 }
 
 /// Aktuelle Einstellungen (fuer die Anzeige der ms).
@@ -75,29 +185,51 @@ pub fn bpm_setzen(bpm: f32) {
 }
 
 pub struct Spieler {
-    tx: Sender<(i32, Welle)>,
+    tx: Sender<Auftrag>,
 }
 
 static SPIELER: OnceLock<Mutex<Option<Spieler>>> = OnceLock::new();
 
-/// Spielt eine MIDI-Note mit gewaehlter Wellenform an.
-pub fn spielen_welle(midi: i32, welle: Welle) {
-    let spieler = SPIELER.get_or_init(|| Mutex::new(None));
-    let mut guard = match spieler.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
+fn spieler_slot() -> &'static Mutex<Option<Spieler>> {
+    SPIELER.get_or_init(|| Mutex::new(None))
+}
+
+/// Den Klang-Thread starten, falls er noch nicht läuft.
+fn sicherstellen(guard: &mut Option<Spieler>) {
     if guard.is_none() {
         match starten() {
             Ok(neu) => *guard = Some(neu),
-            Err(e) => {
-                info!("klang: Start fehlgeschlagen: {e}");
-                return;
-            }
+            Err(e) => info!("klang: Start fehlgeschlagen: {e}"),
         }
     }
+}
+
+/// Spielt eine MIDI-Note mit gewaehlter Wellenform an.
+pub fn spielen_welle(midi: i32, welle: Welle) {
+    let mut guard = match spieler_slot().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    sicherstellen(&mut guard);
     if let Some(spieler) = guard.as_ref() {
-        let _ = spieler.tx.send((midi, welle));
+        let _ = spieler.tx.send(Auftrag::Note(midi, welle));
+    }
+}
+
+/// Einen fertigen PCM-Puffer (mono, 16 Bit) **einmal** abspielen — für Slices
+/// aus dem Slicer. Läuft neben den Tongenerator-Stimmen; bei Überlast fällt
+/// der älteste wartende Puffer aus der Warteschlange.
+pub fn puffer_spielen(pcm: Vec<i16>, rate: u32, gain: f32) {
+    if pcm.is_empty() || rate == 0 {
+        return;
+    }
+    let mut guard = match spieler_slot().lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    sicherstellen(&mut guard);
+    if let Some(spieler) = guard.as_ref() {
+        let _ = spieler.tx.send(Auftrag::Puffer { pcm, rate, gain });
     }
 }
 
@@ -106,7 +238,7 @@ fn starten() -> Result<Spieler, String> {
     let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr().cast()) }
         .map_err(|e| format!("JavaVM: {e}"))?;
     let vm = std::sync::Arc::new(vm);
-    let (tx, rx) = channel::<(i32, Welle)>();
+    let (tx, rx) = channel::<Auftrag>();
     std::thread::Builder::new()
         .name("jam-klang".to_string())
         .spawn(move || {
@@ -120,16 +252,49 @@ fn starten() -> Result<Spieler, String> {
 }
 
 /// Die Schleife: neue Auftraege einsammeln, Stimmen pflegen, Bloecke mischen.
-fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<(i32, Welle)>) -> Result<(), String> {
+fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(), String> {
     let mut env = vm.attach_current_thread().map_err(|e| e.to_string())?;
     let (track, array) = create_track(&mut env)?;
     let mut stimmen: Vec<Stimme> = Vec::new();
+    let mut puffer_schlange: VecDeque<KlingenderPuffer> = VecDeque::new();
     let mut puffer = vec![0i16; BLOCK];
     let mut welle = Welle::Sinus;
+    let mut phasen = [0.0f64; 2];
+    let mut dauerton_an = false;
+    let mut stop_gesehen = STOP_GENERATION.load(Ordering::Relaxed);
     loop {
+        // „Ton aus": alle klingenden Stimmen sofort beenden.
+        let stop = STOP_GENERATION.load(Ordering::Relaxed);
+        if stop != stop_gesehen {
+            stop_gesehen = stop;
+            if !stimmen.is_empty() || !puffer_schlange.is_empty() {
+                info!(
+                    "klang: alle Stimmen aus ({} beendet, {} Puffer verworfen)",
+                    stimmen.len(),
+                    puffer_schlange.len()
+                );
+                stimmen.clear();
+                puffer_schlange.clear();
+            }
+        }
+        // Dauerton des Lissa-Tabs: an/aus im Log belegen und Phasen zurücksetzen.
+        let dauerton = dauerton_aktuell();
+        match (dauerton_an, dauerton) {
+            (false, Some(f)) => {
+                info!("klang: Dauerton an (X {:.1} Hz, Y {:.1} Hz)", f[0], f[1]);
+                dauerton_an = true;
+            }
+            (true, None) => {
+                info!("klang: Dauerton aus");
+                dauerton_an = false;
+                phasen = [0.0; 2];
+            }
+            _ => {}
+        }
         // Klingt nichts, wird gewartet statt gedreht; klingt etwas, werden
         // alle wartenden Auftraege sofort aufgenommen.
-        let erster = if stimmen.is_empty() {
+        let leer = stimmen.is_empty() && dauerton.is_none() && puffer_schlange.is_empty();
+        let erster = if leer {
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(auftrag) => Some(auftrag),
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -139,23 +304,55 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<(i32, Welle)>) -> Res
             rx.try_recv().ok()
         };
         let mut auftrag = erster;
-        while let Some((midi, neue_welle)) = auftrag {
-            welle = neue_welle;
-            let e = einstellungen();
-            let laenge_ms = e.notenwert.ms(e.bpm).max(1);
-            stimmen.push(Stimme::neu(frequenz(midi), RATE as u32, laenge_ms));
-            // Ueberlast: die aelteste Stimme weicht.
-            while stimmen.len() > e.stimmen.max(1) {
-                stimmen.remove(0);
+        while let Some(neu) = auftrag {
+            match neu {
+                Auftrag::Note(midi, neue_welle) => {
+                    welle = neue_welle;
+                    let e = einstellungen();
+                    let laenge_ms = e.notenwert.ms(e.bpm).max(1);
+                    stimmen.push(Stimme::neu(frequenz(midi), RATE as u32, laenge_ms));
+                    // Ueberlast: die aelteste Stimme weicht.
+                    while stimmen.len() > e.stimmen.max(1) {
+                        stimmen.remove(0);
+                    }
+                }
+                Auftrag::Puffer { pcm, rate, gain } => {
+                    puffer_schlange.push_back(KlingenderPuffer::neu(pcm, rate, gain));
+                    // Ueberlast: der aelteste Puffer faellt raus.
+                    while puffer_schlange.len() > PUFFER_MAX {
+                        puffer_schlange.pop_front();
+                    }
+                }
             }
             auftrag = rx.try_recv().ok();
         }
-        if stimmen.is_empty() {
+        if stimmen.is_empty() && dauerton.is_none() && puffer_schlange.is_empty() {
             continue;
         }
         // Kopfraum: wenige Stimmen bleiben laut, viele steuern sich nicht zu.
         let gain = 1.0 / (stimmen.len().max(1) as f32).sqrt();
-        mischen(&mut puffer, &mut stimmen, RATE as u32, welle, gain);
+        if stimmen.is_empty() {
+            // Nur der Dauerton oder nur Puffer: den Block leeren (mischen
+            // wuerde ihn fuellen).
+            puffer.iter_mut().for_each(|s| *s = 0);
+        } else {
+            mischen(&mut puffer, &mut stimmen, RATE as u32, welle, gain);
+        }
+        if let Some(f) = dauerton {
+            // Zwei Stimmen mit Kopfraum (0,25 je Stimme), additiv zu den Noten.
+            dauerton_mischen(&mut puffer, &mut phasen, f, RATE as u32, 0.25);
+        }
+        // Slices (und andere fertige Puffer) einmal abspielen; fertige fallen
+        // aus der Schlange, der Rest rueckt weiter.
+        let mut k = 0;
+        while k < puffer_schlange.len() {
+            puffer_schlange[k].mischen(&mut puffer);
+            if puffer_schlange[k].fertig() {
+                puffer_schlange.remove(k);
+            } else {
+                k += 1;
+            }
+        }
         if !block_schreiben(&mut env, &track, &array, &puffer) {
             return Ok(());
         }

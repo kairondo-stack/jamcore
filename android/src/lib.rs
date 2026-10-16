@@ -1,6 +1,8 @@
 //! JamCore-Android-App: egui-Oberfläche mit Modul-Player (AudioTrack + libopenmpt).
 //! Weitere Module (Rhythmus, Bild/Scan, Session, Tagebuch) folgen in S4+.
 
+mod akkord;
+mod browser;
 mod camera;
 mod diary;
 mod image;
@@ -10,18 +12,22 @@ mod jniutil;
 mod klang;
 mod layout;
 mod link_support;
+mod lissa;
 mod maske;
 mod maske2;
 mod mic;
+mod ordner;
 mod osc;
 mod paths;
 mod player;
 mod quint;
 mod rhythm;
 mod session_ui;
+mod slicer;
 mod tasten;
 mod touch;
 mod video;
+mod wavrec;
 
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -53,7 +59,9 @@ enum Tab {
     Maske,
     Maske2,
     Bild2,
+    Lissa,
     Instr,
+    Slicer,
     Kombi,
 }
 
@@ -70,14 +78,20 @@ struct JamApp {
     module_hint: String,
     modules: Vec<PathBuf>,
     selected: Option<usize>,
+    /// Datei-Browser (Player-Tab „Öffnen"), offen solange `Some`.
+    browser: Option<browser::Browser>,
+    /// Datei-Browser des Slicer-Tabs („Audio öffnen"), offen solange `Some`.
+    browser_audio: Option<browser::Browser>,
     looping: bool,
     player: Option<player::Player>,
     instr: instr::InstrumentPanel,
     osc: osc::OscPanel,
     rhythm: rhythm::RhythmPanel,
+    slicer: slicer::SlicerPanel,
     mic: mic::MicPanel,
     bild: image::ImagePanel,
     kreis: quint::QuintPanel,
+    lissa: lissa::LissaPanel,
     session: session_ui::SessionPanel,
     link_aktiv: bool,
     multicast_aktiv: bool,
@@ -107,6 +121,12 @@ struct JamApp {
     link: jamcore::rusty_link::AblLink,
     link_report: Instant,
     kamera_laeuft: bool,
+    /// „Alle Dateien" (`MANAGE_EXTERNAL_STORAGE`) erteilt? Wird einmal pro
+    /// Sekunde neu geprüft, damit die Anzeige nach dem Besuch der Systemseite
+    /// umspringt (Nutzerentscheidung D2, 2026-10-16).
+    ordner_erlaubt: bool,
+    /// Nächste Prüfung von [`JamApp::ordner_erlaubt`].
+    ordner_pruefung: Instant,
 }
 
 impl Default for JamApp {
@@ -121,14 +141,18 @@ impl Default for JamApp {
             module_hint: String::new(),
             modules: Vec::new(),
             selected: None,
+            browser: None,
+            browser_audio: None,
             looping: true,
             player: None,
             instr: instr::InstrumentPanel::default(),
             osc: osc::OscPanel::default(),
             rhythm: rhythm::RhythmPanel::default(),
+            slicer: slicer::SlicerPanel::default(),
             mic: mic::MicPanel::default(),
             bild: image::ImagePanel::default(),
             kreis: quint::QuintPanel::default(),
+            lissa: lissa::LissaPanel::default(),
             session: session_ui::SessionPanel::default(),
             link_aktiv: true,
             multicast_aktiv: false,
@@ -154,6 +178,8 @@ impl Default for JamApp {
             },
             link_report: Instant::now(),
             kamera_laeuft: false,
+            ordner_erlaubt: false,
+            ordner_pruefung: Instant::now(),
         }
     }
 }
@@ -248,6 +274,26 @@ impl JamApp {
             self.status = "gestoppt".to_string();
         }
     }
+
+    /// Ein Modul aus dem Datei-Browser laden und spielen.
+    fn modul_laden(&mut self, path: PathBuf) {
+        if !self.modules.contains(&path) {
+            self.modules.push(path.clone());
+            self.modules.sort();
+            self.modules.dedup();
+        }
+        self.selected = self.modules.iter().position(|p| *p == path);
+        self.play_selected();
+    }
+}
+
+/// Anzeigetext für den Stand der „Alle Dateien"-Berechtigung (D2).
+fn zugriff_text(erlaubt: bool) -> &'static str {
+    if erlaubt {
+        "erlaubt"
+    } else {
+        "nein"
+    }
 }
 
 fn file_name(path: &std::path::Path) -> String {
@@ -296,6 +342,19 @@ impl eframe::App for JamApp {
                 }
             }
         }
+        // Ordner-Zugriff (D2): den Stand einmal pro Sekunde neu holen — nach
+        // dem Besuch der Systemseite springt die Anzeige im Überblick um.
+        if self.ordner_pruefung.elapsed() >= std::time::Duration::from_secs(1) {
+            self.ordner_pruefung = Instant::now();
+            let erlaubt = match self.app() {
+                Some(app) => ordner::alle_dateien_erlaubt(app),
+                None => false,
+            };
+            if erlaubt != self.ordner_erlaubt {
+                log::info!("Alle Dateien: {}", if erlaubt { "erlaubt" } else { "nein" });
+            }
+            self.ordner_erlaubt = erlaubt;
+        }
         // Ohne Ereignisse zeichnet egui nicht neu; fuer den Spike-Takt (und
         // spaeter fuer Live-Anzeigen) mindestens einmal pro Sekunde.
         ui.ctx()
@@ -331,6 +390,8 @@ impl eframe::App for JamApp {
                     ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
                     ui.selectable_value(&mut self.tab, Tab::Maske2, "M2");
                     ui.selectable_value(&mut self.tab, Tab::Bild2, "B2");
+                    ui.selectable_value(&mut self.tab, Tab::Lissa, "Lissa");
+                    ui.selectable_value(&mut self.tab, Tab::Slicer, "Slicer");
                     ui.selectable_value(&mut self.tab, Tab::Kombi, "Kombi");
                 });
             });
@@ -370,7 +431,45 @@ impl eframe::App for JamApp {
             Tab::Maske => self.view_maske(ui),
             Tab::Maske2 => self.view_maske2(ui),
             Tab::Bild2 => self.view_bild2(ui),
+            Tab::Lissa => self.view_lissa(ui),
+            Tab::Slicer => self.view_slicer(ui),
             Tab::Kombi => self.view_kombi(ui),
+        }
+        // Der Dauerton des Lissa-Tabs klingt nur dort (sonst weiter im Hintergrund).
+        if self.tab != Tab::Lissa {
+            self.lissa.stoppen();
+        }
+
+        // Datei-Browser des Player-Tabs („Öffnen"): Fenster über allem anderen.
+        if let Some(mut browser) = self.browser.take() {
+            let mut offen = true;
+            let gewaehlt = browser.ui(ui.ctx(), &mut offen);
+            if let Some(path) = gewaehlt {
+                self.modul_laden(path);
+                offen = false;
+            }
+            if offen {
+                self.browser = Some(browser);
+            }
+        }
+
+        // Datei-Browser des Slicer-Tabs („Audio öffnen"): liefert nur den Pfad
+        // zurück, abgespielt wird nicht automatisch.
+        if let Some(mut browser) = self.browser_audio.take() {
+            let mut offen = true;
+            let gewaehlt = browser.ui(ui.ctx(), &mut offen);
+            if let Some(path) = gewaehlt {
+                match self.slicer.laden(&path.display().to_string()) {
+                    Ok(beschreibung) => {
+                        self.status = format!("Audio: {} ({beschreibung})", file_name(&path));
+                    }
+                    Err(e) => self.status = format!("Audio-Fehler: {e}"),
+                }
+                offen = false;
+            }
+            if offen {
+                self.browser_audio = Some(browser);
+            }
         }
 
         // Ein zentraler BPM-Wert: hat ihn irgendein Regler (oder die Messung)
@@ -451,9 +550,24 @@ impl JamApp {
                 ui.label(&self.module_hint);
             }
             ui.separator();
-            if ui.button("Module neu suchen").clicked() {
-                self.scan_modules();
-            }
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("Module neu suchen").clicked() {
+                    self.scan_modules();
+                }
+                // „Alle Dateien" (D2): Systemseite für dieses Paket öffnen.
+                if ui.button("Ordner-Zugriff erlauben").clicked() {
+                    let ergebnis = match self.app() {
+                        Some(app) => ordner::einstellungen_oeffnen(app),
+                        None => Err("keine Activity".to_string()),
+                    };
+                    match ergebnis {
+                        Ok(()) => self.status = "Systemseite für Alle Dateien geöffnet".to_string(),
+                        Err(e) => self.meldung = format!("Ordner-Zugriff: {e}"),
+                    }
+                }
+                let stand = zugriff_text(self.ordner_erlaubt);
+                ui.label(format!("Alle Dateien: {stand}"));
+            });
             if ui.button("Zum Player").clicked() {
                 self.tab = Tab::Player;
                 if self.modules.is_empty() {
@@ -597,11 +711,13 @@ impl JamApp {
                     self.bild.set_bpm(effektiv);
                     self.bild_tempo_sync = effektiv;
                 }
+                // Bild → Kreis: derselbe x-Bereich (geteilter Wert).
+                let (von, bis) = self.bild.x_bereich();
+                self.kreis.setze_x_bereich(von, bis);
                 self.bild.ui(ui, self.rhythm.pattern_mut());
                 let nach = self.bild.scan_bpm();
                 if (nach - effektiv).abs() > 0.01 {
-                    self.tempo_setzen(nach);
-                    self.bild_tempo_sync = self.tempo_bpm;
+                    self.tempo_setzen(nach);                    self.bild_tempo_sync = self.tempo_bpm;
                 }
             }
             KombiTeil::Rhythmus => {
@@ -656,10 +772,45 @@ impl JamApp {
         egui::CentralPanel::default().show(ui, |ui| {
             self.bild.ui_vollbild(ui, self.rhythm.pattern_mut());
         });
+        // Bild (B2 nutzt denselben Zustand) → Kreis: geteilter x-Bereich.
+        let (von, bis) = self.bild.x_bereich();
+        self.kreis.setze_x_bereich(von, bis);
         let nach = self.bild.scan_bpm();
         if (nach - effektiv).abs() > 0.01 {
             self.tempo_setzen(nach);
             self.bild_tempo_sync = self.tempo_bpm;
+        }
+    }
+
+    fn view_lissa(&mut self, ui: &mut egui::Ui) {
+        let bpm = self.tempo_aktuell();
+        egui::CentralPanel::default().show(ui, |ui| {
+            self.lissa.ui(ui, bpm);
+        });
+    }
+
+    /// Slicer-Tab: WAV/MP3/… öffnen oder aufnehmen, schneiden, vorhören und
+    /// als .it sichern. Der Datei-Browser wird von hier angefordert und von
+    /// `ui()` als Fenster gezeigt (die App hat nur einen Ort für Fenster).
+    fn view_slicer(&mut self, ui: &mut egui::Ui) {
+        let mut aktion = slicer::Aktion::Keine;
+        egui::CentralPanel::default().show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
+                .id_salt("slicer_inhalt")
+                .show(ui, |ui| {
+                    aktion = self.slicer.ui(ui);
+                });
+        });
+        if aktion == slicer::Aktion::BrowserOeffnen {
+            // App-eigene Ordner zuerst (audio/recordings/wav gehen immer),
+            // mit „Alle Dateien" zusätzlich Music/Download/Documents.
+            let start = match self.app() {
+                Some(app) => browser::startordner(app, browser::Filter::Audio),
+                None => Vec::new(),
+            };
+            self.browser_audio = Some(browser::Browser::neu_audio(start));
+            self.status = "Audio wählen …".to_string();
         }
     }
 
@@ -750,6 +901,9 @@ impl JamApp {
             self.bild
                 .harmonie_band(klassen, self.bild.aktuelle_tipp_spalte());
         }
+        // Der x-Bereich des Kreises gilt auch für den Bild-Scan (geteilter Wert).
+        let (von, bis) = self.kreis.x_bereich();
+        self.bild.setze_x_bereich(von, bis);
     }
 
     fn view_bild(&mut self, ui: &mut egui::Ui) {
@@ -772,6 +926,9 @@ impl JamApp {
             // (Bild-Follow, Desktop `L`/bpmo3).
             self.bild.ui(ui, self.rhythm.pattern_mut());
         });
+        // Bild → Kreis: derselbe x-Bereich (geteilter Wert).
+        let (von, bis) = self.bild.x_bereich();
+        self.kreis.setze_x_bereich(von, bis);
         let nach = self.bild.scan_bpm();
         if (nach - effektiv).abs() > 0.01 {
             self.tempo_setzen(nach);
@@ -997,9 +1154,18 @@ impl JamApp {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(200));
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.button("Neu suchen").clicked() {
                     self.scan_modules();
+                }
+                if ui.button("Öffnen …").clicked() {
+                    // App-eigene Ordner zuerst (module/… gehen immer), mit
+                    // „Alle Dateien" zusätzlich Download/Documents.
+                    let start = match self.app() {
+                        Some(app) => browser::startordner(app, browser::Filter::Module),
+                        None => Vec::new(),
+                    };
+                    self.browser = Some(browser::Browser::neu(start));
                 }
                 if ui.button("Abspielen").clicked() {
                     self.play_selected();
@@ -1021,6 +1187,13 @@ impl JamApp {
                     self.wav_sichern();
                 }
             });
+            // Akkord-Zeile aus den gerade klingenden Noten des Moduls.
+            let noten = self
+                .player
+                .as_ref()
+                .map(|p| p.modul_quelle().klingende_noten())
+                .unwrap_or_default();
+            crate::akkord::zeile(ui, &noten);
             ui.separator();
 
             egui::ScrollArea::vertical()
@@ -1112,6 +1285,11 @@ fn android_main(app: android_activity::AndroidApp) {
     };
     let mut jam_app = JamApp::default();
     jam_app.android_app = Some(app.clone());
+    // App-eigene Ordner anlegen und den Stand von „Alle Dateien" merken
+    // (D2, 2026-10-16) — Fehler landen nur im Log.
+    ordner::app_ordner_anlegen(&app);
+    jam_app.ordner_erlaubt = ordner::alle_dateien_erlaubt(&app);
+    log::info!("Alle Dateien: {}", zugriff_text(jam_app.ordner_erlaubt));
     let _ = APP.set(Mutex::new(Some(app)));
     jam_app.scan_modules();
     let _ = eframe::run_native("JamCore", options, Box::new(|_cc| Ok(Box::new(jam_app))));
