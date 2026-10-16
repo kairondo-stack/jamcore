@@ -36,14 +36,47 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
   `RUSTC_WRAPPER=` setzen, `TMPDIR=/tmp/opencode`.
 - Cargo-NDK: `cargo ndk -t arm64-v8a --platform 26 -o app/src/main/jniLibs build --release`
   (Platform 26 nötig, sonst findet der Linker `libaaudio` nicht; minSdk ist 26).
-- APK: `bash android/build-apk.sh --install`.
+  Der Emulator ist x86_64, dafür `-t x86_64` (macht `build-apk.sh` automatisch).
+- APK: `bash android/build-apk.sh --install` (Default arm64-v8a **und** x86_64;
+  `ABIS=arm64-v8a` nur Handy, `ABIS=x86_64` nur Emulator, `--abi <abi>` geht auch).
 - Desktop-Nix-Pakete (Kopie): `~/jam-nix`, Start in `Start.txt`, `./sync.sh` zum
   Aktualisieren, `./update-hashes.sh` nach Cargo-Änderungen.
 
 ## Gerätetests (Android)
 
+**Emulator statt Handy (Standard seit 2026-10-15).** Liegt in der Nix-Shell bereit
+(Emulator 37.1.10, AOSP-Image API 36 x86_64, KVM; abschaltbar mit
+`nix-shell --arg emulator false`). AVD `jamcore_api36` (Pixel-6-Profil,
+1080x2400) liegt in `.android/` im Projekt (gitignored), Steuerung mit
+`android/emulator.sh`:
+
+- `bash android/emulator.sh start [--headless|--cold|--wipe]` – booten (Fenster
+  standardmäßig; `--headless` für Automatisierung), `stop`, `restart`, `status`
+- `bash android/emulator.sh install` – baut nur x86_64, installiert und startet
+  die Activity; `app` startet sie frisch, `logcat` (= `-s jamandroid`), `shot`,
+  `tap X Y`, `shell`, `wipe`
+- **Screenshots sind 1:1 (1080x2400)** – die Skalierung des Handys entfällt,
+  `tap` benutzt exakt die Screenshot-Koordinaten.
+- Start ist Quick-Boot aus dem Snapshot (~5 s). Eine dort laufende App bleibt
+  nach dem Restore **schwarz** (stale GL-Kontext): `emulator.sh start` beendet
+  sie deshalb selbst, danach `emulator.sh app` (oder `start --cold`).
+- Netz des Emulators ist NAT, kein LAN: Host = `10.0.2.2`; Multicast
+  (Ableton Link 224.76.78.75) verlässt den Emulator nicht → `peers=0` ist dort
+  normal; `adb reverse` weiterhin nur TCP.
+- Details/Ergebnisse: `docs/plans/2026-10-15-emulator.md`.
+
+**Handy (weiterhin möglich):**
+
 - `adb shell input tap <x> <y>`; Screenshot ist 872x1968 skaliert, Gerät
   1080x2410 → x·1.2385, y·1.2246.
+- **`input tap` wird von egui nicht als Klick erkannt** (gemessen 2026-10-16,
+  Pixel 10 Pro): `adb shell input swipe X Y X Y-1 120` benutzen (1 px, ~120 ms)
+  oder Tastatur (`input keyevent 61/66` = TAB/ENTER, Fokusring sichtbar).
+- **Pixel-Taskbar** (ab Android 16/17 sichtbar): das App-Fenster beginnt dann
+  bei `x=172` (`dumpsys window | grep frame`), alle Touch-x um +172 verschieben.
+- Im **Hochkant** reagierte Touch phasenweise gar nicht, im **Querformat** wieder
+  (Accelerometer dreht selbst) – vor Gerätetests Screenshot machen und die Lage
+  prüfen.
 - Start: `adb shell am start -n org.jamcore.app/android.app.NativeActivity`
   (die Activity ist `android.app.NativeActivity`, **kein** `.MainActivity`).
 - Tabs liegen bei Screenshot-y≈148, also Geräte-y≈181. Fünf Tabs (x Gerät):
@@ -52,9 +85,12 @@ Immer wenn Aufgaben unabhängig sind, parallelisieren statt nacheinander:
   zur Kontanz.
 - **Handy-Hotspot + Laptop = haeufigstes Setup, adb per TCP**: Im AP-Modus ist
   „Drahtloses Debugging“ ausgegraut (verlangt WLAN-Station). Einmal USB
-  anstecken, dann `adb tcpip 5555` und `adb connect 10.179.32.50:5555`
-  (10.179.32.50 ist das Handy als Hotspot-Gateway; Laptop z.B. 10.179.32.209).
-  Danach laeuft adb ohne Kabel bis zum Handy-Neustart.
+  anstecken, dann `adb tcpip 5555` und `adb connect <gateway>:5555`
+  (**die Hotspot-IP wechselt!** Gateway aus `ip route | awk '/default/{print $3}'`
+  lesen — am 2026-10-16 war es 10.105.239.30 statt 10.179.32.50). Danach laeuft
+  adb ohne Kabel bis zum Handy-Neustart. APK fuer das Handy **arm64-v8a** bauen
+  (`bash android/build-apk.sh --abi arm64-v8a`) — ein x86_64-APK scheitert mit
+  `INSTALL_FAILED_NO_MATCHING_ABIS`.
 - `adb reverse tcp<port> tcp<port>` für TCP. **UDP kann adb reverse nicht** — OSC
   von Handy zu Laptop braucht beide Geräte im selben Netz (Laptop-IP in der App).
 - Geräte-Seitennachweis ohne Netz: `adb shell "nc -u -l -p 7003 > /data/local/tmp/o.txt"`

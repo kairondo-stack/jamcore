@@ -1,6 +1,6 @@
 # JamCore Android – Bedienungsanleitung
 
-Stand: 14. Oktober 2026 · Beschreibt die App im Quellbaum (`android/`).
+Stand: 15. Oktober 2026 · Beschreibt die App im Quellbaum (`android/`).
 Funktionen mit **„in Arbeit"** oder **„geplant"** sind noch nicht fertig.
 
 ## Inhalt
@@ -59,20 +59,21 @@ Die Tab-Leiste liegt oben unter dem Titel „JamCore". Die Reihenfolge:
 
 | Tab | Was man dort macht | Wichtigste Regler |
 |---|---|---|
-| **Überblick** | Kamera starten/stoppen, Module finden | „Kamera an"/„Kamera aus", „Module neu suchen", „Zum Player" |
-| **Player** | Module auswählen und abspielen | „Abspielen", „Stopp", „Dauerschleife", „WAV sichern"; Anzeige Peak/Position/Order/Row |
+| **Überblick** | Kamera starten/stoppen, Module finden, Ordner-Zugriff erlauben | „Kamera an"/„Kamera aus", „Module neu suchen", „Ordner-Zugriff erlauben" (mit Anzeige „Alle Dateien: erlaubt/nein"), „Zum Player" |
+| **Player** | Module auswählen und abspielen | „Neu suchen", „**Öffnen …**" (Datei-Browser), „Abspielen", „Stopp", „Dauerschleife", „WAV sichern"; Anzeige Peak/Position/Order/Row; darunter die **Akkord-Anzeige** der gerade angespielten Noten |
 | **OSC** | Ziel-Laptop einstellen, Renoise ansteuern, Tempo senden | IP, Port (z. B. 7005), „Verbinden"/„Trennen", Tempo 30–300, „Tempo senden", Notenknöpfe 48/60/64/67/72, „Start"/„Stop", „BPM 128", „Follow an/aus" |
 | **Rhythmus** | Schritt-Raster bearbeiten (8 Patterns) | Zellen tippen, „Laenge" 1–1024, „Rendern", „Follow", „Klang" (Modul-Samples/Tongenerator), „Vel -/+", Skala, „CSV/XML sichern" |
 | **Tempo** | Tempo per Mikrofon messen | „Messen (4 s)", „Live", „Stop", „Tap", „Übernehmen"; Anzeige Pegel/Konfidenz |
-| **Bild** | Kamera/Video live scannen, Farbe wählen, Maske setzen | „Kamera an/aus", „Scan an/aus", Note-Modus, „ins Pattern", „Maske", Toleranz, Zoom/Bereich, „Schritte", „Datei sichern/laden" |
+| **Bild** | Kamera/Video live scannen, Farbe wählen, Maske setzen | „Kamera an/aus", „Scan an/aus", „**Ton aus**" (nur der App-Klang; OSC bleibt), „**Stroboskop**" (Bild läuft im Takt durchs Bild, der Scan liest die bewegte Ansicht), Note-Modus, „ins Pattern", „Maske", Toleranz, Zoom/Bereich, „Schritte", „Datei sichern/laden" |
 | **Kreis** | Quintenzirkel als Klangrad | Segmente antippen (sendet sofort `note_on`), „Auswahl löschen" |
 | **Session** | Ableton Link anzeigen und teilen (**wird mit Tempo zu einem Tab zusammengelegt**) | „Link an/aus", „Link neu starten", „Tempo folgen", Quantum 1–16 |
 | **Tagebuch** | Ideen sichern (Notiz + aktuelles Raster/Tempo) | „Eintrag speichern", „Neu laden", Einträge-Liste, oben der Bild-Pattern-Export (Renoise-XML kopieren) |
 | **Maske** | Takt-Maske: Zeitabstände tippen/wischen | Tastenfeld, „je Wert"/„verteilt", „Spalten", „Wert max", „Wisch-Modulation", „neu", „leeren", min/max-Regeln, Zoom |
 | **Kombi** | Zwei Ansichten gleichzeitig (Hochformat untereinander, Querformat nebeneinander) | Auswahl oben/unten bzw. links/rechts (leer/Bild/Rhythmus/Maske/Tempo/Session/Tagebuch/Kreis) |
-| **Maske 2 (M2)** | 10er-Tastenfeld in Nummernblock-Anordnung, mit „Ende" | **in Arbeit** – noch nicht in der Tab-Leiste |
-| **Bild 2 (B2)** | Bild im Vollbild mit transparenten Leisten | **in Arbeit** – noch nicht in der Tab-Leiste |
-| **Instrumente (Instr.)** | Instrumente/Samples mit Notenbereichen (von/bis) | **in Arbeit** – noch nicht in der Tab-Leiste |
+| **Maske 2 (M2)** | 10er-Tastenfeld in Nummernblock-Anordnung, mit „Ende" | Tastenfeld, „neu"/„Ende"; Nummernblock wirkt auch hier |
+| **Bild 2 (B2)** | Bild im Vollbild mit transparenten Leisten | gleiche Regler wie „Bild" (Kamera/Scan/Maske), Leisten scrollen |
+| **Instrumente (Instr.)** | Instrumente/Samples mit Notenbereichen (von/bis) | Eintragsliste, „von"/„bis"-Regler, „×" zum Löschen eines Bereichs |
+| **Lissa** | Lissajous-Figur, die im Takt kippt (Phasendrehung) | X/Y-Stepper (1–16) + Presets, „Umdrehungen" (1/64 … 16) mit Stufe „∞", „Takte pro Zyklus", „Sägezahn (Original)"/„Weich" bzw. „◀ links"/„rechts ▶", „Ton" + Grundton, „Präsentation" |
 
 Wichtig zu wissen:
 
@@ -172,8 +173,11 @@ Basisordner auf dem Handy:
 
 | Ort | Inhalt |
 |---|---|
+| `bild/` | Standbilder für den Bild-Tab (wie `bilder/`) |
+| `audio/` | Audiodateien für den Slicer (`.wav/.mp3/.ogg/.flac/.m4a/…`) |
 | `module/` | Module für den Player (`.it/.xm/.mod/.s3m/.mtm`) |
 | `videos/` | Videoquellen für den Bild-Tab (mp4/mkv/webm/avi/mov/3gp) |
+| `recordings/` | Mikrofon-Aufnahmen des Slicer-Tabs (`aufnahme-N.wav`) |
 | `bilder/` | Standbilder für den Bild-Tab (png/jpg/jpeg/bmp) |
 | `patterns/` | `pattern N.csv` und `pattern N.xml` aus dem Rhythmus-Tab |
 | `tagebuch/` | Tagebuch-Einträge (`JJJJ-MM-TT_hh_mm.txt`) |
@@ -182,8 +186,32 @@ Basisordner auf dem Handy:
 | `KeyEventRender.txt` | Takt-Maske zum Austausch; wird im Bild-Tab über „Datei sichern"/„Datei laden" geschrieben/gelesen |
 | `frame4save.bmp` | letztes Bild aus „Snapshot" im Bild-Tab |
 
+Die Ordner `bild`, `audio`, `module`, `videos` und `recordings` legt die App
+beim Start selbst an.
+
 Am einfachsten kommst du an die Dateien per `adb pull` oder `adb shell`
 (Dateimanager dürfen auf `Android/data` oft nicht zugreifen).
+
+### Wo liegen meine Dateien?
+
+Zwei Orte, je nachdem, wie viel Zugriff du der App geben willst:
+
+- **App-Ordner** (Tabelle oben): brauchen **keine** Berechtigung und sind vom
+  Rechner per USB erreichbar. Leg dort deine Bilder, Audiodateien und Module
+  ab; sie erscheinen im Player („Öffnen …") und im Slicer („Audio öffnen").
+- **Systemordner** `DCIM`, `Pictures`, `Music`, `Download` und `Documents`:
+  nur mit der Berechtigung **„Alle Dateien"** (Android 11+). Im
+  **Überblick**-Tab steht der Stand als „Alle Dateien: erlaubt/nein";
+  „Ordner-Zugriff erlauben" öffnet die Systemseite für die App. Dort
+  „Zugriff auf alle Dateien erlauben" einschalten und zurück zur App — die
+  Anzeige springt nach etwa einer Sekunde auf „erlaubt". Danach stehen die
+  Systemordner als Startordner in den Browsern bereit (im Player zusätzlich
+  Download und Documents, im Slicer zusätzlich Music, Download und
+  Documents).
+- **Ohne die Berechtigung** passiert nichts Schlimmes: die Systemordner fehlen
+  einfach in den Browsern. Nicht lesbare Ordner werden als Meldung im
+  Browserfenster angezeigt („… nicht lesbar (Berechtigung?)") und nur ins
+  Protokoll geschrieben — die App stürzt nicht ab.
 
 ## Problemlösung
 

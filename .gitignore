@@ -17,3 +17,6 @@ android/local.properties
 android/app/src/main/jniLibs/
 release.keystore
 KeyEventRender.txt
+
+# Emulator (AVD, Snapshots, adb-Keys) – siehe android/emulator.sh
+.android/
