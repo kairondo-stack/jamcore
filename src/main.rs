@@ -55,7 +55,13 @@ fn main() {
     let dump = args.iter().any(|a| a == "--dump");
     let wav_out = args.iter().position(|a| a == "--wav").map(|i| args[i + 1].clone());
 
-    let m = Mod::from_file(path).expect("Modul laden");
+    let m = match Mod::from_file(path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Modul konnte nicht geladen werden: {path}: {e}");
+            std::process::exit(1);
+        }
+    };
     println!("=== Loaded ===");
     println!("{}", m.info());
     let ns = unsafe { openmpt::openmpt_module_get_num_samples(m.ptr) };
@@ -377,5 +383,68 @@ mod tests {
         }
         assert_eq!(bt.observe(32, 8), Some(1));
         assert_eq!(bt.observe(40, 8), None);
+    }
+
+    /// Gegenprobe mit libopenmpt: Slices als .it schreiben und laden.
+    #[test]
+    fn erzeugtes_it_laesst_sich_mit_openmpt_laden() {
+        let slice = |name: &str, phase: f32| jamcore::itwrite::Sample {
+            name: name.to_string(),
+            daten: (0..1000)
+                .map(|i| ((i as f32 * 0.05 + phase).sin() * 20000.0) as i16)
+                .collect(),
+            rate: 44100,
+            c5speed: 0,
+        };
+        let samples = [slice("Slice 1", 0.0), slice("Slice 2", 1.0)];
+        let daten = jamcore::itwrite::bytes(&samples, "Slices").expect("IT-Bytes");
+        let pfad = std::env::temp_dir().join(format!("itwrite_samples_{}.it", std::process::id()));
+        std::fs::write(&pfad, &daten).expect("IT schreiben");
+        let m = Mod::from_file(pfad.to_str().unwrap()).expect("libopenmpt lädt die Datei");
+        assert_eq!(m.num_samples(), 2, "zwei Slices als Samples");
+        assert_eq!(m.num_instruments(), 0, "reine Sample-Datei");
+        assert_eq!(m.sample_name(0), "Slice 1");
+        assert_eq!(m.sample_name(1), "Slice 2");
+        assert_eq!(m.metadata("title"), "Slices");
+        assert_eq!(m.num_patterns(), 1, "ein leeres Pattern");
+        assert_eq!(m.pattern_num_rows(0), 64, "leeres Pattern hat 64 Zeilen");
+        assert_eq!(m.order_pattern(0), 0, "Order 0 zeigt auf Pattern 0");
+        let _ = std::fs::remove_file(&pfad);
+    }
+
+    /// Später nachgereichte Patterns kommen mit libopenmpt an.
+    #[test]
+    fn gefuelltes_pattern_laedt_mit_openmpt() {
+        use jamcore::itwrite::{Pattern, Sample, Zelle};
+        let samples = [Sample {
+            name: "A".to_string(),
+            daten: vec![0i16; 16],
+            rate: 44100,
+            c5speed: 0,
+        }];
+        let pattern = Pattern {
+            zeilen: 2,
+            kanaele: 1,
+            zellen: vec![
+                Zelle {
+                    note: Some(59), // C-5
+                    instrument: Some(1),
+                    ..Zelle::default()
+                },
+                Zelle {
+                    note: Some(254), // Note-Cut
+                    ..Zelle::default()
+                },
+            ],
+        };
+        let daten = jamcore::itwrite::bytes_mit_patterns(&samples, &[pattern], "Muster")
+            .expect("IT-Bytes");
+        let pfad = std::env::temp_dir().join(format!("itwrite_pattern_{}.it", std::process::id()));
+        std::fs::write(&pfad, &daten).expect("IT schreiben");
+        let m = Mod::from_file(pfad.to_str().unwrap()).expect("libopenmpt lädt die Datei");
+        assert_eq!(m.num_samples(), 1);
+        assert_eq!(m.num_patterns(), 1, "Pattern geladen");
+        assert_eq!(m.pattern_num_rows(0), 2, "zwei Zeilen");
+        let _ = std::fs::remove_file(&pfad);
     }
 }

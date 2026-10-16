@@ -2,6 +2,8 @@
 //! `it_live`: `write_wav`, `BeatTracker`, `render_variation`).
 //!
 //! - [`wav_stereo`] schreibt 16-Bit-PCM (stereo) aus zwei Float-Kanälen.
+//! - [`wav_mono`] schreibt 16-Bit-PCM (mono) aus fertigen i16-Proben — für die
+//!   Mikrofonaufnahme der App (`android/src/wavrec.rs`).
 //! - [`BeatTracker`] meldet den Beginn jeder vierten Beat-Phrase (wie der
 //!   Live-Trigger im Desktop).
 //! - [`order_mit_pattern`] sucht die nächste Order mit einem Ziel-Pattern —
@@ -34,6 +36,31 @@ pub fn wav_stereo(links: &[f32], rechts: &[f32], rate: u32) -> Vec<u8> {
             let s = (wert.clamp(-1.0, 1.0) * 32767.0) as i16;
             out.extend_from_slice(&s.to_le_bytes());
         }
+    }
+    out
+}
+
+/// 16-Bit-PCM-WAV (mono) aus fertigen i16-Proben. Aufbau wie [`wav_stereo`],
+/// aber ein Kanal (Block-Align 2, Byte-Rate `rate * 2`) — für die
+/// Mikrofonaufnahme, die schon 16-Bit-Proben liefert.
+pub fn wav_mono(proben: &[i16], rate: u32) -> Vec<u8> {
+    let daten_bytes = proben.len() * 2; // ein Kanal * 16 Bit
+    let mut out = Vec::with_capacity(44 + daten_bytes);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + daten_bytes as u32).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // mono
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 2).to_le_bytes()); // byte rate
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits je Sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(daten_bytes as u32).to_le_bytes());
+    for wert in proben {
+        out.extend_from_slice(&wert.to_le_bytes());
     }
     out
 }
@@ -193,6 +220,33 @@ mod tests {
         // Unterschiedlich lange Kanaele: der kuerzere bestimmt.
         let b = wav_stereo(&[0.0, 0.0, 0.0], &[0.0], 8000);
         assert_eq!(b.len(), 44 + 2 * 2);
+    }
+
+    #[test]
+    fn wav_mono_kopf_und_samples() {
+        let b = wav_mono(&[0, 32767, -32768], 16000);
+        assert_eq!(&b[..4], b"RIFF");
+        assert_eq!(&b[8..12], b"WAVE");
+        assert_eq!(&b[12..16], b"fmt ");
+        assert_eq!(u32_le(&b, 16), 16, "fmt-Groesse");
+        assert_eq!(u16_le(&b, 20), 1, "PCM");
+        assert_eq!(u16_le(&b, 22), 1, "mono");
+        assert_eq!(u32_le(&b, 24), 16000, "Abtastrate");
+        assert_eq!(u32_le(&b, 28), 32000, "Byte-Rate");
+        assert_eq!(u16_le(&b, 32), 2, "Block-Align");
+        assert_eq!(u16_le(&b, 34), 16, "Bits");
+        assert_eq!(&b[36..40], b"data");
+        assert_eq!(u32_le(&b, 40) as usize, b.len() - 44, "Datenlaenge");
+        assert_eq!(u32_le(&b, 4) as usize, b.len() - 8, "RIFF-Groesse");
+        assert_eq!(b.len(), 44 + 3 * 2, "drei Proben mono");
+        assert_eq!(i16_at(&b, 0), 0);
+        assert_eq!(i16_at(&b, 1), 32767);
+        assert_eq!(i16_at(&b, 2), -32768);
+        // Leere Aufnahme: nur der Kopf, keine Daten.
+        let leer = wav_mono(&[], 8000);
+        assert_eq!(leer.len(), 44, "nur der Kopf");
+        assert_eq!(u32_le(&leer, 40), 0, "leere Daten");
+        assert_eq!(u32_le(&leer, 28), 16000, "Byte-Rate auch bei leer");
     }
 
     #[test]

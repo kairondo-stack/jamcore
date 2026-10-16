@@ -4,6 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# Gezielte Feature-Liste statt `all`: adpcm/alac/mkv/caf werden nicht
+# gebraucht und kosten nur Bauzeit (Desktop und Android).
+symphonia = { version = "0.5", default-features = false, features = [
+    "aac",
+    "aiff",
+    "flac",
+    "isomp4",
+    "mp3",
+    "ogg",
+    "pcm",
+    "vorbis",
+    "wav",
+] }
 rosc = "0.9"
 rusty_link = { version = "0.4", optional = true }
 

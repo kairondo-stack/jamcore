@@ -3,21 +3,31 @@
 //! OSC-Ausgang.
 
 pub mod bmp;
+pub mod akkord;
+pub mod audio;
 pub mod diary;
+pub mod euclid;
 pub mod gesten;
 pub mod grid;
 pub mod harmonie;
 pub mod instrument;
+pub mod itwrite;
 pub mod klang;
 pub mod livescan;
+pub mod lissa;
 pub mod maske;
 pub mod micbpm;
+pub mod modulebrowser;
 pub mod openmpt;
 pub mod osc;
 pub mod quint;
+pub mod relay;
 pub mod scanmask;
 pub mod schrittweite;
 pub mod session;
+pub mod spirale;
+pub mod slice;
+pub mod stroboskop;
 pub mod takte;
 pub mod transformation;
 pub mod wav;

@@ -6,10 +6,104 @@
 //     wirklich gebraucht wird.
 //   - Eingaben (BPM, Harmonien usw.) über stdin statt SDL-Tasteneingabe.
 //   - OSC-Empfang (Port 7010) entfällt (in rrn5.cpp auskommentiert).
-mod osc;
+//   - Stroboskop-Ansicht (F9–F12, −/+; siehe strobo.rs) wie in der App: eine
+//     Bildquelle läuft im Takt durchs Bild, der Scan liest die verschobene
+//     Quellspalte `(Ansicht − Versatz) mod Breite`.
+//   - Spiral-Scan (Shift+F8 an/aus, Alt+−/Alt++ Schrittweite; siehe
+//     spirale.rs) als **zweiter Scan-Modus**: der Abtastpfad läuft als Spirale
+//     über das Bild (Archimedes bzw. „arch ln" aus dem Max-Patch `spiralobpm`),
+//     der **Radius bestimmt die Tonhöhe**; gelesen wird die Bildzelle am
+//     Spiralpunkt, die Spur erscheint im Sweep-Fenster. F8 selbst ist belegt
+//     (setzt `renoiseplay`), F1–F12 alle — daher Shift+F8.
+//   - Datei-Browser auf `o` in der Konsole (Unterordner und Bilddateien, „.."
+//     geht hoch, `q` bricht ab) statt eines festen Ordners; der Startordner ist
+//     das erste Argument (sonst der aktuelle Ordner).
+//   - **„OSC aus/an" auf `a`** statt „Ton aus": rrn5 hat **keinen lokalen
+//     Klangweg** (kein Audio-Backend, kein Tongenerator — es sendet nur per
+//     rosc an Renoise, dort klingt es). „Ton aus" gibt es in der App, weil der
+//     Scan dort einen eigenen Klang hat; hier kann derselbe Platz nur das
+//     Senden meinen. Das bisherige `o` (Pattern-Ausgabe, bpmo) liegt deshalb
+//     auf Strg+o.
 mod shared;
+mod spirale;
+mod strobo;
 mod video;
 mod x11cap;
+
+// ---------------------------------------------------------------------------
+// OSC-Ausgabe mit Schalter (Taste `a`: „OSC aus/an")
+//
+// Alle Sender des Programms laufen durch die Hülle `osc` unten; steht der
+// Schalter aus, wird nichts gesendet. Die Aufrufe im Programm bleiben dabei
+// unverändert (`osc::note_on(…)` usw.) — so gibt es genau eine Stelle, an der
+// „aus" wirkt, und keine vergessene Sendestelle.
+// ---------------------------------------------------------------------------
+#[path = "osc.rs"]
+mod osc_roh;
+
+mod osc {
+    // Hülle um `osc_roh`: jede Sendestelle, die das Programm benutzt, steht hier
+    // und geht durch den Schalter. Eine neue Sendestelle muss hier ergänzt
+    // werden — dann fällt sie auf, statt am Schalter vorbei zu senden.
+    use super::osc_an;
+    use rosc::OscType;
+
+    pub fn t7000(addr: &str, args: Vec<OscType>) {
+        if osc_an() {
+            super::osc_roh::t7000(addr, args);
+        }
+    }
+
+    pub fn t7001(addr: &str, args: Vec<OscType>) {
+        if osc_an() {
+            super::osc_roh::t7001(addr, args);
+        }
+    }
+
+    pub fn send_bpm(fixed_bpm: f32, teiler: f32) {
+        if osc_an() {
+            super::osc_roh::send_bpm(fixed_bpm, teiler);
+        }
+    }
+
+    pub fn transport_start() {
+        if osc_an() {
+            super::osc_roh::transport_start();
+        }
+    }
+
+    pub fn transport_stop() {
+        if osc_an() {
+            super::osc_roh::transport_stop();
+        }
+    }
+
+    pub fn note_on(port: u16, note: i32, volume: i32) {
+        if osc_an() {
+            super::osc_roh::note_on(port, note, volume);
+        }
+    }
+
+    pub fn trigger_midi(port: u16, volume: i32) {
+        if osc_an() {
+            super::osc_roh::trigger_midi(port, volume);
+        }
+    }
+}
+
+/// OSC-Ausgabe an/aus (Taste `a`); alle Sender laufen über die Hülle `osc`.
+static OSC_AN: AtomicBool = AtomicBool::new(true);
+
+fn osc_an() -> bool {
+    OSC_AN.load(Ordering::Relaxed)
+}
+
+/// OSC-Ausgabe umschalten; liefert den neuen Zustand.
+fn osc_umschalten() -> bool {
+    let neu = !osc_an();
+    OSC_AN.store(neu, Ordering::Relaxed);
+    neu
+}
 
 use shared::SharedMemoryEditor;
 use sdl2::event::{Event, EventType};
@@ -18,6 +112,8 @@ use sdl2::pixels::{Color, PixelFormatEnum};
 use sdl2::rect::Point;
 use sdl2::render::{Canvas, Texture, TextureCreator};
 use sdl2::video::Window;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Test-Hook: E2E_KEYS="Tab,Right" beim Start in die SDL-Queue legen.
@@ -29,8 +125,24 @@ fn inject_test_keys() {
 }
 
 fn push_test_keys(spec: &str) {
-    use sdl2::keyboard::{Keycode as K, Scancode as S};
+    use sdl2::keyboard::{Keycode as K, Mod as M, Scancode as S};
     for name in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        // Modifikatoren vor dem Tastennamen („shift+f8", „alt+minus"): sie
+        // landen im `mod`-Feld des Tastendrucks — die Handler lesen sie wie bei
+        // einer echten Tastatur aus `keymod`.
+        let mut mods = M::NOMOD;
+        let mut name = name;
+        while let Some((p, rest)) = name.split_once('+') {
+            let bit = match p.to_ascii_lowercase().as_str() {
+                "shift" => M::LSHIFTMOD,
+                "alt" => M::LALTMOD,
+                "ctrl" => M::LCTRLMOD,
+                "gui" => M::LGUIMOD,
+                _ => break,
+            };
+            mods |= bit;
+            name = rest;
+        }
         if let Some(ms) = name.strip_prefix("wait:") {
             std::thread::sleep(std::time::Duration::from_millis(ms.parse().unwrap_or(0)));
             continue;
@@ -121,8 +233,23 @@ fn push_test_keys(spec: &str) {
             "x" => (K::X, S::X),
             "y" => (K::Y, S::Y),
             "z" => (K::Z, S::Z),
+            "f1" => (K::F1, S::F1),
+            "f2" => (K::F2, S::F2),
             "f3" => (K::F3, S::F3),
             "f4" => (K::F4, S::F4),
+            "f5" => (K::F5, S::F5),
+            "f6" => (K::F6, S::F6),
+            "f7" => (K::F7, S::F7),
+            "f8" => (K::F8, S::F8),
+            "f9" => (K::F9, S::F9),
+            "f10" => (K::F10, S::F10),
+            "f11" => (K::F11, S::F11),
+            "f12" => (K::F12, S::F12),
+            // „+"/„−" für die Takte: „+" gibt es je nach Tastatur nur mit
+            // Shift, als Scancode dafür die Ziffernblock-Taste (E2E-Hook).
+            "minus" => (K::Minus, S::Minus),
+            "plus" => (K::Plus, S::KpPlus),
+            "equals" => (K::Equals, S::Equals),
             _ => continue,
         };
         unsafe {
@@ -131,6 +258,7 @@ fn push_test_keys(spec: &str) {
             raw.key.state = 1;
             raw.key.keysym.sym = k.into_i32();
             raw.key.keysym.scancode = sdl2::sys::SDL_GetScancodeFromKey(k.into_i32());
+            raw.key.keysym.mod_ = mods.bits();
             sdl2::sys::SDL_PushEvent(&mut raw);
         }
     }
@@ -249,7 +377,10 @@ fn read_two_i32() -> (i32, i32) {
     wh_from_tokens(&tokens)
 }
 
-/// Bildverzeichnis aus Argumenten/Env (--dir <pfad>, FRAMES_DIR, sonst cwd).
+/// Startordner für die Bilddateien (und für den Datei-Browser auf `o`):
+/// erstes **freies** Argument, sonst `--dir <pfad>`, sonst `FRAMES_DIR`, sonst
+/// der aktuelle Ordner. Die Werte von `--size`, `--video` und `--shm` sind
+/// keine Ordner und werden übersprungen.
 fn resolve_frames_dir(args: &[String]) -> String {
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -259,8 +390,20 @@ fn resolve_frames_dir(args: &[String]) -> String {
             }
         }
     }
-    if let Some(p) = args.iter().find(|a| !a.starts_with("--")) {
-        return p.clone();
+    let mit_wert = ["--size", "--video", "--shm"];
+    let mut ueberspringen = false;
+    for a in args {
+        if ueberspringen {
+            ueberspringen = false;
+            continue;
+        }
+        if mit_wert.contains(&a.as_str()) {
+            ueberspringen = true;
+            continue;
+        }
+        if !a.starts_with("--") {
+            return a.clone();
+        }
     }
     std::env::var("FRAMES_DIR").unwrap_or_else(|_| ".".to_string())
 }
@@ -426,6 +569,13 @@ struct App {
     live_palette: Option<std::collections::HashSet<u32>>,
     max_notes_per_sec: u32,
     live_verbose: bool,
+    /// Stroboskop-Ansicht (F9–F12, −/+): Zustand und Phase (siehe strobo.rs).
+    strobo: strobo::Stroboskop,
+    /// Spiral-Scan (Shift+F8 an/aus, Alt+−/Alt++ Schrittweite): `Some` =
+    /// Spirale statt Linien-Sweep, `None` = Spalten-Sweep (siehe spirale.rs).
+    spirale: Option<jamcore::spirale::Spirale>,
+    /// Letzter Spiralpunkt für die dünne Spur im Sweep-Fenster.
+    spirale_letzter: Option<(i32, i32)>,
     surfacesh: bool,
     sendbpm: bool,
     leftset: bool,
@@ -564,6 +714,9 @@ impl App {
             live_verbose: std::env::var("RRN5_LIVE_VERBOSE")
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            strobo: strobo::Stroboskop::new(),
+            spirale: None,
+            spirale_letzter: None,
             surfacesh: false,
             sendbpm: true,
             leftset: false,
@@ -673,6 +826,42 @@ impl App {
         }
     }
 
+    /// Stroboskop-Phase fortschreiben (je Frame einmal) und den Versatz in
+    /// Pixeln liefern. Das Tempo ist das gerechnete BPM der App; solange das
+    /// noch nicht steht, gilt `fixedBpm` (Vorgabe 120).
+    fn strobo_schritt(&mut self) -> i32 {
+        let bpm = if self.Bpm.is_finite() && self.Bpm > 0.0 {
+            self.Bpm as f64
+        } else {
+            self.fixedBpm.max(1.0) as f64
+        };
+        self.strobo.schritt(bpm, self.xw)
+    }
+
+    /// Eine Scan-Note senden: Notenbremse, OSC-Kanal je `renoiseswitch`,
+    /// Zähler. Gemeinsamer Weg von Linien- und Spiral-Scan; `true`, wenn
+    /// wirklich gesendet wurde (die ausführliche Meldung hängt daran).
+    fn sende_note(&mut self, note: i32, vol: i32) -> bool {
+        if self.renoisenote
+            && jamcore::livescan::note_allowed(
+                self.live_last_note.elapsed(),
+                self.max_notes_per_sec,
+            )
+        {
+            self.live_last_note = Instant::now();
+            if self.renoiseswitch {
+                osc::note_on(7000, note, vol);
+                osc::trigger_midi(7002, vol);
+            } else {
+                osc::note_on(7001, note, vol);
+            }
+            self.live_notes_this_sweep += 1;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Eine Spalte des aktuellen Kamera-/Videoframes scannen und abspielen.
     /// Taktsynchron: ein Sweep dauert einen Beat; freilaufend: kontinuierlich.
     fn live_scan_step(&mut self, frame: &[u8], third: &mut [u8], second: &[u8]) -> bool {
@@ -722,6 +911,14 @@ impl App {
             sel: (self.selectedR, self.selectedG, self.selectedB),
             range: (self.rrange, self.grange, self.brange),
         };
+        // Zweiter Scan-Modus (Shift+F8): die Spirale liest die Bildzelle am
+        // Spiralpunkt statt der Sweep-Spalte; der Linien-Sweep unten bleibt
+        // unverändert.
+        if self.spirale.is_some() {
+            return self.spiral_scan_schritt(
+                frame, third, second, w, h, column_ns, budget, &alphas, &filter,
+            );
+        }
         let step = self.iadd.max(1);
         while start.elapsed() < budget {
             let now = Instant::now();
@@ -751,22 +948,35 @@ impl App {
                     self.live_palette = None;
                 }
             }
+            // Stroboskop: die Ansicht ist verschoben — gelesen (und als Note
+            // gedeutet) wird die Quellspalte dahinter, wie in der App.
+            let x_quelle = self.strobo.quell_spalte(x, w);
             // Takte-Maske (biialpha): nur Spalten mit iialpha≠0 kommen durch,
-            // Amplitude skaliert Farbe und Volume.
+            // Amplitude skaliert Farbe und Volume. Die Maske hängt an der
+            // Ansichtsspalte (sie bewegt sich mit dem Sweep, nicht mit dem Bild).
             let alpha = if self.biialpha {
                 jamcore::livescan::mask_alpha(&alphas, x)
             } else {
                 1.0
             };
             if alpha > 0.0 {
-                let hits =
-                    jamcore::livescan::scan_column(frame, w, h, x, &filter, self.live_palette.as_ref());
+                let hits = jamcore::livescan::scan_column(
+                    frame,
+                    w,
+                    h,
+                    x_quelle,
+                    &filter,
+                    self.live_palette.as_ref(),
+                );
                 for (y, r, g, b) in hits {
-                    let (note, vol) = self.event_note_volume(x, y, r, g, b);
-                    if !self.is_note_in_chordpatt(note, x, y, h) {
+                    let (note, vol) = self.event_note_volume(x_quelle, y, r, g, b);
+                    if !self.is_note_in_chordpatt(note, x_quelle, y, h) {
                         continue;
                     }
                     let (dr, dg, db) = jamcore::livescan::scale_rgb(r, g, b, alpha);
+                    // Gezeichnet wird in der Ansichtsspalte: das dritte Fenster
+                    // bleibt die Sweep-Anzeige (links → rechts), auch wenn die
+                    // Noten aus der verschobenen Quellspalte kommen.
                     set_px(third, w, x, y, Color::RGB(dr, dg, db));
                     self.live_drawn_this_sweep += 1;
                     drew = true;
@@ -775,23 +985,8 @@ impl App {
                     } else {
                         vol
                     };
-                    if self.renoisenote
-                        && jamcore::livescan::note_allowed(
-                            self.live_last_note.elapsed(),
-                            self.max_notes_per_sec,
-                        )
-                    {
-                        self.live_last_note = Instant::now();
-                        if self.renoiseswitch {
-                            osc::note_on(7000, note, vol);
-                            osc::trigger_midi(7002, vol);
-                        } else {
-                            osc::note_on(7001, note, vol);
-                        }
-                        self.live_notes_this_sweep += 1;
-                        if self.live_verbose {
-                            println!("live x={x} y={y} note={note} vol={vol}");
-                        }
+                    if self.sende_note(note, vol) && self.live_verbose {
+                        println!("live x={x} quelle={x_quelle} y={y} note={note} vol={vol}");
                     }
                 }
             }
@@ -808,6 +1003,150 @@ impl App {
             }
             self.live_x = next;
             self.live_next_col += Duration::from_nanos(column_ns as u64);
+        }
+        drew
+    }
+
+    /// Ein Tick des Spiral-Scans: Spirale fortschreiben, die Bildzelle am
+    /// Spiralpunkt lesen, die Note aus dem **Radius** senden (Patch
+    /// `expr ($f1*$f3/$f2+$f4)`) und die Spur ins Sweep-Fenster zeichnen.
+    ///
+    /// Wie beim Linien-Sweep läuft ein Tick je `column_ns`; ein Sweep endet,
+    /// wenn der Radius das Bild verlassen hat, danach beginnt die Spirale
+    /// wieder im Zentrum. Die Lautstärke kommt wie bisher aus der Zelle, nur
+    /// die Tonhöhe folgt dem Radius.
+    fn spiral_scan_schritt(
+        &mut self,
+        frame: &[u8],
+        third: &mut [u8],
+        second: &[u8],
+        w: i32,
+        h: i32,
+        column_ns: i64,
+        budget: Duration,
+        alphas: &[f32],
+        filter: &jamcore::livescan::ScanFilter,
+    ) -> bool {
+        let mut drew = false;
+        let start = Instant::now();
+        while start.elapsed() < budget {
+            let now = Instant::now();
+            if now < self.live_next_col {
+                sleep_ns(self.live_next_col.saturating_duration_since(now).as_nanos() as i64);
+                continue;
+            }
+            // Spirale fortschreiben: ein Schritt je Tick. `radius` gehört zur
+            // geklemmten Bildzelle (das ist die Note), `radius_roh` ist der
+            // ungeklemmte Radius für das Sweep-Ende.
+            let (px, py, radius, radius_roh) = {
+                let Some(s) = self.spirale.as_mut() else {
+                    return drew;
+                };
+                s.weiter();
+                let (px, py) = s.punkt(w as f64, h as f64);
+                (px, py, s.radius(w as f64, h as f64), s.radius_roh())
+            };
+            if self.spirale_letzter.is_none() {
+                // Sweep-Anzeige neu aufsetzen (wie `x == left` beim Linien-Sweep).
+                fill_buf(third, Color::RGB(self.rr as u8, self.gg as u8, self.bb as u8));
+                if self.live_palette_on {
+                    let pal = jamcore::livescan::build_palette(
+                        second,
+                        (w * h) as usize,
+                        (self.rr as u8, self.gg as u8, self.bb as u8),
+                    );
+                    if pal.is_empty() {
+                        self.live_palette = None;
+                    } else {
+                        if self.live_palette.as_ref().map(|p| p.len()) != Some(pal.len()) {
+                            println!("Live-Scan: Palette aktiv ({} Farben)", pal.len());
+                        }
+                        self.live_palette = Some(pal);
+                    }
+                } else {
+                    self.live_palette = None;
+                }
+            }
+            // Stroboskop wie beim Linien-Sweep: gelesen wird die Quellspalte
+            // hinter der Ansicht, gezeichnet wird an der Ansichtsspalte.
+            let x_quelle = self.strobo.quell_spalte(px, w);
+            // Takte-Maske (biialpha): 0.0 sperrt den Punkt, sonst skaliert der
+            // Wert Farbe und Lautstärke.
+            let alpha = if self.biialpha {
+                jamcore::livescan::mask_alpha(alphas, px)
+            } else {
+                1.0
+            };
+            // Dünne Spur vom letzten zum aktuellen Punkt (erster Punkt des
+            // Sweeps: nur der Punkt). In der Auswahlfarbe; wäre sie der
+            // Hintergrundfarbe gleich, bliebe sie unsichtbar.
+            let (sr, sg, sb) = if (self.selectedR, self.selectedG, self.selectedB)
+                == (self.rr as u8, self.gg as u8, self.bb as u8)
+            {
+                (255, 255, 255)
+            } else {
+                (self.selectedR, self.selectedG, self.selectedB)
+            };
+            let spur = match self.spirale_letzter {
+                Some(von) => spirale::linie(von, (px, py)),
+                None => vec![(px, py)],
+            };
+            for (lx, ly) in spur {
+                set_px(third, w, lx, ly, Color::RGB(sr, sg, sb));
+            }
+            drew = true;
+            self.spirale_letzter = Some((px, py));
+            if alpha > 0.0 {
+                if let Some((r, g, b)) = spirale::zelle_trifft(
+                    frame,
+                    w,
+                    h,
+                    x_quelle,
+                    py,
+                    filter,
+                    self.live_palette.as_ref(),
+                ) {
+                    // Tonhöhe aus dem Radius, normiert auf den größten Radius
+                    // im Bild (halbe Diagonale, Patch: `sqrtmax`).
+                    let note = jamcore::spirale::note_aus_radius(
+                        radius,
+                        spirale::radius_max(w, h),
+                        self.noteScale,
+                        self.noteScaleadd,
+                    );
+                    let (_, vol) = self.event_note_volume(x_quelle, py, r, g, b);
+                    if self.is_note_in_chord(note, px) {
+                        let (dr, dg, db) = jamcore::livescan::scale_rgb(r, g, b, alpha);
+                        set_px(third, w, px, py, Color::RGB(dr, dg, db));
+                        self.live_drawn_this_sweep += 1;
+                        let vol = if self.biialpha {
+                            (vol as f32 * alpha).clamp(0.0, 127.0) as i32
+                        } else {
+                            vol
+                        };
+                        if self.sende_note(note, vol) && self.live_verbose {
+                            println!(
+                                "live spirale x={px} quelle={x_quelle} y={py} r={radius:.1} note={note} vol={vol}"
+                            );
+                        }
+                    }
+                }
+            }
+            // Sweep-Ende: die Spirale hat das Bild verlassen (Radius größer als
+            // die halbe Diagonale) — Zähler melden, dann von vorn im Zentrum.
+            if radius_roh >= spirale::radius_max(w, h) {
+                println!(
+                    "Live-Scan: Sweep beendet, {} Noten, {} gezeichnet (Spirale)",
+                    self.live_notes_this_sweep, self.live_drawn_this_sweep
+                );
+                self.live_notes_this_sweep = 0;
+                self.live_drawn_this_sweep = 0;
+                if let Some(s) = self.spirale.as_mut() {
+                    s.phi = 0.0;
+                }
+                self.spirale_letzter = None;
+            }
+            self.live_next_col += Duration::from_nanos(column_ns.max(1) as u64);
         }
         drew
     }
@@ -1255,7 +1594,7 @@ fn show_frame(
     app.currentFrame = idx;
     if let Some((iw, ih, img)) = load_image_to_rgba(&app.filenames[idx]) {
         scale_rgba_into(w, h, main_buffer, iw, ih, &img);
-        main_view.present(main_buffer, w, h);
+        present_main(app, main_view, main_buffer, w, h);
         if let Err(e) = editor.write_image(iw, ih, &img) {
             eprintln!("MyImageShm: {e}");
         }
@@ -1314,24 +1653,137 @@ fn convert_to_rgba(
     out
 }
 
+/// Unterstützte Bildendung (.png/.jpg/.jpeg/.bmp, Groß-/Kleinschreibung egal).
+fn ist_bilddatei(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase()
+            .as_str(),
+        "png" | "jpg" | "jpeg" | "bmp"
+    )
+}
+
 /// Bildverzeichnis scannen und nur unterstützte Endungen sortiert zurückgeben.
 fn filter_image_files(directory: &str) -> Vec<String> {
     let mut files: Vec<String> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(directory) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            if ["png", "jpg", "jpeg", "bmp"].contains(&ext.as_str()) {
+            if ist_bilddatei(&path) {
                 files.push(path.to_string_lossy().into_owned());
             }
         }
     }
     files.sort();
     files
+}
+
+// ---------------------------------------------------------------------------
+// Datei-Browser in der Konsole (Taste `o`)
+//
+// rrn5 kannte bisher nur den Startordner. Der Browser listet die Unterordner
+// und Bilddateien des Ordners, „.." geht hoch, Enter lädt den Ordner, eine
+// Ziffer wählt Ordner oder Bild, „q" bricht ab; danach wird die Dateiliste neu
+// gelesen. Bewusst Textmodus (kein GUI-Dialog), wie die übrigen Eingaben.
+// ---------------------------------------------------------------------------
+#[derive(Clone)]
+enum BrowserWahl {
+    Ordner(PathBuf),
+    Datei(PathBuf),
+}
+
+/// Unterordner und Bilddateien eines Ordners, alphabetisch, Ordner zuerst.
+fn browser_eintraege(ordner: &Path) -> Vec<BrowserWahl> {
+    let mut ordner_liste: Vec<PathBuf> = Vec::new();
+    let mut dateien: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(ordner) {
+        for entry in entries.flatten() {
+            let pfad = entry.path();
+            if pfad.is_dir() {
+                ordner_liste.push(pfad);
+            } else if ist_bilddatei(&pfad) {
+                dateien.push(pfad);
+            }
+        }
+    }
+    ordner_liste.sort();
+    dateien.sort();
+    let mut liste: Vec<BrowserWahl> = ordner_liste.into_iter().map(BrowserWahl::Ordner).collect();
+    liste.extend(dateien.into_iter().map(BrowserWahl::Datei));
+    liste
+}
+
+/// Dateiname ohne Pfad (für die Anzeige).
+fn dateiname(pfad: &Path) -> String {
+    pfad.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pfad.display().to_string())
+}
+
+/// Eine Zeile von der Konsole (stdin); `None` = abgebrochen/Eingabe zu Ende
+/// (z. B. wenn rrn5 mit einer Pipe gestartet wurde).
+fn konsole_zeile() -> Option<String> {
+    use std::io::BufRead;
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    match stdin.lock().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
+}
+
+/// Einfacher Textmodus-Browser: Ziffer wählt (Ordner betreten bzw. Bild),
+/// Enter lädt den Ordner, „.." geht hoch, „q" bricht ab.
+fn datei_browser(start: &str) -> Option<BrowserWahl> {
+    let mut ordner = PathBuf::from(start);
+    if !ordner.is_dir() {
+        // Unbrauchbarer Start (z. B. versehentlich der Wert von --size):
+        // beim aktuellen Ordner anfangen.
+        ordner = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    }
+    loop {
+        let eintraege = browser_eintraege(&ordner);
+        println!("=== Datei-Browser ===");
+        println!("Ordner: {}", ordner.display());
+        if eintraege.is_empty() {
+            println!(" (keine Unterordner und keine Bilddateien)");
+        }
+        for (i, e) in eintraege.iter().enumerate() {
+            let name = match e {
+                BrowserWahl::Ordner(p) => format!("{}/", dateiname(p)),
+                BrowserWahl::Datei(p) => dateiname(p),
+            };
+            println!(" {:3}  {}", i + 1, name);
+        }
+        println!("Nummer wählen, Enter = diesen Ordner laden, .. = hoch, q = abbrechen");
+        let Some(zeile) = konsole_zeile() else {
+            println!("Datei-Browser: Eingabe zu Ende");
+            return None;
+        };
+        let eingabe = zeile.trim();
+        if eingabe.is_empty() {
+            return Some(BrowserWahl::Ordner(ordner));
+        }
+        if eingabe.eq_ignore_ascii_case("q") {
+            return None;
+        }
+        if eingabe == ".." {
+            match ordner.parent() {
+                Some(p) if !p.as_os_str().is_empty() => ordner = p.to_path_buf(),
+                _ => println!("Datei-Browser: schon im obersten Ordner"),
+            }
+            continue;
+        }
+        match eingabe.parse::<usize>() {
+            Ok(n) if n >= 1 && n <= eintraege.len() => match eintraege[n - 1].clone() {
+                BrowserWahl::Ordner(p) => ordner = p,
+                BrowserWahl::Datei(p) => return Some(BrowserWahl::Datei(p)),
+            },
+            _ => println!("Datei-Browser: unbekannte Eingabe '{eingabe}'"),
+        }
+    }
 }
 
 /// Breite/Höhe aus gesammelten stdin-Tokens (C++: `cin >> w >> h`).
@@ -1506,6 +1958,37 @@ impl View {
 
     fn clear(&mut self, w: i32, h: i32) {
         self.present(&vec![0u8; (w * h) as usize * 4], w, h);
+    }
+
+    /// Stroboskop-Ansicht: je Ansichtsspalte die Quellspalte
+    /// `(x − Versatz) mod Breite` aus **demselben** Puffer (kein zweiter
+    /// Puffer) — das Bild liegt dadurch mehrfach nebeneinander und läuft
+    /// rechts heraus, links wieder hinein.
+    fn present_versetzt(&mut self, buf: &[u8], w: i32, h: i32, strobo: &strobo::Stroboskop) {
+        let row = (w as usize) * 4;
+        let _ = self.tex.with_lock(None, |dst, pitch| {
+            for y in 0..h as usize {
+                let src = &buf[y * row..(y + 1) * row];
+                let dst_row = &mut dst[y * pitch..y * pitch + row];
+                for x in 0..w {
+                    let qx = strobo.quell_spalte(x, w) as usize;
+                    let (zx, zq) = (x as usize * 4, qx * 4);
+                    dst_row[zx..zx + 4].copy_from_slice(&src[zq..zq + 4]);
+                }
+            }
+        });
+        let _ = self.canvas.copy(&self.tex, None, None);
+        self.canvas.present();
+    }
+}
+
+/// Bild ins Hauptfenster geben: mit Stroboskop versetzt (die Ansicht läuft im
+/// Takt durchs Bild), sonst unverändert — immer aus demselben Puffer.
+fn present_main(app: &App, view: &mut View, buf: &[u8], w: i32, h: i32) {
+    if app.strobo.an {
+        view.present_versetzt(buf, w, h, &app.strobo);
+    } else {
+        view.present(buf, w, h);
     }
 }
 
@@ -1836,6 +2319,11 @@ fn handle_key(
             Keycode::Comma => {
                 app.filenames = read_filenames(&app.frames_dir);
             }
+            Keycode::O => {
+                // Pattern-Ausgabe (bpmo): lag früher auf `o` — das ist jetzt
+                // der Datei-Browser (siehe Kopfkommentar).
+                app.bpmo = !app.bpmo;
+            }
             Keycode::F9 => {
                 app.fixedBpm -= 0.0625;
                 println!("{}", app.fixedBpm);
@@ -2037,11 +2525,115 @@ fn handle_key(
             Keycode::C => {
                 app.rightset = true;
             }
+            // Schrittweite der Spirale ÷/× (Shift+F8 schaltet den Modus).
+            // Ohne Spirale gibt es nichts zu stellen.
+            Keycode::Minus | Keycode::KpMinus => {
+                if let Some(s) = app.spirale.as_mut() {
+                    spirale::schritt_teile(s);
+                    println!("{}", spirale::text(&app.spirale));
+                }
+            }
+            Keycode::Plus | Keycode::KpPlus | Keycode::Equals => {
+                if let Some(s) = app.spirale.as_mut() {
+                    spirale::schritt_vielfache(s);
+                    println!("{}", spirale::text(&app.spirale));
+                }
+            }
             _ => {}
         }
     }
 
+    // Die neuen Tasten (Stroboskop, OSC-Schalter, Datei-Browser) gehören keinem
+    // Modus: Strg+F9…F12 (BPM), Strg+A/LAlt+A (Teiler) und Strg+o (Pattern-
+    // Ausgabe) sind belegt — ohne die Prüfung liefen beide Aktionen zugleich.
+    // Shift bleibt erlaubt, weil „+" je nach Tastatur nur mit Shift erreichbar
+    // ist.
+    let ohne_mod = !(keymod.contains(Mod::LCTRLMOD)
+        || keymod.contains(Mod::RCTRLMOD)
+        || keymod.contains(Mod::LALTMOD)
+        || keymod.contains(Mod::RALTMOD)
+        || keymod.contains(Mod::LGUIMOD)
+        || keymod.contains(Mod::RGUIMOD));
+    let shift_mod = keymod.contains(Mod::LSHIFTMOD) || keymod.contains(Mod::RSHIFTMOD);
+
     match kc {
+        // Stroboskop-Ansicht (wie in der App): F9 an/aus, F10 Richtung,
+        // F11/F12 Umdrehungen ÷2/×2, −/+ Takte ÷2/×2.
+        Keycode::F9 if ohne_mod => {
+            app.strobo.umschalten();
+            println!(
+                "Stroboskop: {} ({})",
+                if app.strobo.an { "an" } else { "aus" },
+                app.strobo.text()
+            );
+            // Einmal neu zeichnen: aus → unversetzt, an → mit Versatz.
+            present_main(app, main_view, main_buffer, w, h);
+        }
+        Keycode::F10 if ohne_mod => {
+            app.strobo.richtung_umdrehen();
+            println!(
+                "Stroboskop: Richtung {}",
+                if app.strobo.rechts { "rechts" } else { "links" }
+            );
+        }
+        Keycode::F11 if ohne_mod => {
+            app.strobo.umdrehungen_teile(2.0);
+            println!("Stroboskop: {}", app.strobo.text());
+        }
+        Keycode::F12 if ohne_mod => {
+            app.strobo.umdrehungen_vielfache(2.0);
+            println!("Stroboskop: {}", app.strobo.text());
+        }
+        Keycode::Minus | Keycode::KpMinus if ohne_mod => {
+            app.strobo.takte_teile(2.0);
+            println!("Stroboskop: {}", app.strobo.text());
+        }
+        Keycode::Plus | Keycode::KpPlus | Keycode::Equals if ohne_mod => {
+            app.strobo.takte_vielfache(2.0);
+            println!("Stroboskop: {}", app.strobo.text());
+        }
+        Keycode::A if ohne_mod => {
+            // Kein lokaler Klangweg: „Ton aus" gibt es hier nicht, der Schalter
+            // unterdrückt die OSC-Ausgabe (siehe Kopfkommentar).
+            println!("OSC: {}", if osc_umschalten() { "an" } else { "aus" });
+        }
+        Keycode::O if ohne_mod => {
+            // Datei-Browser in der Konsole: Ordner laden (Enter), Bild wählen
+            // (Ziffer), hoch (..) oder abbrechen (q) — danach die Dateiliste
+            // neu lesen und das gewählte Bild gleich zeigen.
+            match datei_browser(&app.frames_dir) {
+                Some(BrowserWahl::Ordner(p)) => {
+                    app.frames_dir = p.to_string_lossy().into_owned();
+                    app.filenames = read_filenames(&app.frames_dir);
+                    println!(
+                        "Bildordner: {} ({} Bilder)",
+                        app.frames_dir,
+                        app.filenames.len()
+                    );
+                    if !app.filenames.is_empty() {
+                        app.currentFrame = 0;
+                        show_frame(app, editor, main_view, main_buffer, w, h, 0);
+                    }
+                }
+                Some(BrowserWahl::Datei(p)) => {
+                    app.frames_dir = p
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| ".".to_string());
+                    app.filenames = read_filenames(&app.frames_dir);
+                    let name = p.to_string_lossy().into_owned();
+                    match app.filenames.iter().position(|f| *f == name) {
+                        Some(idx) => {
+                            app.currentFrame = idx;
+                            show_frame(app, editor, main_view, main_buffer, w, h, 0);
+                            println!("Bild: {name}");
+                        }
+                        None => println!("Bild nicht in der Liste: {name}"),
+                    }
+                }
+                None => println!("Datei-Browser abgebrochen"),
+            }
+        }
         Keycode::F5 => {
             if app.renoiseplay {
                 osc::transport_start();
@@ -2051,7 +2643,23 @@ fn handle_key(
                 app.renoiseplay = true;
             }
         }
-        Keycode::F8 => {
+        // Spirale statt Linien-Sweep: F8 ist belegt (setzt `renoiseplay`), alle
+        // F1–F12 sind vergeben — deshalb Shift+F8. Der Zustand ist
+        // `spirale: Option<Spirale>`; der Scan-Pfad liest dann die Zelle am
+        // Spiralpunkt (siehe `spiral_scan_schritt`).
+        Keycode::F8 if shift_mod => {
+            spirale::umschalten(&mut app.spirale);
+            app.spirale_letzter = None;
+            // Die Zähler gehören zum abgebrochenen Durchlauf (sonst zählt der
+            // erste Spiral-Sweep die Treffer des Linien-Sweeps mit).
+            app.live_notes_this_sweep = 0;
+            app.live_drawn_this_sweep = 0;
+            println!("{}", spirale::text(&app.spirale));
+        }
+        // F8 ohne Modifikatoren bleibt „Transport läuft" (wie bisher); mit
+        // Strg/Alt (nicht Shift) soll es nichts tun (die belegten Strg-Kombis
+        // stehen im Kopfkommentar).
+        Keycode::F8 if ohne_mod => {
             app.renoiseplay = true;
         }
         Keycode::F7 => {
@@ -2450,7 +3058,7 @@ fn handle_key(
                 if let Some((iw, ih, img)) = load_image_to_rgba("frame4.bmp") {
                     scale_rgba_into(w, h, main_buffer, iw, ih, &img);
                 }
-                main_view.present(main_buffer, w, h);
+                present_main(app, main_view, main_buffer, w, h);
             }
         }
         Keycode::Space => {
@@ -2465,9 +3073,6 @@ fn handle_key(
                 "/renoise/song/bpm",
                 vec![rosc::OscType::Float(app.fixedBpm2)],
             );
-        }
-        Keycode::O => {
-            app.bpmo = !app.bpmo;
         }
         Keycode::Semicolon => {
             app.xl += 1;
@@ -2488,7 +3093,7 @@ fn handle_key(
                             let _ = raw.save("frame0.bmp");
                         }
                         scale_rgba_into(w, h, main_buffer, iw, ih, &img);
-                        main_view.present(main_buffer, w, h);
+                        present_main(app, main_view, main_buffer, w, h);
                     }
                 }
             }
@@ -2522,6 +3127,16 @@ fn frame_logic(
     // Maustaste) steht das Bild und der Live-Scan pausiert.
     let freeze = app.isLeftMouseButtonHeld || app.isMiddleMouseButtonHeld;
     if !freeze {
+        // Stroboskop-Ansicht: Phase fortschreiben und das Bild neu versetzt
+        // zeigen — nur wenn der Versatz sich wirklich geändert hat (sonst
+        // würde jedes Frame denselben Puffer erneut hochladen).
+        if app.strobo.an {
+            let vorher = app.strobo.versatz_px();
+            app.strobo_schritt();
+            if app.strobo.versatz_px() != vorher {
+                present_main(app, main_view, main_buffer, w, h);
+            }
+        }
         // Bildrate begrenzen (Kamera/Video), sonst dekodiert ein Videofile
         // mit maximaler Geschwindigkeit und heizt die CPU auf.
         let now = Instant::now();
@@ -2529,7 +3144,7 @@ fn frame_logic(
             if let Some(src) = app.video.as_mut() {
                 if let Some((fw, fh, rgba)) = src.next_frame_rgba() {
                     scale_rgba_into(w, h, main_buffer, fw, fh, &rgba);
-                    main_view.present(main_buffer, w, h);
+                    present_main(app, main_view, main_buffer, w, h);
                     let publish = match app.shm_mode {
                         video::ShmMode::Every => true,
                         video::ShmMode::Throttle => app.shm_last.elapsed().as_millis() >= 200,
@@ -2613,7 +3228,7 @@ fn frame_logic(
         set_px(second, w, 0, 0, Color::RGB(1, 1, 1));
         *secondsave = second.clone();
         second_view.present(second, w, h);
-        main_view.present(main_buffer, w, h);
+        present_main(app, main_view, main_buffer, w, h);
     }
 
     if app.isMiddleMouseButtonHeld {
@@ -2662,7 +3277,7 @@ fn frame_logic(
             find_and_draw_harmonics(app, second, secondsave, w, h);
         }
         second_view.present(second, w, h);
-        main_view.present(main_buffer, w, h);
+        present_main(app, main_view, main_buffer, w, h);
     }
 
     if app.leftset {
@@ -2908,7 +3523,7 @@ fn frame_logic(
     if app.cvcamload {
         if let Some((iw, ih, img)) = load_image_to_rgba("savesurf.bmp") {
             scale_rgba_into(w, h, main_buffer, iw, ih, &img);
-            main_view.present(main_buffer, w, h);
+            present_main(app, main_view, main_buffer, w, h);
             std::thread::sleep(Duration::from_nanos(1000000));
         }
     }
@@ -2931,7 +3546,7 @@ fn frame_logic(
             let mut sh_view = make_view(video, "Surface View", sw, sh, 960, 0);
             sh_view.present(&buf, sw, sh);
             scale_rgba_into(w, h, main_buffer, sw, sh, &buf);
-            main_view.present(main_buffer, w, h);
+            present_main(app, main_view, main_buffer, w, h);
             wait_enter();
             drop(sh_view);
         }
@@ -2946,6 +3561,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let frames_dir = resolve_frames_dir(&args);
     let filenames = read_filenames(&frames_dir);
+    println!("Bildordner: {frames_dir} ({} Bilder)", filenames.len());
 
     let (xw, yh) = match resolve_size(&args) {
         Some(size) => size,
@@ -2990,6 +3606,12 @@ fn main() {
         "Tasten: Z = Kamera an/aus, 8 = SHM-Modus (aktuell {}), --video <pfad>",
         app.shm_mode.as_str()
     );
+    println!(
+        "Neu: o = Datei-Browser, a = OSC aus/an, F9 = Stroboskop an/aus, \
+         F10 = Richtung, F11/F12 = Umdrehungen ÷/×, −/+ = Takte ÷/×, \
+         Shift+F8 = Scan Linie/Spirale, Alt+−/Alt++ = Spiral-Schrittweite ÷/× \
+         (Pattern-Ausgabe jetzt Strg+o)"
+    );
 
     let sdl = match sdl2::init() {
         Ok(s) => s,
@@ -3028,7 +3650,7 @@ fn main() {
     if let Some((iw, ih, img)) = load_image_to_rgba("frame.bmp") {
         scale_rgba_into(xw, yh, &mut main_buffer, iw, ih, &img);
     }
-    main_view.present(&main_buffer, xw, yh);
+    present_main(&app, &mut main_view, &main_buffer, xw, yh);
     second_view.present(&second, xw, yh);
     third_view.present(&third, xw, yh);
 
@@ -3381,5 +4003,58 @@ mod tests {
         assert_eq!(scaled_note_at(5, 50, 0, 100, 100, 120, 0), 60);
         assert_eq!(scaled_note_at(7, 50, 0, 100, 100, 120, 0), 60);
         assert_eq!(scaled_note_at(2, 0, 200, 100, 100, 120, 0), 127);
+    }
+
+    #[test]
+    fn resolve_frames_dir_nimmt_das_erste_freie_argument() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(resolve_frames_dir(&args(&["bilder"])), "bilder");
+        assert_eq!(
+            resolve_frames_dir(&args(&["--dir", "a", "b"])),
+            "a",
+            "--dir sticht das freie Argument"
+        );
+        assert_eq!(
+            resolve_frames_dir(&args(&["--size", "320x240", "bilder"])),
+            "bilder",
+            "der Wert von --size ist kein Ordner"
+        );
+        assert_eq!(
+            resolve_frames_dir(&args(&["--video", "v.avi", "--shm", "off", "bilder"])),
+            "bilder",
+            "Werte von --video/--shm überspringen"
+        );
+    }
+
+    #[test]
+    fn browser_eintraege_ordner_zuerst_und_alphabetisch() {
+        let dir = std::env::temp_dir().join(format!("rrn5_browser_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("zeta")).unwrap();
+        std::fs::create_dir_all(dir.join("alpha")).unwrap();
+        for name in ["b.png", "a.jpg", "c.txt", "notiz"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let namen: Vec<String> = browser_eintraege(&dir)
+            .iter()
+            .map(|e| match e {
+                BrowserWahl::Ordner(p) => format!("{}/", dateiname(p)),
+                BrowserWahl::Datei(p) => dateiname(p),
+            })
+            .collect();
+        assert_eq!(
+            namen,
+            vec!["alpha/", "zeta/", "a.jpg", "b.png"],
+            "Ordner zuerst, andere Dateien bleiben draußen"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ist_bilddatei_prueft_die_endung() {
+        assert!(ist_bilddatei(Path::new("a.PNG")));
+        assert!(ist_bilddatei(Path::new("/tmp/b.jpeg")));
+        assert!(!ist_bilddatei(Path::new("c.txt")));
+        assert!(!ist_bilddatei(Path::new("ohne_endung")));
     }
 }
