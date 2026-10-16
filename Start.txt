@@ -1,0 +1,48 @@
+Start.txt — Desktop-Paket (Nix) im Projekt
+
+Baubar direkt hier: `nix-build -A jam-tools` → `result/bin/` mit rrn5,
+pattern_recorder, imgsh, bundle_udp, it_live und lissa.
+(Eine Kopie unter ~/jam-nix ist damit nicht mehr nötig; `./sync.sh` dort bleibt
+nur als Spiegel.)
+
+WEG: EIN WEG, ZWEI SCHRITTE
+
+
+Schritt 1 — Shell betreten:
+
+    cd ~/jam-nix
+    nix-shell
+
+Schritt 2 — Programm starten (eine Zeile pro Programm):
+
+    cargo run --release --bin rrn5 -- --size 640x480             # Bild/Farb -> Noten
+    cargo run --release --bin pattern_recorder                    # Rhythmus-Recorder
+    cargo run --release --bin imgsh -- ~/Bilder/frame.png          # Bildbetrachter
+    cargo run --release --bin bundle_udp 127.0.0.1                      # OSC-Relay (Handys -> Renoise, Ziel :7003)
+    # mehrere Handys, je Handy ein Instrument (max 10):
+    #   OSC_MAP="10.179.32.50=127.0.0.1:7005,10.179.32.51=127.0.0.1:7006" \
+    #     cargo run --release --bin bundle_udp
+    cargo run --release --bin it_live -- ~/Musik/track.it          # Modul-Renderer
+    cargo run --release --bin lissa                                # Lissajous-Figur + zwei Stimmen
+
+Beenden: Fenster schliessen, Shell verlassen mit "exit".
+
+
+ABKURZUNGEN
+
+  ~/jam-nix/result/bin/rrn5 --size 640x480
+      Fertig gebaute Programme, ohne Shell und ohne Neubau.
+
+  cd ~/jam-nix && nix-shell --run "cargo run --release --bin pattern_recorder"
+      Einzeiler, ohne in der Shell zu bleiben.
+
+
+HINWEISE
+
+  - it_live braucht eine echte Moduldatei (.it/.mod/.xm). Im Ordner ist keine
+    dabei, z. B. eine aus ~/Documents/cde.
+  - pattern_recorder laedt ./sagan.ttf aus dem Arbeitsverzeichnis.
+    In ~/jam-nix liegt die Datei, also einfach von hier starten.
+  - Der erste Build dauert einige Minuten, danach sind es Sekunden.
+  - Volle Nix-Funktionen (nix-build, flake, Hashes, Quellen aktualisieren):
+    siehe README.md

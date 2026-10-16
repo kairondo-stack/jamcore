@@ -20,3 +20,7 @@ KeyEventRender.txt
 
 # Emulator (AVD, Snapshots, adb-Keys) – siehe android/emulator.sh
 .android/
+
+# Nix-Paketbau
+result
+result-*
