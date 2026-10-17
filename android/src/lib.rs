@@ -439,6 +439,15 @@ impl eframe::App for JamApp {
         if self.tab != Tab::Lissa {
             self.lissa.stoppen();
         }
+        // Der Linien-/Bereichston des Oszillator-Scans klingt nur, wo das Bild
+        // sichtbar ist (Bild, B2 oder Kombi mit Bild) — sonst bliebe er beim
+        // Tab-Wechsel für immer stehen.
+        let bild_sichtbar = matches!(self.tab, Tab::Bild | Tab::Bild2)
+            || (self.tab == Tab::Kombi
+                && (self.kombi_oben == KombiTeil::Bild || self.kombi_unten == KombiTeil::Bild));
+        if !bild_sichtbar {
+            self.bild.linienton_aus();
+        }
 
         // Datei-Browser des Player-Tabs („Öffnen"): Fenster über allem anderen.
         if let Some(mut browser) = self.browser.take() {

@@ -10,6 +10,11 @@
 //! ([`puffer_spielen`], z. B. Slices aus dem Slicer). Sie klingen **einmal**
 //! (keine Schleife), werden auf die Ausgaberate umgerechnet und bei Ueberlast
 //! fällt der **aelteste** Puffer raus — wie bei den Stimmen.
+//!
+//! Dazu kommen die dauerhaften **Linien-/Bereichsstimmen** des
+//! Oszillator-Scans ([`linienton_setzen`]): ein ganzer Satz (Hz, Gain), den
+//! jeder Aufruf ersetzt — im Bild-Tab klingen sie, solange die Linie bzw. der
+//! x-Bereich steht.
 
 use std::collections::VecDeque;
 use std::os::raw::c_int;
@@ -134,6 +139,77 @@ fn slot() -> &'static Mutex<Einstellungen> {
 
 /// Zwei Dauertöne (Lissa-Tab: X- und Y-Stimme der Figur). `None` = aus.
 static DAUERTON: OnceLock<Mutex<Option<[f32; 2]>>> = OnceLock::new();
+
+/// Dauerhafte Stimmen des Oszillator-Scans (Bild-Tab: Linie/x-Bereich), je
+/// Stimme (Hz, Gain). Jeder Aufruf **ersetzt** den ganzen Satz — die Linie
+/// klingt nur solange sie steht; `None`/leer schaltet ab.
+static LINIENTON: OnceLock<Mutex<Option<Vec<(f32, f32)>>>> = OnceLock::new();
+
+fn linienton_slot() -> &'static Mutex<Option<Vec<(f32, f32)>>> {
+    LINIENTON.get_or_init(|| Mutex::new(None))
+}
+
+/// Die Stimmen des Linien-/Bereichstons setzen (Hz, Gain je Stimme) oder mit
+/// `None` abschalten. Der nächste Aufruf ersetzt den vorigen Satz; der
+/// Klang-Thread mischt sie wie die Lissa-Dauertöne dauerhaft. Startet den
+/// Klang-Thread, wenn er noch nicht läuft.
+pub fn linienton_setzen(stimmen: Option<Vec<(f32, f32)>>) {
+    let stimmen = stimmen.filter(|s| !s.is_empty());
+    let an = stimmen.is_some();
+    if let Ok(mut l) = linienton_slot().lock() {
+        *l = stimmen;
+    }
+    if an {
+        let mut guard = match spieler_slot().lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        sicherstellen(&mut guard);
+    }
+}
+
+fn linienton_aktuell() -> Option<Vec<(f32, f32)>> {
+    linienton_slot().lock().ok().and_then(|l| l.clone())
+}
+
+/// Die Linien-/Bereichsstimmen auf einen Block addieren. `phasen` wächst mit
+/// der Stimmenzahl; die Phasen der schon klingenden Stimmen laufen weiter
+/// (kein Klick, wenn die Linie die Note wechselt). Kopfraum über die
+/// Stimmenzahl, damit ein Akkord nicht übersteuert.
+fn linienton_mischen(
+    puffer: &mut [i16],
+    phasen: &mut Vec<f64>,
+    stimmen: &[(f32, f32)],
+    rate: u32,
+    gain: f32,
+) {
+    if rate == 0 || stimmen.is_empty() {
+        return;
+    }
+    phasen.resize(stimmen.len(), 0.0);
+    let kopf = 1.0 / (stimmen.len() as f64).sqrt();
+    let schritte: Vec<f64> = stimmen
+        .iter()
+        .map(|(f, _)| (*f as f64 / rate as f64).clamp(0.0, 0.5))
+        .collect();
+    let staerken: Vec<f64> = stimmen.iter().map(|(_, g)| (*g as f64).clamp(0.0, 1.0)).collect();
+    let g = if gain.is_finite() {
+        gain.clamp(0.0, 1.0) as f64 * kopf
+    } else {
+        0.0
+    };
+    for wert in puffer.iter_mut() {
+        let mut summe = 0.0f64;
+        for (i, s) in staerken.iter().enumerate() {
+            summe += (phasen[i] * std::f64::consts::TAU).sin() * s;
+        }
+        let add = (summe * g * 32767.0) as i32;
+        *wert = (*wert as i32 + add).clamp(-32768, 32767) as i16;
+        for (i, s) in schritte.iter().enumerate() {
+            phasen[i] = (phasen[i] + s).fract();
+        }
+    }
+}
 
 fn dauerton_slot() -> &'static Mutex<Option<[f32; 2]>> {
     DAUERTON.get_or_init(|| Mutex::new(None))
@@ -261,6 +337,8 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
     let mut welle = Welle::Sinus;
     let mut phasen = [0.0f64; 2];
     let mut dauerton_an = false;
+    let mut linien_phasen: Vec<f64> = Vec::new();
+    let mut linienton_an = false;
     let mut stop_gesehen = STOP_GENERATION.load(Ordering::Relaxed);
     loop {
         // „Ton aus": alle klingenden Stimmen sofort beenden.
@@ -291,9 +369,27 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
             }
             _ => {}
         }
+        // Linien-/Bereichston des Bild-Tabs (Oszillator-Scan): der Satz wird
+        // bei jedem Aufruf ersetzt, hier nur der Übergang protokolliert.
+        let linienton = linienton_aktuell();
+        match (linienton_an, linienton.as_ref()) {
+            (false, Some(s)) => {
+                info!("klang: Linienton an ({} Stimmen)", s.len());
+                linienton_an = true;
+            }
+            (true, None) => {
+                info!("klang: Linienton aus");
+                linienton_an = false;
+                linien_phasen.clear();
+            }
+            _ => {}
+        }
         // Klingt nichts, wird gewartet statt gedreht; klingt etwas, werden
         // alle wartenden Auftraege sofort aufgenommen.
-        let leer = stimmen.is_empty() && dauerton.is_none() && puffer_schlange.is_empty();
+        let leer = stimmen.is_empty()
+            && dauerton.is_none()
+            && linienton.is_none()
+            && puffer_schlange.is_empty();
         let erster = if leer {
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(auftrag) => Some(auftrag),
@@ -326,7 +422,8 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
             }
             auftrag = rx.try_recv().ok();
         }
-        if stimmen.is_empty() && dauerton.is_none() && puffer_schlange.is_empty() {
+        if stimmen.is_empty() && dauerton.is_none() && linienton.is_none() && puffer_schlange.is_empty()
+        {
             continue;
         }
         // Kopfraum: wenige Stimmen bleiben laut, viele steuern sich nicht zu.
@@ -341,6 +438,11 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
         if let Some(f) = dauerton {
             // Zwei Stimmen mit Kopfraum (0,25 je Stimme), additiv zu den Noten.
             dauerton_mischen(&mut puffer, &mut phasen, f, RATE as u32, 0.25);
+        }
+        if let Some(linie) = linienton.as_ref() {
+            // Oszillator-Scan: der ganze Satz klingt dauerhaft (Kopfraum
+            // rechnet `linienton_mischen` über die Stimmenzahl).
+            linienton_mischen(&mut puffer, &mut linien_phasen, linie, RATE as u32, 0.5);
         }
         // Slices (und andere fertige Puffer) einmal abspielen; fertige fallen
         // aus der Schlange, der Rest rueckt weiter.

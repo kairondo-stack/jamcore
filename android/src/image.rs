@@ -16,6 +16,9 @@ use jamcore::livescan::{
     scan_column, ScanFilter,
 };
 use jamcore::osc::{OscOut, Renoise};
+use jamcore::oszillator::{
+    anteil_je_zeit, harm_basis, harmonie_an, note_fuer_zeile, Durchlauf, XBasis,
+};
 use jamcore::scanmask::{Aufloesung, ScanMaske};
 use jamcore::spirale::{Familie, Spirale};
 
@@ -34,6 +37,16 @@ const BILD_ANTEIL_H: f32 = 0.55;
 /// sonst frisst die GUI die Höhe und das Bild wird winzig. Das Bild bekommt
 /// dort gut die Hälfte der Fläche.
 const BILD_ANTEIL_H_QUER: f32 = 0.62;
+/// Höchstens so viele Stimmen klingen beim Linien-/Bereichston gleichzeitig
+/// (die tiefsten bleiben — wie `ALLE_MAX_NOTEN` im Desktop, mehr wäre nur
+/// Matsch).
+const LINIENTON_MAX: usize = 4;
+/// Höchstens so viele Spalten tastet „alle Spalten gleichzeitig" ab; die
+/// Rechnung läuft je Frame, deshalb ist sie gedeckelt.
+const ALLE_SPALTEN_MAX: usize = 256;
+/// Farbe der „aus"-Pixel bei Anzeige „echte Farben" (fast schwarz, damit das
+/// Bild vom Kastenrand unterscheidbar bleibt).
+const ANZEIGE_DUNKEL: u8 = 8;
 
 ///
 /// Gibt es als freie Funktion, weil sie an zwei Stellen gebraucht wird.
@@ -85,6 +98,44 @@ fn spirale_text(s: &Spirale) -> String {
 /// Zahl mit einer Nachkommastelle und Komma (die Statuszeile ist deutsch).
 fn zahl(v: f64) -> String {
     format!("{v:.1}").replace('.', ",")
+}
+
+/// Dauer des Bereichs-Durchlaufs klemmen: 1/64 … 4 Takt. `takte::teile`/
+/// `vielfache` klemmen nur auf 1/36 … 36 Takte, deshalb hier der eigene
+/// Bereich; `NaN` wird zur Vorgabe 1/4 Takt.
+fn dauer_klemmen(takte: f64) -> f64 {
+    if takte.is_nan() {
+        return 0.25;
+    }
+    takte.clamp(1.0 / 64.0, 4.0)
+}
+
+/// Text der Dauer („1/64 Takt" … „4 Takte"): wie `takte::text`, aber mit
+/// Nennern bis 64 — `takte::text` kennt nur Nenner bis 36 und würde 1/64 als
+/// „0.02 Takte" zeigen. Der Fallback bleibt `takte::text`.
+fn dauer_text(takte: f64) -> String {
+    let t = dauer_klemmen(takte);
+    if t >= 1.0 {
+        let gerundet = t.round();
+        if (t - gerundet).abs() < 1e-6 {
+            return if gerundet == 1.0 {
+                "1 Takt".to_string()
+            } else {
+                format!("{gerundet:.0} Takte")
+            };
+        }
+    }
+    for nenner in 1..=64usize {
+        let zaehler = t * nenner as f64;
+        if (zaehler - zaehler.round()).abs() < 1e-6 && zaehler >= 1.0 {
+            return if zaehler.round() == 1.0 {
+                format!("{zaehler:.0}/{nenner} Takt")
+            } else {
+                format!("{zaehler:.0}/{nenner} Takte")
+            };
+        }
+    }
+    jamcore::takte::text(t)
 }
 
 /// Größter Radius im Bild: Abstand von der Mitte zur Ecke (Patch: `sqrtmax`).
@@ -303,6 +354,39 @@ pub struct ImagePanel {
     video_pruefung: std::time::Instant,
     /// Zeitpunkt der letzten ScrollArea-Messung (siehe [`Self::ui`]).
     messung: std::time::Instant,
+    /// Anzeige des Bildes: „echte Farben" zeigt nur die Auswahl in
+    /// Originalfarbe, alles andere dunkel — statt grüner Markierung.
+    anzeige_echt: bool,
+    /// Oszillator-Scan: senkrechte Linie, deren Treffer als Dauerton klingen.
+    linie_an: bool,
+    /// Nur im Verschiebe-Modus zieht ein Finger die Linie; sonst wählt ein
+    /// Tipp die Farbe wie bisher.
+    linie_verschieben: bool,
+    /// Position der Linie als Anteil der Bildbreite (0..=1, Ansicht).
+    linie_x: f32,
+    /// x-Bereichs-Modus: Durchlauf über den Scan-Bereich statt der Linie.
+    bereich_an: bool,
+    /// Dauer eines Bereichs-Durchlaufs in Takten (1/64 … 4).
+    bereich_takte: f64,
+    /// Sweep (einmal durch) oder alle Spalten gleichzeitig (`Durchlauf`).
+    bereich_durchlauf: Durchlauf,
+    /// Takt-Maske (nur durch Spalten) oder alle y-Werte (Maske aus).
+    bereich_maske: bool,
+    /// Harmonie-x: Gesamt-x oder Bereichs-x (`XBasis`).
+    harm_x_basis: XBasis,
+    /// Takte seit dem Start des Bereichs-Durchlaufs (`anteil_je_zeit`).
+    bereich_seit_start: f64,
+    bereich_letzte_zeit: std::time::Instant,
+    /// Anteil des Bereichs-Durchlaufs (0..1) für die Cursor-Anzeige.
+    bereich_anteil: f32,
+    /// Nächste Neuberechnung des Linien-/Bereichstons (Bremse).
+    linien_naechste: std::time::Instant,
+    /// Klingt gerade ein Linien-/Bereichston? (für „einmal abschalten").
+    linienton_an: bool,
+    /// Zuletzt gespielte Noten des Linientons (Log nur beim Wechsel).
+    linienton_noten: Vec<i32>,
+    /// Zuletzt protokollierte Harmonie (Band-Index) des Linien-/Bereichstons.
+    harm_log: Option<usize>,
 }
 
 impl Default for ImagePanel {
@@ -390,6 +474,22 @@ impl ImagePanel {
             video_laeuft: false,
             video_pruefung: std::time::Instant::now(),
             messung: std::time::Instant::now(),
+            anzeige_echt: false,
+            linie_an: false,
+            linie_verschieben: false,
+            linie_x: 0.5,
+            bereich_an: false,
+            bereich_takte: 0.25,
+            bereich_durchlauf: Durchlauf::Sweep,
+            bereich_maske: true,
+            harm_x_basis: XBasis::Gesamt,
+            bereich_seit_start: 0.0,
+            bereich_letzte_zeit: std::time::Instant::now(),
+            bereich_anteil: 0.0,
+            linien_naechste: std::time::Instant::now(),
+            linienton_an: false,
+            linienton_noten: Vec::new(),
+            harm_log: None,
         }
     }
 
@@ -701,10 +801,19 @@ impl ImagePanel {
                         }
                     }
                 }
-                bild[idx] = 20;
-                bild[idx + 1] = 235;
-                bild[idx + 2] = 60;
+                if !self.anzeige_echt {
+                    // „grün" (wie bisher): der Treffer wird markiert.
+                    bild[idx] = 20;
+                    bild[idx + 1] = 235;
+                    bild[idx + 2] = 60;
+                }
                 treffer += 1;
+            } else if self.anzeige_echt {
+                // „echte Farben": nur die Auswahl leuchtet in Originalfarbe,
+                // alles andere geht aus (keine grüne Umrandung/Markierung).
+                bild[idx] = ANZEIGE_DUNKEL;
+                bild[idx + 1] = ANZEIGE_DUNKEL;
+                bild[idx + 2] = ANZEIGE_DUNKEL;
             }
         }
         self.treffer = treffer;
@@ -1604,6 +1713,7 @@ impl ImagePanel {
         self.laenge_anpassen(schritte);
         self.textur_aktualisieren(ui.ctx());
         self.scan_schritt(ui.ctx(), pattern);
+        self.linien_schritt();
         self.bild_zeichnen(ui, platz, flaeche, schritte, true);
 
         let basis = ui.min_rect().min;
@@ -1624,7 +1734,7 @@ impl ImagePanel {
                     });
             });
 
-        // Links: Quelle, Zoom, Takt, BPM, Schritte.
+        // Links: Quelle, Zoom, Takt, BPM, Stroboskop, Spirale, Linie/Bereich.
         egui::Area::new("bild2_links".into())
             .fixed_pos(egui::pos2(basis.x + 6.0, basis.y + oben_hoehe))
             .order(egui::Order::Foreground)
@@ -1644,12 +1754,14 @@ impl ImagePanel {
                                 self.zeile_bpm(ui);
                                 self.zeile_stroboskop(ui);
                                 self.zeile_spirale(ui);
+                                self.zeile_linie(ui);
+                                self.zeile_bereich(ui);
                                 self.zeile_schritte(ui, pattern);
                             });
                     });
             });
 
-        // Rechts: Maske, Toleranz, Auswahl, Malen, Kanal, Harmonics, Notenmenge.
+        // Rechts: Maske, Toleranz, Auswahl, Malen, Kanal, Harmonics, Harmonie-x.
         egui::Area::new("bild2_rechts".into())
             .fixed_pos(egui::pos2(
                 basis.x + platz - leiste_breite - 6.0,
@@ -1672,6 +1784,7 @@ impl ImagePanel {
                                 self.zeile_malen(ui);
                                 self.zeile_kanal(ui);
                                 self.zeile_harmonics(ui);
+                                self.zeile_harm_zeit(ui);
                                 self.zeile_notenmenge(ui);
                             });
                     });
@@ -1714,6 +1827,7 @@ impl ImagePanel {
         self.laenge_anpassen(schritte);
 
         self.scan_schritt(ui.ctx(), pattern);
+        self.linien_schritt();
 
         // Im Querformat liegt das Bild links und die Steuerung rechts in zwei
         // Spalten — untereinander wuerde die GUI die Hoehe fressen und das Bild
@@ -1750,7 +1864,7 @@ impl ImagePanel {
 
     /// Wie viele Zeilen die Steuerung hat. Jede Zeile ist schmal genug für eine
     /// Spalte; im Querformat wechseln sie zwischen zwei Spalten ab.
-    const STEUERUNG_ZEILEN: usize = 13;
+    const STEUERUNG_ZEILEN: usize = 16;
 
     /// Eine Zeile der Steuerung. Jede Zeile ist schmal genug für eine Spalte;
     /// im Querformat wechseln sie sich zwischen zwei Spalten ab.
@@ -1769,6 +1883,9 @@ impl ImagePanel {
             10 => self.zeile_notenmenge(ui),
             11 => self.zeile_stroboskop(ui),
             12 => self.zeile_spirale(ui),
+            13 => self.zeile_linie(ui),
+            14 => self.zeile_bereich(ui),
+            15 => self.zeile_harm_zeit(ui),
             _ => {}
         }
     }
@@ -1925,6 +2042,431 @@ impl ImagePanel {
                     .small()
                     .color(Color32::GRAY),
             );
+        }
+    }
+
+    /// Oszillator-Scan: senkrechte Linie an/aus (mit Verschiebe-Modus) und
+    /// der x-Bereich als zweiter Modus. Linie und Bereich schließen sich aus.
+    fn zeile_linie(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            if ui.selectable_label(self.linie_an, "Linie").clicked() {
+                self.linie_an = !self.linie_an;
+                if self.linie_an {
+                    self.bereich_an = false;
+                }
+                self.bereich_seit_start = 0.0;
+                self.bereich_letzte_zeit = std::time::Instant::now();
+                self.linien_naechste = std::time::Instant::now();
+                log::info!("bild: Linie {}", if self.linie_an { "an" } else { "aus" });
+                self.status = if self.linie_an {
+                    format!("Linie x {:.2}", self.linie_x)
+                } else {
+                    "Linie aus".to_string()
+                };
+            }
+            if self.linie_an {
+                if ui
+                    .selectable_label(self.linie_verschieben, "Verschieben")
+                    .clicked()
+                {
+                    self.linie_verschieben = !self.linie_verschieben;
+                    log::info!(
+                        "bild: Linie verschieben {}",
+                        if self.linie_verschieben { "an" } else { "aus" }
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("x {:.0} %", self.linie_x * 100.0))
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+            if ui.selectable_label(self.bereich_an, "Bereich").clicked() {
+                self.bereich_an = !self.bereich_an;
+                if self.bereich_an {
+                    self.linie_an = false;
+                    self.bereich_seit_start = 0.0;
+                    self.bereich_letzte_zeit = std::time::Instant::now();
+                    self.bereich_log();
+                } else {
+                    log::info!("bild: Bereich aus");
+                    self.status = "Bereich aus".to_string();
+                }
+            }
+        });
+    }
+
+    /// x-Bereichs-Modus: Dauer (1/64 … 4 Takt, ÷2 ×2 ÷3 ×3), Durchlauf
+    /// (Sweep ⇄ alle Spalten gleichzeitig) und Takt-Maske ⇄ alle y-Werte.
+    fn zeile_bereich(&mut self, ui: &mut egui::Ui) {
+        if !self.bereich_an {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Dauer:");
+            if ui.small_button("÷2").clicked() {
+                self.bereich_takte = dauer_klemmen(jamcore::takte::teile(self.bereich_takte, 2.0));
+                self.bereich_seit_start = 0.0;
+                self.bereich_log();
+            }
+            if ui.small_button("×2").clicked() {
+                self.bereich_takte =
+                    dauer_klemmen(jamcore::takte::vielfache(self.bereich_takte, 2.0));
+                self.bereich_seit_start = 0.0;
+                self.bereich_log();
+            }
+            if ui.small_button("÷3").clicked() {
+                self.bereich_takte = dauer_klemmen(jamcore::takte::teile(self.bereich_takte, 3.0));
+                self.bereich_seit_start = 0.0;
+                self.bereich_log();
+            }
+            if ui.small_button("×3").clicked() {
+                self.bereich_takte =
+                    dauer_klemmen(jamcore::takte::vielfache(self.bereich_takte, 3.0));
+                self.bereich_seit_start = 0.0;
+                self.bereich_log();
+            }
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} ({:.2} s)",
+                    dauer_text(self.bereich_takte),
+                    jamcore::takte::sweep_sekunden(self.bereich_takte, self.scan_bpm as f64)
+                ))
+                .small()
+                .color(Color32::GRAY),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            let sweep = matches!(self.bereich_durchlauf, Durchlauf::Sweep);
+            if ui.selectable_label(sweep, "Sweep").clicked() && !sweep {
+                self.bereich_durchlauf = Durchlauf::Sweep;
+                self.bereich_seit_start = 0.0;
+                self.bereich_log();
+            }
+            if ui.selectable_label(!sweep, "Alle").clicked() && sweep {
+                self.bereich_durchlauf = Durchlauf::Alles;
+                self.bereich_log();
+            }
+            if ui.selectable_label(self.bereich_maske, "Takt-Maske").clicked() && !self.bereich_maske
+            {
+                self.bereich_maske = true;
+                self.bereich_log();
+            }
+            if ui.selectable_label(!self.bereich_maske, "alle y").clicked() && self.bereich_maske {
+                self.bereich_maske = false;
+                self.bereich_log();
+            }
+        });
+    }
+
+    /// Status/Log des x-Bereichs-Modus, z. B. „bild: Bereich 1/4 Takt Sweep
+    /// Maske" (Gerätebeleg).
+    fn bereich_log(&mut self) {
+        let text = format!(
+            "Bereich {} {} {}",
+            dauer_text(self.bereich_takte),
+            if matches!(self.bereich_durchlauf, Durchlauf::Sweep) {
+                "Sweep"
+            } else {
+                "Alle"
+            },
+            if self.bereich_maske { "Maske" } else { "Alle y" }
+        );
+        log::info!("bild: {text}");
+        self.status = text;
+    }
+
+    /// Harmonie-Zeit: liegen die x-Bänder der Harmonien auf der ganzen
+    /// x-Achse (Gesamt, wie bisher) oder gestreckt im Scan-Bereich?
+    fn zeile_harm_zeit(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Harmonie-x:");
+            let gesamt = matches!(self.harm_x_basis, XBasis::Gesamt);
+            if ui.selectable_label(gesamt, "Gesamt").clicked() && !gesamt {
+                self.harm_x_basis = XBasis::Gesamt;
+                self.harm_log = None;
+                log::info!("bild: Harmonie-x Gesamt");
+                self.status = "Harmonie-x: Gesamt (Bänder auf der ganzen Achse)".to_string();
+            }
+            if ui.selectable_label(!gesamt, "Bereich").clicked() && gesamt {
+                self.harm_x_basis = XBasis::Bereich;
+                self.harm_log = None;
+                log::info!("bild: Harmonie-x Bereich");
+                self.status = "Harmonie-x: Bereich (Bänder im Scan-Bereich)".to_string();
+            }
+        });
+    }
+
+    /// Anteil (0..1) der Harmonie-x-Achse für eine Bildposition (0..1).
+    ///
+    /// „Gesamt": die Position zählt auf der ganzen Achse (wie bisher);
+    /// „Bereich": der Scan-Bereich wird auf 0..1 gestreckt (`harm_basis`).
+    fn harm_basis_anteil(&self, anteil: f32) -> f32 {
+        let (von, bis) = harm_basis(self.harm_x_basis, self.schritte(), self.bereich());
+        if bis > von {
+            ((anteil - von) / (bis - von)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// x in Schritten der Harmonie-Bänder für eine Bildposition (0..1).
+    fn harm_x(&self, anteil: f32) -> i32 {
+        (self.harm_basis_anteil(anteil) * self.schritte().max(1) as f32).round() as i32
+    }
+
+    /// x-Schritt (Gesamt-Schrittzahl) für eine Bildposition 0..1 — für die
+    /// Takt-Maske, die an der absoluten Spalte hängt, nicht an der Harmonie.
+    fn schritt_aus_anteil(&self, anteil: f32) -> i32 {
+        let schritte = self.schritte().max(1) as i32;
+        ((anteil.clamp(0.0, 1.0) * schritte as f32).floor() as i32).clamp(0, schritte - 1)
+    }
+
+    /// Masken-Amplitude an einer Bildposition (1.0, wenn die Maske aus ist).
+    fn masken_alpha(&self, anteil: f32) -> f32 {
+        if self.maske_an {
+            self.maske
+                .alpha(self.schritt_aus_anteil(anteil), self.schritte().max(1) as usize)
+        } else {
+            1.0
+        }
+    }
+
+    /// Anteil (0..1) des Bereichs-Durchlaufs zur aktuellen Zeit; `None` bei
+    /// „alle Spalten gleichzeitig" (`anteil_je_zeit` läuft modulo der Dauer).
+    fn bereichs_anteil(&self) -> Option<f32> {
+        anteil_je_zeit(
+            self.bereich_seit_start,
+            self.bereich_takte,
+            self.bereich_durchlauf,
+        )
+        .map(|a| a as f32)
+    }
+
+    /// Die Harmonie-Bänder in Anteilen der Harmonie-x-Achse (für
+    /// `harmonie_an`): die Schrittzahlen des Kreises (`harmonie.setx`) durch
+    /// die Schrittzahl geteilt.
+    fn harm_baender_anteil(&self) -> Vec<(f32, f32, usize)> {
+        let schritte = self.schritte().max(1) as f32;
+        let mut aus = Vec::new();
+        let mut von = 0.0f32;
+        for (i, (bis_x, _)) in self.harmonie.baender().iter().enumerate() {
+            let bis = (*bis_x as f32 / schritte).clamp(0.0, 1.0);
+            aus.push((von, bis, i));
+            von = bis;
+        }
+        aus
+    }
+
+    /// Statuszeile/Log der Harmonie-Zeit: „bild: Harmonie 2 an x 0.42" beim
+    /// **Wechsel** des Bands (die Position wandert je Frame, deshalb nur beim
+    /// Wechsel — sonst flutete das Log).
+    fn harm_log_schreiben(&mut self, anteil: f32) {
+        if !(self.harmonie.an && self.harmonie.notenmenge) {
+            self.harm_log = None;
+            return;
+        }
+        let basis = self.harm_basis_anteil(anteil);
+        let idx = harmonie_an(basis, &self.harm_baender_anteil());
+        if idx != self.harm_log {
+            self.harm_log = idx;
+            match idx {
+                Some(i) => {
+                    log::info!("bild: Harmonie {} an x {:.2}", i + 1, basis);
+                    self.status = format!("Harmonie {} an x {:.2}", i + 1, basis);
+                }
+                None => {
+                    log::info!("bild: Harmonie aus (x {basis:.2})");
+                    self.status = format!("Harmonie aus (x {basis:.2})");
+                }
+            }
+        }
+    }
+
+    /// Die Stimmen des Linien-/Bereichstons aus einem Satz Bildspalten.
+    ///
+    /// Je Spalte werden alle Zeilen geprüft (Farbe+Toleranz bzw. Palette,
+    /// Harmonie nach der Spaltenposition). Bei mehreren Treffern klingt die
+    /// **tiefste** Note der Spalte — Entscheidung: eine Stimme je Spalte statt
+    /// eines Akkords, damit der Ton ein „Oszillator" mit einer Tonhöhe bleibt
+    /// und große Flächen nicht matschen. Über die Spalten wird entdoppelt
+    /// (gleiche Note = eine Stimme, der höhere Gain bleibt) und auf
+    /// [`LINIENTON_MAX`] Stimmen gedeckelt.
+    fn linien_stimmen(
+        &self,
+        live: &[u8],
+        w: usize,
+        h: usize,
+        spalten: &[(i32, f32)],
+        filter: &ScanFilter,
+        palette: Option<&std::collections::HashSet<u32>>,
+    ) -> Vec<(i32, f32)> {
+        let (wi, hi) = (w as i32, h as i32);
+        let mut noten: Vec<(i32, f32)> = Vec::new();
+        for &(x, alpha) in spalten {
+            if alpha <= 0.0 {
+                continue;
+            }
+            let x_anteil = (x as f32 / wi.max(1) as f32).clamp(0.0, 1.0);
+            let harm_x = self.harm_x(x_anteil);
+            let mut tiefste: Option<(i32, f32)> = None;
+            for (y, r, g, b) in scan_column(live, wi, hi, x, filter, palette) {
+                let note = note_fuer_zeile(y as f32 / hi.max(1) as f32, 36, 36);
+                // Harmonics-Filter wie beim Sweep: gesperrte Noten fallen weg.
+                if !self.harmonie.note_erlaubt(note, harm_x) {
+                    continue;
+                }
+                let (_, vol) = note_volume_farbe(r, g, b, 36, 36);
+                let gain = (vol as f32 / 127.0).clamp(0.05, 1.0) * alpha.clamp(0.0, 1.0);
+                if tiefste.map(|(n, _)| note < n).unwrap_or(true) {
+                    tiefste = Some((note, gain));
+                }
+            }
+            if let Some((note, gain)) = tiefste {
+                noten.push((note, gain));
+            }
+        }
+        // Tiefste zuerst, je Note der höchste Gain; dann deckeln.
+        noten.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)));
+        noten.dedup_by_key(|(n, _)| *n);
+        noten.truncate(LINIENTON_MAX);
+        noten
+    }
+
+    /// Oszillator-Scan: Linien- bzw. Bereichston fortschreiben (je Frame).
+    ///
+    /// Läuft **unabhängig** vom „Scan an"-Schalter des Spalten-Sweeps (der
+    /// bleibt unverändert); ohne Linie/Bereich, ohne Auswahl oder mit „Ton
+    /// aus" bleibt es still. Der Ton wird gebremst neu gerechnet (~30 ms,
+    /// „alle Spalten" ~120 ms) — ein Dauerton braucht keine 20 Bilder/s.
+    fn linien_schritt(&mut self) {
+        // Zeit für den Bereichs-Durchlauf (Takte, wie der Stroboskop-Zähler) —
+        // auch ohne Auswahl, damit der Cursor sichtbar weiterwandert.
+        if self.bereich_an {
+            let jetzt = std::time::Instant::now();
+            let dt = jetzt
+                .duration_since(self.bereich_letzte_zeit)
+                .as_secs_f64()
+                .min(0.25);
+            self.bereich_letzte_zeit = jetzt;
+            self.bereich_seit_start += dt * self.scan_bpm.max(1.0) as f64 / 60.0;
+        }
+        self.bereich_anteil = self.bereichs_anteil().unwrap_or(0.0);
+        if (!self.linie_an && !self.bereich_an) || !self.ton_an || self.sel.is_none() {
+            self.linienton_aus();
+            return;
+        }
+        let jetzt = std::time::Instant::now();
+        if jetzt < self.linien_naechste {
+            return;
+        }
+        let alle = self.bereich_an && matches!(self.bereich_durchlauf, Durchlauf::Alles);
+        self.linien_naechste =
+            jetzt + std::time::Duration::from_millis(if alle { 120 } else { 30 });
+        let Some(sel) = self.sel else {
+            self.linienton_aus();
+            return;
+        };
+        let Some((w, h, live)) = camera::letztes_bild() else {
+            self.linienton_aus();
+            return;
+        };
+        // Ohne Breite gibt es keine Spalte (clamp(0, -1) würde paniken).
+        let wi = (w as i32).max(1);
+        let filter = ScanFilter {
+            bg: self.bg,
+            sel,
+            range: self.toleranz,
+        };
+        let palette = if self.palette_scan && self.mal_masse == (w, h) {
+            let p = build_palette(&self.mal_puffer, w * h, self.bg);
+            (!p.is_empty()).then_some(p)
+        } else {
+            None
+        };
+        // Welche Bildspalten klingen? Linie: eine; Bereich-Sweep: die Spalte
+        // der Durchlaufposition; „alle": die Spalten des Bereichs (gedeckelt).
+        // Stroboskop: gelesen wird die Quellspalte hinter der Ansicht.
+        let (von, bis) = self.bereich();
+        let mut spalten: Vec<(i32, f32)> = Vec::new();
+        if self.linie_an {
+            let ansicht = (self.linie_x.clamp(0.0, 1.0) * wi as f32).floor() as i32;
+            let x = if self.strobo_an {
+                jamcore::stroboskop::quell_spalte(ansicht, self.strobo_versatz_px, wi)
+            } else {
+                ansicht
+            };
+            spalten.push((x.clamp(0, wi - 1), self.masken_alpha(self.linie_x)));
+        } else if !alle {
+            let position = von + self.bereich_anteil.clamp(0.0, 1.0) * (bis - von);
+            let x = (position * wi as f32).floor() as i32;
+            let alpha = if self.bereich_maske {
+                self.masken_alpha(position)
+            } else {
+                1.0
+            };
+            spalten.push((x.clamp(0, wi - 1), alpha));
+        } else {
+            let x0 = (von * wi as f32).floor() as i32;
+            let x1 = (bis * wi as f32).ceil() as i32;
+            let breite = (x1 - x0).max(1);
+            let n = breite.min(ALLE_SPALTEN_MAX as i32);
+            for k in 0..n {
+                let x = x0 + k * breite / n;
+                let anteil = x as f32 / wi.max(1) as f32;
+                let alpha = if self.bereich_maske {
+                    self.masken_alpha(anteil)
+                } else {
+                    1.0
+                };
+                let x = if self.strobo_an {
+                    jamcore::stroboskop::quell_spalte(x, self.strobo_versatz_px, wi)
+                } else {
+                    x
+                };
+                spalten.push((x.clamp(0, wi - 1), alpha));
+            }
+        }
+        let noten = self.linien_stimmen(&live, w, h, &spalten, &filter, palette.as_ref());
+        // Harmonie-Zeit protokollieren: welches Band gilt an der aktuellen
+        // Position? (Linie: Linienposition; Sweep: Durchlaufposition;
+        // „alle": Mitte des Bereichs.)
+        self.harm_log_schreiben(if self.linie_an {
+            self.linie_x
+        } else if alle {
+            (von + bis) / 2.0
+        } else {
+            von + self.bereich_anteil.clamp(0.0, 1.0) * (bis - von)
+        });
+        if noten.is_empty() {
+            self.linienton_aus();
+            return;
+        }
+        let zahlen: Vec<i32> = noten.iter().map(|(n, _)| *n).collect();
+        if self.linienton_noten != zahlen {
+            log::info!(
+                "bild: Linienton {} {:?} ({} Stimmen)",
+                if self.linie_an { "Linie" } else { "Bereich" },
+                zahlen,
+                noten.len()
+            );
+            self.linienton_noten = zahlen;
+        }
+        let stimmen: Vec<(f32, f32)> = noten
+            .iter()
+            .map(|(n, g)| (jamcore::klang::frequenz(*n), *g))
+            .collect();
+        crate::klang::linienton_setzen(Some(stimmen));
+        self.linienton_an = true;
+    }
+
+    /// Den Linien-/Bereichston abschalten (nur wenn er wirklich klingt) —
+    /// z. B. beim Verlassen des Bild-Tabs (siehe `lib.rs`).
+    pub fn linienton_aus(&mut self) {
+        if self.linienton_an || !self.linienton_noten.is_empty() {
+            self.linienton_an = false;
+            self.linienton_noten.clear();
+            crate::klang::linienton_setzen(None);
         }
     }
 
@@ -2259,6 +2801,33 @@ impl ImagePanel {
                 }
             }
         });
+        // Anzeige: „grün" wie bisher (Treffer/Markierung grün) oder „echte
+        // Farben" — nur die Auswahl in Originalfarbe, alles andere dunkel.
+        ui.horizontal(|ui| {
+            ui.label("Anzeige:");
+            if ui.selectable_label(!self.anzeige_echt, "grün").clicked() && self.anzeige_echt {
+                self.anzeige_echt = false;
+                log::info!("bild: Anzeige grün");
+                self.status = "Anzeige: grün".to_string();
+                if self.sel.is_some() {
+                    let ctx = ui.ctx().clone();
+                    self.markieren(&ctx);
+                }
+            }
+            if ui
+                .selectable_label(self.anzeige_echt, "echte Farben")
+                .clicked()
+                && !self.anzeige_echt
+            {
+                self.anzeige_echt = true;
+                log::info!("bild: Anzeige echte Farben");
+                self.status = "Anzeige: echte Farben (nur die Auswahl leuchtet)".to_string();
+                if self.sel.is_some() {
+                    let ctx = ui.ctx().clone();
+                    self.markieren(&ctx);
+                }
+            }
+        });
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(format!("{} Pixel", self.treffer)).small());
             if ui.button("löschen").clicked() {
@@ -2548,6 +3117,31 @@ impl ImagePanel {
             }
         }
 
+        // Oszillator-Scan: die senkrechte Linie bzw. die Grenzen und der
+        // Cursor des x-Bereichs — in Ansichtskoordinaten; gelesen wird die
+        // Quellspalte dahinter (Stroboskop wie beim Sweep).
+        if self.linie_an || self.bereich_an {
+            let painter = ui.painter().with_clip_rect(kasten);
+            let gelb = Color32::from_rgb(255, 215, 60);
+            let grau = Color32::from_rgba_unmultiplied(255, 255, 255, 90);
+            let senkrecht = |anteil: f32, farbe: Color32, breite: f32| {
+                let x = bild_rect.min.x + anteil.clamp(0.0, 1.0) * bild_b;
+                painter.vline(x, kasten.y_range(), egui::Stroke::new(breite, farbe));
+            };
+            if self.linie_an {
+                senkrecht(self.linie_x, gelb, 1.5);
+            }
+            if self.bereich_an {
+                let (von, bis) = self.bereich();
+                senkrecht(von, grau, 1.0);
+                senkrecht(bis, grau, 1.0);
+                if matches!(self.bereich_durchlauf, Durchlauf::Sweep) {
+                    let anteil = von + self.bereich_anteil.clamp(0.0, 1.0) * (bis - von);
+                    senkrecht(anteil, gelb, 1.5);
+                }
+            }
+        }
+
         if let Some(pos) = response.interact_pointer_pos() {
             if sichtbar.contains(pos) {
                 // Finger in der Leiste: Spalte umschalten und beim Wischen den
@@ -2580,6 +3174,17 @@ impl ImagePanel {
                     }
                 }
             } else if finger_unten && self.bild_tipp_erlaubt(&bild_rect, &kasten, pos) {
+                // Oszillator-Scan im Verschiebe-Modus: der Finger zieht die
+                // Linie. Sonst wählt der Tipp die Farbe wie bisher.
+                if self.linie_an && self.linie_verschieben {
+                    let anteil =
+                        ((pos.x - bild_rect.min.x) / bild_b.max(1.0)).clamp(0.0, 1.0);
+                    if (anteil - self.linie_x).abs() > 1e-4 {
+                        self.linie_x = anteil;
+                        self.status = format!("Linie x {:.2}", self.linie_x);
+                    }
+                    return;
+                }
                 // Finger im Bild: einfrieren + Farbe waehlen.
                 if self.eingefroren.is_none() {
                     self.eingefroren = camera::letztes_bild();

@@ -24,6 +24,24 @@
 //     Scan dort einen eigenen Klang hat; hier kann derselbe Platz nur das
 //     Senden meinen. Das bisherige `o` (Pattern-Ausgabe, bpmo) liegt deshalb
 //     auf Strg+o.
+//   - **Oszillator-Scan und Anzeige-Umschalter** (siehe `oszi.rs`): eine
+//     senkrechte **Linie** im Bild bzw. ein **x-Bereich**, deren passende
+//     Pixel als Noten per OSC gesendet werden (gedrosselt), dazu der
+//     **Anzeige**-Umschalter „grün ⇄ echte Farben". Alle Buchstaben und F-Tasten
+//     sind belegt (a = OSC aus, o = Browser, l = Bild sichern, i = X11-Aufnahme,
+//     b = Takt-Maske, v = Blau-Bereich), deshalb liegt der neue Block wie
+//     Shift+F8 (Spirale) auf **Shift+F1…F7**:
+//       Shift+F1 = Anzeige grün ⇄ echte Farben
+//       Shift+F2 = Linie an/aus
+//       Shift+F3 = Linie verschieben (Klick setzt, Pfeile ←/→ schieben)
+//       Shift+F4 = Bereich statt Linie (x-Bereich des Scans)
+//       Shift+F5 = Durchlauf Sweep ⇄ alle Spalten
+//       Shift+F6 = Takt-Maske ⇄ alle y
+//       Shift+F7 = Harmonie-x Gesamt ⇄ Bereich
+//       Alt+−/Alt++ = Dauer ÷2/×2 (1/64 … 4 Takt), solange der Bereich an ist
+//     Alles Neue ist standardmäßig **aus**; der bestehende Scan (Linie über
+//     Spalten, Stroboskop, Spirale) bleibt unverändert.
+mod oszi;
 mod shared;
 mod spirale;
 mod strobo;
@@ -576,6 +594,11 @@ struct App {
     spirale: Option<jamcore::spirale::Spirale>,
     /// Letzter Spiralpunkt für die dünne Spur im Sweep-Fenster.
     spirale_letzter: Option<(i32, i32)>,
+    /// Oszillator-Scan (Shift+F1…F7, siehe oszi.rs): Linie bzw. x-Bereich,
+    /// Dauer 1/64 … 4 Takt, Sweep/Alle, Takt-Maske, Harmonie-x. Standard: aus.
+    oszi: oszi::Oszi,
+    /// Anzeige-Umschalter „grün ⇄ echte Farben" (Shift+F1).
+    anzeige: oszi::Anzeige,
     surfacesh: bool,
     sendbpm: bool,
     leftset: bool,
@@ -717,6 +740,8 @@ impl App {
             strobo: strobo::Stroboskop::new(),
             spirale: None,
             spirale_letzter: None,
+            oszi: oszi::Oszi::new(),
+            anzeige: oszi::Anzeige::default(),
             surfacesh: false,
             sendbpm: true,
             leftset: false,
@@ -973,7 +998,7 @@ impl App {
                     if !self.is_note_in_chordpatt(note, x_quelle, y, h) {
                         continue;
                     }
-                    let (dr, dg, db) = jamcore::livescan::scale_rgb(r, g, b, alpha);
+                    let (dr, dg, db) = oszi::treffer_farbe(self.anzeige, r, g, b, alpha);
                     // Gezeichnet wird in der Ansichtsspalte: das dritte Fenster
                     // bleibt die Sweep-Anzeige (links → rechts), auch wenn die
                     // Noten aus der verschobenen Quellspalte kommen.
@@ -1116,7 +1141,7 @@ impl App {
                     );
                     let (_, vol) = self.event_note_volume(x_quelle, py, r, g, b);
                     if self.is_note_in_chord(note, px) {
-                        let (dr, dg, db) = jamcore::livescan::scale_rgb(r, g, b, alpha);
+                        let (dr, dg, db) = oszi::treffer_farbe(self.anzeige, r, g, b, alpha);
                         set_px(third, w, px, py, Color::RGB(dr, dg, db));
                         self.live_drawn_this_sweep += 1;
                         let vol = if self.biialpha {
@@ -1149,6 +1174,178 @@ impl App {
             self.live_next_col += Duration::from_nanos(column_ns.max(1) as u64);
         }
         drew
+    }
+
+    /// x-Bereich des Oszillator-Scans: die Split-Grenzen des Scans
+    /// (`Alt+D`/`Alt+C`) als Anteile der Breite — dieselben Grenzen wie der
+    /// bestehende Sweep. Unbrauchbare Grenzen bedeuten die volle Breite.
+    fn oszi_bereich(&self, w: i32) -> (f32, f32) {
+        let w = w.max(1) as f32;
+        let links = (self.leftrand as f32 / w).clamp(0.0, 1.0);
+        let rechts = ((w - self.rightrand as f32) / w).clamp(0.0, 1.0);
+        if rechts > links {
+            (links, rechts)
+        } else {
+            (0.0, 1.0)
+        }
+    }
+
+    /// Treffer einer Spalte für den Oszillator-Scan als `(y-Anteil, r, g, b)`
+    /// — Farbe+Toleranz bzw. Palette wie der bestehende Sweep.
+    fn oszi_treffer(
+        &self,
+        frame: &[u8],
+        w: i32,
+        h: i32,
+        x: i32,
+        filter: &jamcore::livescan::ScanFilter,
+    ) -> Vec<(f32, u8, u8, u8)> {
+        jamcore::livescan::scan_column(frame, w, h, x, filter, self.live_palette.as_ref())
+            .into_iter()
+            .map(|(y, r, g, b)| (y as f32 / h.max(1) as f32, r, g, b))
+            .collect()
+    }
+
+    /// Harmonie-Prüfung des Oszillator-Scans an der Spalte `x`: der x-Anteil
+    /// folgt dem Umschalter Gesamt-/Bereichs-x (`harm_anteil`), die Bänder
+    /// kommen aus den Quintenzirkel-x-Stellen (`notessetx`). Hinter dem letzten
+    /// Band gilt keine Harmonie (wie `in_notesset_range` im Desktop); ohne
+    /// Bänder entscheidet der Akkord-Filter wie bisher.
+    fn oszi_note_erlaubt(&self, note: i32, x: i32, w: i32) -> bool {
+        if !self.harmonics {
+            return true;
+        }
+        let count = (self.notessetcount.max(0) as usize)
+            .min(self.notesset.len())
+            .min(self.notessetx.len());
+        let baender = oszi::harmonie_baender(&self.notessetx[..count], w);
+        let (links, rechts) = self.oszi_bereich(w);
+        let anteil = self.oszi.harm_anteil(x, w, links, rechts);
+        let n = (((note + self.noteValueadd) % 12) + 12) % 12;
+        match oszi::harm_an(anteil, &baender) {
+            Some(idx) => self.notesset.get(idx).is_some_and(|klassen| klassen.contains(&n)),
+            None if baender.is_empty() => self.is_note_in_chord(note, x),
+            None => false,
+        }
+    }
+
+    /// Ein Takt des Oszillator-Scans (siehe oszi.rs): die Linie bzw. den
+    /// x-Bereich lesen und die Treffer als Noten senden — **gedrosselt** auf
+    /// höchstens eine Aussendung alle [`oszi::TAKT_MS`] (30 ms).
+    ///
+    /// Die Drossel ist die bewusste Wahl aus dem Plan: ohne sie fliegt bei
+    /// jedem Frame je Trefferzeile eine Note (wie der bestehende Scan) — mit
+    /// 30 ms klingt es wie ein Oszillator, und Renoise kann jede Note als
+    /// eigene ansprechen. Gespielt wird die **tiefste** Trefferzeile (ein Ton
+    /// je Takt); im „alle Spalten"-Modus ein **kleiner Akkord** aus bis zu
+    /// [`oszi::ALLE_MAX_NOTEN`] tiefsten Noten.
+    ///
+    /// Gelesen wird bei laufendem Stroboskop die Quellspalte hinter der
+    /// Ansicht (wie beim Sweep); die Takt-Maske sperrt Spalten und dimmt die
+    /// Lautstärke (127 · Amplitude), der Harmonie-Filter fällt je Note.
+    ///
+    /// Preis des Modus „alle Spalten": je Takt wird der **ganze** Bereich
+    /// gelesen (bei 384x384 rund 150k Pixel, bei einem 4K-Bild rund 8M) — für
+    /// große Bilder lieber den Bereich mit `Alt+D`/`Alt+C` eingrenzen.
+    fn oszi_schritt(&mut self, frame: &[u8], w: i32, h: i32) -> bool {
+        if !self.oszi.an() || w <= 0 || h <= 0 || frame.len() < (w * h * 4) as usize {
+            return false;
+        }
+        // Durchlauf fortschreiben (Takte aus dem Tempo der App, wie das
+        // Stroboskop; ohne gerechnetes Tempo gilt fixedBpm).
+        let bpm = if self.Bpm.is_finite() && self.Bpm > 0.0 {
+            self.Bpm as f64
+        } else {
+            self.fixedBpm.max(1.0) as f64
+        };
+        self.oszi.schritt(bpm);
+        if !self.oszi.ton_faellig() {
+            return false;
+        }
+        let filter = jamcore::livescan::ScanFilter {
+            bg: (self.rr as u8, self.gg as u8, self.bb as u8),
+            sel: (self.selectedR, self.selectedG, self.selectedB),
+            range: (self.rrange, self.grange, self.brange),
+        };
+        let alphas: Vec<f32> = if self.oszi.maske_an {
+            self.keyEventsxyes.iter().map(|k| k.iialpha).collect()
+        } else {
+            Vec::new()
+        };
+        let alpha_bei = |x: i32| -> f32 {
+            if self.oszi.maske_an {
+                jamcore::livescan::mask_alpha(&alphas, x)
+            } else {
+                1.0
+            }
+        };
+        let (links, rechts) = self.oszi_bereich(w);
+        let mut noten: Vec<(i32, i32)> = Vec::new();
+        if !self.oszi.bereich_an {
+            // Linie: eine Spalte. Gelesen wird die Quellspalte hinter der
+            // Stroboskop-Ansicht (wie beim Sweep), der Harmonie-x-Anteil gilt
+            // für die Linienposition.
+            let x = self.oszi.linie_x.clamp(0, w - 1);
+            let alpha = alpha_bei(x);
+            if alpha > 0.0 {
+                let x_quelle = self.strobo.quell_spalte(x, w);
+                let treffer = self.oszi_treffer(frame, w, h, x_quelle, &filter);
+                if let Some((note, vol, _)) =
+                    oszi::tiefste_note(&treffer, self.noteScale, self.noteScaleadd)
+                {
+                    let vol = (vol as f32 * alpha).clamp(0.0, 127.0) as i32;
+                    if self.oszi_note_erlaubt(note, x, w) {
+                        noten.push((note, vol));
+                    }
+                }
+            }
+        } else {
+            // Bereich: im Sweep wandert die eine Spalte in der Dauer einmal
+            // durch, im Modus „alle" werden alle Spalten gleichzeitig gelesen.
+            let schritte = ((rechts - links) * w as f32).round().max(1.0) as i32;
+            let spalten: Vec<i32> = match self.oszi.durchlauf_anteil() {
+                Some(anteil) => {
+                    let anteil = anteil.clamp(0.0, 1.0);
+                    let schritt = (anteil * (schritte - 1) as f64).round() as i32;
+                    vec![jamcore::livescan::spalte_im_bereich(
+                        schritt, schritte, links, rechts, w,
+                    )]
+                }
+                None => (0..schritte)
+                    .map(|s| jamcore::livescan::spalte_im_bereich(s, schritte, links, rechts, w))
+                    .collect(),
+            };
+            for x in spalten {
+                let alpha = alpha_bei(x);
+                if alpha <= 0.0 {
+                    continue;
+                }
+                let x_quelle = self.strobo.quell_spalte(x, w);
+                let treffer = self.oszi_treffer(frame, w, h, x_quelle, &filter);
+                if let Some((note, vol, _)) =
+                    oszi::tiefste_note(&treffer, self.noteScale, self.noteScaleadd)
+                {
+                    let vol = (vol as f32 * alpha).clamp(0.0, 127.0) as i32;
+                    if self.oszi_note_erlaubt(note, x, w) {
+                        noten.push((note, vol));
+                    }
+                }
+            }
+            noten = oszi::kleiner_akkord(noten);
+        }
+        let mut gesendet = false;
+        for (note, vol) in noten {
+            if self.sende_note(note, vol) {
+                gesendet = true;
+                if self.live_verbose {
+                    println!("oszi note={note} vol={vol}");
+                }
+            }
+        }
+        if gesendet {
+            self.oszi.ton_gemeldet();
+        }
+        gesendet
     }
 
     fn is_note_in_chord(&self, note: i32, x: i32) -> bool {
@@ -1984,11 +2181,57 @@ impl View {
 
 /// Bild ins Hauptfenster geben: mit Stroboskop versetzt (die Ansicht läuft im
 /// Takt durchs Bild), sonst unverändert — immer aus demselben Puffer.
+///
+/// Die senkrechte Linie des Oszillator-Scans wird **nur in die Anzeige**
+/// gemalt (Kopie), nie in den Puffer: der Scan liest den Puffer, sonst wären
+/// die Linienpixel selbst Treffer.
 fn present_main(app: &App, view: &mut View, buf: &[u8], w: i32, h: i32) {
-    if app.strobo.an {
+    if app.oszi.linie_an {
+        let mut anzeige = buf.to_vec();
+        zeichne_linie(app, &mut anzeige, w, h);
+        if app.strobo.an {
+            view.present_versetzt(&anzeige, w, h, &app.strobo);
+        } else {
+            view.present(&anzeige, w, h);
+        }
+    } else if app.strobo.an {
         view.present_versetzt(buf, w, h, &app.strobo);
     } else {
         view.present(buf, w, h);
+    }
+}
+
+/// Die senkrechte Linie des Oszillator-Scans in eine Anzeige-Kopie malen: in
+/// der Auswahlfarbe (wie die Spiral-Spur); wäre sie der Hintergrundfarbe
+/// gleich, bliebe sie unsichtbar — dann weiß.
+fn zeichne_linie(app: &App, anzeige: &mut [u8], w: i32, h: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let x = app.oszi.linie_x.clamp(0, w - 1);
+    let (lr, lg, lb) = if (app.selectedR, app.selectedG, app.selectedB)
+        == (app.rr as u8, app.gg as u8, app.bb as u8)
+    {
+        (255, 255, 255)
+    } else {
+        (app.selectedR, app.selectedG, app.selectedB)
+    };
+    for y in 0..h {
+        set_px(anzeige, w, x, y, Color::RGB(lr, lg, lb));
+    }
+}
+
+/// Das Fenster „Selected color" zeigen. Im Anzeige-Modus „grün" markiert die
+/// **Anzeige** alle Treffer grün (wie `markieren_bild` in der App); der Puffer
+/// selbst bleibt unangetastet, denn er ist die Palette des Live-Scans
+/// (`build_palette` liest die gemalten Originalfarben). „echte Farben" zeigt
+/// den Puffer unverändert (nur die Auswahl in Originalfarben, kein Grün).
+fn present_second(app: &App, view: &mut View, second: &[u8], w: i32, h: i32) {
+    if app.anzeige == oszi::Anzeige::Gruen {
+        let kopie = oszi::anzeige_kopie(second, (app.rr as u8, app.gg as u8, app.bb as u8));
+        view.present(&kopie, w, h);
+    } else {
+        view.present(second, w, h);
     }
 }
 
@@ -2526,15 +2769,31 @@ fn handle_key(
                 app.rightset = true;
             }
             // Schrittweite der Spirale ÷/× (Shift+F8 schaltet den Modus).
-            // Ohne Spirale gibt es nichts zu stellen.
+            // Solange der Oszillator-**Bereich** an ist (Shift+F4), gehört
+            // Alt+−/Alt++ dessen Dauer (1/64 … 4 Takt) — sonst wie bisher der
+            // Spiral-Schrittweite. Ohne Spirale gibt es dort nichts zu stellen.
             Keycode::Minus | Keycode::KpMinus => {
-                if let Some(s) = app.spirale.as_mut() {
+                if app.oszi.bereich_an {
+                    app.oszi.dauer_teile(2.0);
+                    println!(
+                        "rrn5: Bereich {} {}",
+                        app.oszi.dauer_text(),
+                        oszi::durchlauf_text(app.oszi.durchlauf)
+                    );
+                } else if let Some(s) = app.spirale.as_mut() {
                     spirale::schritt_teile(s);
                     println!("{}", spirale::text(&app.spirale));
                 }
             }
             Keycode::Plus | Keycode::KpPlus | Keycode::Equals => {
-                if let Some(s) = app.spirale.as_mut() {
+                if app.oszi.bereich_an {
+                    app.oszi.dauer_vielfache(2.0);
+                    println!(
+                        "rrn5: Bereich {} {}",
+                        app.oszi.dauer_text(),
+                        oszi::durchlauf_text(app.oszi.durchlauf)
+                    );
+                } else if let Some(s) = app.spirale.as_mut() {
                     spirale::schritt_vielfache(s);
                     println!("{}", spirale::text(&app.spirale));
                 }
@@ -2557,6 +2816,93 @@ fn handle_key(
     let shift_mod = keymod.contains(Mod::LSHIFTMOD) || keymod.contains(Mod::RSHIFTMOD);
 
     match kc {
+        // ------------------------------------------------------------------
+        // Oszillator-Scan und Anzeige-Umschalter (neu 2026-10-17, oszi.rs)
+        //
+        // Alle Buchstaben sind belegt (l = Bild sichern, i = X11-Aufnahme,
+        // b = Takt-Maske, v = Blau-Bereich) und F1–F12 ebenso — der neue Block
+        // liegt deshalb wie Shift+F8 (Spirale) auf **Shift+F1…F7**. Alles
+        // Neue ist standardmäßig aus.
+        // ------------------------------------------------------------------
+        Keycode::F1 if shift_mod && ohne_mod => {
+            app.anzeige = oszi::anzeige_umschalten(app.anzeige);
+            println!("rrn5: Anzeige {}", oszi::anzeige_text(app.anzeige));
+            // Beide Fenster sofort neu zeigen (der Umschalter wirkt in der
+            // Anzeige, nicht im Puffer — siehe `present_second`).
+            present_second(app, second_view, second, w, h);
+            present_main(app, main_view, main_buffer, w, h);
+        }
+        Keycode::F2 if shift_mod && ohne_mod => {
+            if app.oszi.linie_umschalten() {
+                app.oszi.setze_linie(app.oszi.linie_x, w);
+                println!(
+                    "rrn5: Linie an (x={} von {}, {})",
+                    app.oszi.linie_x,
+                    w,
+                    app.oszi.text()
+                );
+            } else {
+                println!("rrn5: Linie aus");
+            }
+            present_main(app, main_view, main_buffer, w, h);
+        }
+        Keycode::F3 if shift_mod && ohne_mod => {
+            println!(
+                "rrn5: Linie verschieben {} (Klick setzt die Linie, Pfeile links/rechts schieben)",
+                if app.oszi.verschieben_umschalten() {
+                    "an"
+                } else {
+                    "aus"
+                }
+            );
+        }
+        Keycode::F4 if shift_mod && ohne_mod => {
+            if app.oszi.bereich_umschalten() {
+                println!(
+                    "rrn5: Bereich {} {}",
+                    app.oszi.dauer_text(),
+                    oszi::durchlauf_text(app.oszi.durchlauf)
+                );
+            } else {
+                println!("rrn5: Bereich aus");
+            }
+        }
+        Keycode::F5 if shift_mod && ohne_mod => {
+            let d = app.oszi.durchlauf_umschalten();
+            println!("rrn5: Durchlauf {}", oszi::durchlauf_text(d));
+            if app.oszi.bereich_an {
+                println!(
+                    "rrn5: Bereich {} {}",
+                    app.oszi.dauer_text(),
+                    oszi::durchlauf_text(d)
+                );
+            }
+        }
+        Keycode::F6 if shift_mod && ohne_mod => {
+            println!(
+                "rrn5: {}",
+                if app.oszi.maske_umschalten() {
+                    "Takt-Maske an"
+                } else {
+                    "alle y (ohne Takt-Maske)"
+                }
+            );
+        }
+        Keycode::F7 if shift_mod && ohne_mod => {
+            println!(
+                "rrn5: Harmonie-x {}",
+                oszi::basis_text(app.oszi.basis_umschalten())
+            );
+        }
+        // Pfeiltasten links/rechts verschieben die Linie, **solange** der
+        // Verschiebe-Modus an ist (sonst stellen sie wie bisher noteadjust).
+        // `ohne_mod` lässt Strg+Pfeil (xofflr) und Alt unberührt.
+        Keycode::Left | Keycode::Right if app.oszi.verschieben && ohne_mod => {
+            app.oszi
+                .linie_schieben(if kc == Keycode::Left { -1 } else { 1 }, w);
+            println!("rrn5: Linie x={}", app.oszi.linie_x);
+            present_main(app, main_view, main_buffer, w, h);
+        }
         // Stroboskop-Ansicht (wie in der App): F9 an/aus, F10 Richtung,
         // F11/F12 Umdrehungen ÷2/×2, −/+ Takte ÷2/×2.
         Keycode::F9 if ohne_mod => {
@@ -3039,7 +3385,7 @@ fn handle_key(
                 scale_rgba_into(w, h, second, iw, ih, &img);
             }
             *secondsave = second.clone();
-            second_view.present(second, w, h);
+            present_second(app, second_view, second, w, h);
             app.bpmo3 = true;
         }
         Keycode::K => {
@@ -3165,15 +3511,29 @@ fn frame_logic(
         }
     }
 
+    // Oszillator-Scan (Linie bzw. x-Bereich, siehe oszi.rs): eigener Weg
+    // **neben** dem Live-Scan — er läuft auch, wenn der Live-Scan aus ist,
+    // und beim Ziehen der Linie auch im eingefrorenen Bild. rrn5 hat keinen
+    // lokalen Klang; die Treffer gehen gedrosselt als Noten per OSC an Renoise.
+    app.oszi_schritt(main_buffer, w, h);
+
     if app.isRightMouseButtonHeld {
         fill_buf(second, Color::RGB(app.rr as u8, app.gg as u8, app.bb as u8));
         fill_buf(third, Color::RGB(app.rr as u8, app.gg as u8, app.bb as u8));
         *secondsave = second.clone();
-        second_view.present(second, w, h);
+        present_second(app, second_view, second, w, h);
         third_view.present(third, w, h);
     }
 
-    if app.isLeftMouseButtonHeld {
+    // Verschiebe-Modus (Shift+F3): ein Klick setzt die Linie (siehe
+    // MouseButtonDown in `main`), die Pfeiltasten schieben sie weiter. Gemalt
+    // wird dabei **nicht** — sonst macht ein Tipp die Farbauswahl (Plan).
+    //
+    // Bewusst ohne Ziehen über `mouse_xy`: dessen Wert ist die Position des
+    // Zeigers **relativ zum Fenster**, die SDL auf manchen Systemen (headless)
+    // nicht mitführt — ein Zug würde die Linie dann auf 0 zurückreißen. Der
+    // Klick selbst kennt seine Spalte immer.
+    if !app.oszi.verschieben && app.isLeftMouseButtonHeld {
         let (mx, my) = mouse_xy();
         let (selr, selg, selb) = {
             let px = get_px(main_buffer, w, mx as i32, my as i32);
@@ -3227,13 +3587,13 @@ fn frame_logic(
         }
         set_px(second, w, 0, 0, Color::RGB(1, 1, 1));
         *secondsave = second.clone();
-        second_view.present(second, w, h);
+        present_second(app, second_view, second, w, h);
         present_main(app, main_view, main_buffer, w, h);
     }
 
     if app.isMiddleMouseButtonHeld {
         fill_buf(second, Color::RGB(app.rr as u8, app.gg as u8, app.bb as u8));
-        second_view.present(second, w, h);
+        present_second(app, second_view, second, w, h);
         app.l = 0;
         app.lb = 0;
         app.pixi = 0;
@@ -3276,7 +3636,7 @@ fn frame_logic(
         if app.harmonics {
             find_and_draw_harmonics(app, second, secondsave, w, h);
         }
-        second_view.present(second, w, h);
+        present_second(app, second_view, second, w, h);
         present_main(app, main_view, main_buffer, w, h);
     }
 
@@ -3612,6 +3972,13 @@ fn main() {
          Shift+F8 = Scan Linie/Spirale, Alt+−/Alt++ = Spiral-Schrittweite ÷/× \
          (Pattern-Ausgabe jetzt Strg+o)"
     );
+    println!(
+        "Oszillator-Scan: Shift+F1 = Anzeige grün ⇄ echte Farben (jetzt {}), Shift+F2 = Linie an/aus, \
+         Shift+F3 = Linie verschieben (Klick setzt, Pfeile ←/→ schieben), Shift+F4 = Bereich statt Linie, \
+         Shift+F5 = Sweep/alle Spalten, Shift+F6 = Takt-Maske/alle y, \
+         Shift+F7 = Harmonie-x Gesamt/Bereich, Alt+−/Alt++ = Bereichs-Dauer ÷/× (1/64 … 4 Takt)",
+        oszi::anzeige_text(app.anzeige)
+    );
 
     let sdl = match sdl2::init() {
         Ok(s) => s,
@@ -3651,7 +4018,7 @@ fn main() {
         scale_rgba_into(xw, yh, &mut main_buffer, iw, ih, &img);
     }
     present_main(&app, &mut main_view, &main_buffer, xw, yh);
-    second_view.present(&second, xw, yh);
+    present_second(&app, &mut second_view, &second, xw, yh);
     third_view.present(&third, xw, yh);
 
     let mut editor = match SharedMemoryEditor::open() {
@@ -3691,12 +4058,23 @@ fn main() {
                     keymod,
                 );
             }
-            Some(Event::MouseButtonDown { mouse_btn, .. }) => {
+            Some(Event::MouseButtonDown { mouse_btn, x, .. }) => {
                 match mouse_btn {
                     sdl2::mouse::MouseButton::Left => {
                         app.isLeftMouseButtonHeld = true;
                         app.isRightMouseButtonHeld = false;
                         app.isMiddleMouseButtonHeld = false;
+                        // Verschiebe-Modus: der Klick setzt die Linie auf die
+                        // geklickte Spalte (die Koordinaten des Klicks sind
+                        // fensterbezogen). Der Zug mit gehaltener Taste macht
+                        // das in `frame_logic` weiter — dort über `mouse_xy`,
+                        // das auf manchen Systemen (headless) nicht aktuell ist,
+                        // der Klick selbst kennt seine Spalte aber immer.
+                        if app.oszi.verschieben {
+                            app.oszi.setze_linie(x, app.xw);
+                            println!("rrn5: Linie x={}", app.oszi.linie_x);
+                            present_main(&app, &mut main_view, &mut main_buffer, app.xw, app.yh);
+                        }
                     }
                     sdl2::mouse::MouseButton::Right => {
                         app.isRightMouseButtonHeld = true;

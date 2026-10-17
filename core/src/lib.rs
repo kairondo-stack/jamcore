@@ -19,6 +19,7 @@ pub mod maske;
 pub mod micbpm;
 pub mod modulebrowser;
 pub mod openmpt;
+pub mod oszillator;
 pub mod osc;
 pub mod quint;
 pub mod relay;
