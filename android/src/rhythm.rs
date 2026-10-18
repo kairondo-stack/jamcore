@@ -1112,10 +1112,23 @@ impl RhythmPanel {
                 .clicked()
             {
                 self.klangquelle = Klangquelle::Slices;
-                self.status = format!(
-                    "Klang: Slices ({} im Slicer geladen, Instr = Slice-Nummer)",
-                    crate::slicer::slice_anzahl()
-                );
+                // Nach einem App-Neustart ist das Raster leer (es liegt nur im
+                // Speicher): die Slices aus dem letzten Export nachladen, damit
+                // „Slices" sofort klingt statt auf den Tongenerator zu fallen.
+                let aus_export = crate::slicer::raster_aus_letztem_export();
+                let anzahl = crate::slicer::slice_anzahl();
+                // Die Instrumentnummer ist der Slice-Index: liegt sie hinter
+                // den geladenen Slices (z. B. noch von Modul-Samples), klingt
+                // sonst der Tongenerator statt des Slices — auf den letzten
+                // vorhandenen Slice klemmen.
+                if anzahl > 0 && self.instrument as usize >= anzahl {
+                    self.instrument = (anzahl - 1).min(255) as u8;
+                }
+                self.status = if aus_export {
+                    format!("Klang: Slices ({anzahl} aus letztem Export geladen)")
+                } else {
+                    format!("Klang: Slices ({anzahl} im Slicer geladen)")
+                };
             }
             if self.klangquelle == Klangquelle::Welle && ui.button(self.welle.name()).clicked() {
                 let alle = jamcore::klang::Welle::ALLE;

@@ -47,6 +47,18 @@ const ALLE_SPALTEN_MAX: usize = 256;
 /// Farbe der „aus"-Pixel bei Anzeige „echte Farben" (fast schwarz, damit das
 /// Bild vom Kastenrand unterscheidbar bleibt).
 const ANZEIGE_DUNKEL: u8 = 8;
+/// Ersatz-Zieldatei der Aufnahme („Rec"), wenn der Slicer keine nennt:
+/// `<App-Ordner>/module/aufnahme.it` — dort sucht der Player-Tab.
+const REC_DATEI: &str = "aufnahme.it";
+/// So lange darf ein Durchlauf höchstens laufen, ohne dass die Aufnahme
+/// schreibt; danach wird auch **mitten im** Durchlauf geschrieben.
+const REC_ABSTAND: std::time::Duration = std::time::Duration::from_millis(2000);
+/// Kürzester Abstand zweier Schreibvorgänge am Durchlauf-Ende: kurze Sweeps
+/// (Vorgabe: 1/4 Takt ≈ 8 pro Sekunde) würden sonst im Takt der Sweeps
+/// dieselbe Datei schreiben — bei großen Slice-Sample-Dateien unnötige Last.
+const REC_MINDEST_ABSTAND: std::time::Duration = std::time::Duration::from_millis(250);
+/// Schritte je Takt des Rasters (16tel) — die Patternlänge fürs Log in Takten.
+const REC_SCHRITTE_JE_TAKT: f64 = 16.0;
 
 ///
 /// Gibt es als freie Funktion, weil sie an zwei Stellen gebraucht wird.
@@ -223,6 +235,449 @@ fn linie(von: (i32, i32), bis: (i32, i32)) -> Vec<(i32, i32)> {
 }
 // ==== ENDE SPIRAL-HELFER ====================================================
 
+// ==== AUFNAHME-HELFER: Raster -> IT-Pattern, .it lesen =====================
+// Nur `jamcore` — kein egui, keine Kamera. Der Leser versteht genau das
+// Format, das `jamcore::itwrite` schreibt (gegen libopenmpt geprüft); fremde
+// Formate werden gemeldet statt halb gelesen — die Aufnahme darf eine
+// vorhandene Datei nicht beschädigen.
+
+/// Nur der Dateiname eines Pfads (Anzeige der Aufnahme-Datei).
+fn kurzname(pfad: &str) -> String {
+    std::path::Path::new(pfad)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pfad.to_string())
+}
+
+/// Patternlänge in Takten (16 Schritte je Takt) für Log und Status: „2 Takte",
+/// „1/2 Takt" — ohne die Klemmung der Sweep-Dauer ([`dauer_text`]).
+fn rec_takte_text(schritte: u16) -> String {
+    let takte = schritte.max(1) as f64 / REC_SCHRITTE_JE_TAKT;
+    let ganz = takte.round();
+    if (takte - ganz).abs() < 1e-6 {
+        return if ganz == 1.0 {
+            "1 Takt".to_string()
+        } else {
+            format!("{ganz:.0} Takte")
+        };
+    }
+    for nenner in [2usize, 4, 8, 16] {
+        let zaehler = schritte as f64 * nenner as f64 / REC_SCHRITTE_JE_TAKT;
+        if (zaehler - zaehler.round()).abs() < 1e-6 {
+            return if zaehler.round() == 1.0 {
+                format!("{:.0}/{nenner} Takt", zaehler.round())
+            } else {
+                format!("{:.0}/{nenner} Takte", zaehler.round())
+            };
+        }
+    }
+    format!("{takte:.2} Takte").replace('.', ",")
+}
+
+/// Das Raster (`jamcore::grid::Pattern`) als IT-Pattern für die Aufnahme:
+/// eine Zeile je Schritt, **ein Kanal** (das Raster ist einstimmig — höchstens
+/// eine Note je Schritt), Note = Raster-Tonhöhe, Instrument = Slice-Nummer.
+///
+/// IT zählt Samples 1-basiert, das Raster 0-basiert (Slice 0 = „Slice 1").
+/// Gibt es keine Samples, bleibt das Instrument leer — sonst zeigte die Note
+/// ins Leere.
+fn it_pattern_aus_raster(pattern: &Pattern, samples: usize) -> jamcore::itwrite::Pattern {
+    let zeilen = pattern.steps_per_cycle().max(1);
+    let mut zellen = vec![jamcore::itwrite::Zelle::default(); zeilen as usize];
+    for note in pattern.notes() {
+        let step = (note.step % zeilen) as usize;
+        let instrument = if samples > 0 {
+            let nummer = note.instrument as usize + 1;
+            (nummer <= samples).then_some(nummer as u8)
+        } else {
+            None
+        };
+        zellen[step] = jamcore::itwrite::Zelle {
+            note: Some(note.pitch.clamp(0, 119) as u8),
+            instrument,
+            ..jamcore::itwrite::Zelle::default()
+        };
+    }
+    jamcore::itwrite::Pattern {
+        zeilen,
+        kanaele: 1,
+        zellen,
+    }
+}
+
+/// u16 little-endian an Offset `o` (0, wenn es die Stelle nicht gibt).
+fn it_u16(daten: &[u8], o: usize) -> u16 {
+    daten
+        .get(o..o + 2)
+        .map(|s| u16::from_le_bytes([s[0], s[1]]))
+        .unwrap_or(0)
+}
+
+/// u32 little-endian an Offset `o` (0, wenn es die Stelle nicht gibt).
+fn it_u32(daten: &[u8], o: usize) -> u32 {
+    daten
+        .get(o..o + 4)
+        .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        .unwrap_or(0)
+}
+
+/// Name aus einem NUL-gepolsterten Feld.
+fn it_name(feld: &[u8]) -> String {
+    let ende = feld.iter().position(|c| *c == 0).unwrap_or(feld.len());
+    String::from_utf8_lossy(&feld[..ende]).trim().to_string()
+}
+
+/// Samples und Patterns einer `.it`-Datei lesen (Format des eigenen Writers:
+/// `IMPM`, Sample-Köpfe `IMPS` 16 Bit mono, gepackte Patterns).
+///
+/// Nicht gelesen werden Instrument-Modus, komprimierte/Stereo/Delta-Samples
+/// und Big-Endian-Daten — solche Dateien kommen aus der App nicht, und ein
+/// halb verstandenes Format wäre beim Zurückschreiben ein Datenverlust.
+///
+/// `pub(crate)`, weil der Slicer damit sein Raster aus dem letzten Export
+/// nachlädt (Slices hörbar, ohne den Slicer-Tab zu öffnen).
+pub(crate) fn it_lesen(
+    daten: &[u8],
+) -> Result<
+    (
+        Vec<jamcore::itwrite::Sample>,
+        Vec<jamcore::itwrite::Pattern>,
+    ),
+    String,
+> {
+    if daten.len() < 0xC0 || &daten[..4] != b"IMPM" {
+        return Err("keine IT-Datei (IMPM fehlt)".to_string());
+    }
+    let ord_num = it_u16(daten, 0x20) as usize;
+    let ins_num = it_u16(daten, 0x22) as usize;
+    let smp_num = it_u16(daten, 0x24) as usize;
+    let pat_num = it_u16(daten, 0x26) as usize;
+    if it_u16(daten, 0x2c) & 0x04 != 0 {
+        return Err("Instrument-Modus wird nicht gelesen".to_string());
+    }
+    let smp_zeiger = 0xC0 + ord_num + 4 * ins_num;
+    let pat_zeiger = smp_zeiger + 4 * smp_num;
+    if daten.len() < pat_zeiger + 4 * pat_num {
+        return Err("Datei zu kurz (Parapointer fehlen)".to_string());
+    }
+
+    // Sample-Köpfe + PCM (16 Bit mono, wie der Writer sie schreibt).
+    let mut samples = Vec::with_capacity(smp_num);
+    for i in 0..smp_num {
+        let off = it_u32(daten, smp_zeiger + 4 * i) as usize;
+        if off == 0 || off + 0x50 > daten.len() {
+            return Err(format!("Sample-Kopf {i} zeigt ins Leere"));
+        }
+        let kopf = &daten[off..off + 0x50];
+        if &kopf[..4] != b"IMPS" {
+            return Err(format!("Sample-Kopf {i}: keine IMPS-Signatur"));
+        }
+        let flg = kopf[0x12];
+        let cvt = kopf[0x2e];
+        if flg & 0x08 != 0 {
+            return Err("komprimierte Samples werden nicht gelesen".to_string());
+        }
+        if flg & 0x04 != 0 {
+            return Err("Stereo-Samples werden nicht gelesen".to_string());
+        }
+        if cvt & 0x02 != 0 || cvt & 0x0c != 0 {
+            return Err("Sample-Kodierung (Big-Endian/Delta) wird nicht gelesen".to_string());
+        }
+        let bits16 = flg & 0x02 != 0;
+        let vorzeichen = cvt & 0x01 != 0;
+        let laenge = it_u32(kopf, 0x30) as usize;
+        let c5speed = it_u32(kopf, 0x3c);
+        let pcm_off = it_u32(kopf, 0x48) as usize;
+        let bytes_je = if bits16 { 2 } else { 1 };
+        if pcm_off + laenge * bytes_je > daten.len() {
+            return Err(format!("Sample {i}: Daten zeigen ins Leere"));
+        }
+        let mut pcm = Vec::with_capacity(laenge);
+        for k in 0..laenge {
+            let wert = if bits16 {
+                let o = pcm_off + k * 2;
+                i16::from_le_bytes([daten[o], daten[o + 1]]) as i32
+            } else {
+                let roh = daten[pcm_off + k] as i32;
+                if vorzeichen {
+                    (roh as i8) as i32
+                } else {
+                    roh - 128
+                }
+            };
+            // 8-Bit auf 16 Bit ziehen (der Writer schreibt 16 Bit).
+            pcm.push(if bits16 {
+                wert as i16
+            } else {
+                (wert * 256).clamp(-32768, 32767) as i16
+            });
+        }
+        samples.push(jamcore::itwrite::Sample {
+            name: it_name(&kopf[0x14..0x2e]),
+            daten: pcm,
+            rate: c5speed.max(1),
+            c5speed,
+        });
+    }
+
+    // Patterns: Parapointer 0 heißt (wie in OpenMPT) ein leeres 64-Zeilen-
+    // Pattern; sonst u16 Länge, u16 Zeilen, 4 reservierte Bytes, Daten.
+    let mut patterns = Vec::with_capacity(pat_num);
+    for i in 0..pat_num {
+        let off = it_u32(daten, pat_zeiger + 4 * i) as usize;
+        if off == 0 {
+            patterns.push(jamcore::itwrite::Pattern::leer());
+            continue;
+        }
+        if off + 8 > daten.len() {
+            return Err(format!("Pattern {i}: Zeiger zeigt ins Leere"));
+        }
+        let len = it_u16(daten, off) as usize;
+        let zeilen = it_u16(daten, off + 2).max(1);
+        if off + 8 + len > daten.len() {
+            return Err(format!("Pattern {i}: Daten zu kurz"));
+        }
+        if zeilen > 4096 {
+            return Err(format!("Pattern {i}: {} Zeilen (zu viele)", zeilen));
+        }
+        let mut pos = off + 8;
+        let ende = pos + len;
+        // Erst je Zeile die belegten Zellen sammeln; die Kanalzahl ergibt sich
+        // aus dem größten Kanal (wie in libopenmpt) — und erst damit steht der
+        // Platz jeder Zelle im Raster fest.
+        let mut zeilen_daten: Vec<Vec<(usize, jamcore::itwrite::Zelle)>> = Vec::new();
+        let mut masken: Vec<u8> = Vec::new();
+        let mut letzte: Vec<jamcore::itwrite::Zelle> = Vec::new();
+        for _ in 0..zeilen {
+            let mut zeile: Vec<(usize, jamcore::itwrite::Zelle)> = Vec::new();
+            while pos < ende {
+                let kanalbyte = daten[pos];
+                pos += 1;
+                if kanalbyte == 0 {
+                    break; // Zeilenende
+                }
+                let kanal = (kanalbyte & 0x7f).saturating_sub(1) as usize;
+                if kanal >= masken.len() {
+                    masken.resize(kanal + 1, 0);
+                    letzte.resize(kanal + 1, jamcore::itwrite::Zelle::default());
+                }
+                // Nur mit gesetztem oberen Bit kommt eine neue Maske; sonst
+                // gilt die Maske des Kanals weiter (ITTECH/libopenmpt).
+                if kanalbyte & 0x80 != 0 && pos < ende {
+                    masken[kanal] = daten[pos];
+                    pos += 1;
+                }
+                let maske = masken[kanal];
+                let mut zelle = jamcore::itwrite::Zelle::default();
+                if maske & 0x10 != 0 {
+                    zelle.note = letzte[kanal].note;
+                }
+                if maske & 0x20 != 0 {
+                    zelle.instrument = letzte[kanal].instrument;
+                }
+                if maske & 0x40 != 0 {
+                    zelle.volume = letzte[kanal].volume;
+                }
+                if maske & 0x80 != 0 {
+                    zelle.befehl = letzte[kanal].befehl;
+                    zelle.parameter = letzte[kanal].parameter;
+                }
+                if maske & 0x01 != 0 && pos < ende {
+                    let n = daten[pos];
+                    pos += 1;
+                    zelle.note = match n {
+                        0xFE => Some(254), // Note-Cut
+                        0xFF => Some(255), // Note-Off
+                        n if n < 0x80 => Some(n),
+                        _ => None, // Fade u. Ä. gibt es im Raster nicht
+                    };
+                }
+                if maske & 0x02 != 0 && pos < ende {
+                    zelle.instrument = Some(daten[pos]);
+                    pos += 1;
+                }
+                if maske & 0x04 != 0 && pos < ende {
+                    zelle.volume = Some(daten[pos]);
+                    pos += 1;
+                }
+                if maske & 0x08 != 0 && pos + 1 < ende {
+                    zelle.befehl = Some(daten[pos]);
+                    zelle.parameter = Some(daten[pos + 1]);
+                    pos += 2;
+                }
+                letzte[kanal] = zelle;
+                zeile.push((kanal, zelle));
+            }
+            zeilen_daten.push(zeile);
+            if pos >= ende {
+                break; // Daten zu Ende: die restlichen Zeilen bleiben leer.
+            }
+        }
+        while zeilen_daten.len() < zeilen as usize {
+            zeilen_daten.push(Vec::new());
+        }
+        let kanaele = zeilen_daten
+            .iter()
+            .flat_map(|z| z.iter().map(|(k, _)| *k + 1))
+            .max()
+            .unwrap_or(1)
+            .max(1) as u16;
+        if kanaele > 64 {
+            return Err(format!("Pattern {i}: {kanaele} Kanäle (zu viele)"));
+        }
+        let mut zellen = vec![
+            jamcore::itwrite::Zelle::default();
+            zeilen as usize * kanaele as usize
+        ];
+        for (z, eintraege) in zeilen_daten.iter().enumerate() {
+            for (kanal, zelle) in eintraege {
+                let idx = z * kanaele as usize + *kanal;
+                if idx < zellen.len() {
+                    zellen[idx] = *zelle;
+                }
+            }
+        }
+        patterns.push(jamcore::itwrite::Pattern {
+            zeilen,
+            kanaele,
+            zellen,
+        });
+    }
+    Ok((samples, patterns))
+}
+// ==== ENDE AUFNAHME-HELFER ================================================
+
+// ==== STROBO-FORMEL: reine Rechnung (auf dem Host pruefbar) ===============
+// Nur Zahlen — kein egui, keine Kamera. Zustand und Verdrahtung liegen im
+// `ImagePanel`; diese Helfer sind der Teil, den die Host-Probe ohne Android
+// ausfuehren kann (das Android-Crate baut nur mit `cargo ndk`).
+//
+// Die Formel (Nutzerwunsch, „Max-Formel"): Basis = Bildwiederholrate × 60
+// (Wiederholungen je Minute). Bei 30 Hz ist die Basis 1800 — je Frame läuft
+// das Bild genau einmal durch, also **Stillstand**. Der Versatz ± macht die
+// sichtbare Bewegung: 1800 + 120 = 1920/min = 32/s; bei 30 fps bleiben davon
+// 2/s übrig = 120 Durchläufe/Minute = einer je Beat bei 120 BPM.
+
+/// Anteil des neuen Werts, der je Frame in die geglättete Bildrate geht
+/// (exponentiell über die letzten Frames, damit die Anzeige nicht springt).
+const FPS_GLAETTUNG: f64 = 0.1;
+/// Brauchbare Frame-Dauer: ein Doppelaufruf im selben Frame (unter 1/240 s)
+/// und eine Pause (über 1/2 s, z. B. Tab war weg oder ein Hakler) sind kein
+/// Maß für die Bildrate und lassen den geglätteten Wert stehen.
+const FPS_DT_MIN: f64 = 1.0 / 240.0;
+const FPS_DT_MAX: f64 = 0.5;
+
+/// Ein Frame-Intervall in die geglättete Bildrate einrechnen (`fps ≈ 1/dt`).
+/// Der erste brauchbare Wert wird übernommen (0 = noch nichts gemessen).
+fn fps_glaetten(alt: f64, dt: f64) -> f64 {
+    if !(FPS_DT_MIN..=FPS_DT_MAX).contains(&dt) {
+        return alt;
+    }
+    let neu = 1.0 / dt;
+    if alt <= 0.0 {
+        neu
+    } else {
+        alt + (neu - alt) * FPS_GLAETTUNG
+    }
+}
+
+/// Basis der Formel: „auto" aus der gemessenen Bildrate des Bild-Panels oder
+/// fest 1800 (30 Hz) / 3600 (60 Hz).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StroboBasis {
+    Auto,
+    Hz30,
+    Hz60,
+}
+
+impl StroboBasis {
+    /// Beschriftung des Umschalters.
+    fn knopf(self) -> &'static str {
+        match self {
+            StroboBasis::Auto => "auto",
+            StroboBasis::Hz30 => "1800",
+            StroboBasis::Hz60 => "3600",
+        }
+    }
+
+    /// Woher die Basis kommt (Log): „auto" oder „fest".
+    fn quelle(self) -> &'static str {
+        match self {
+            StroboBasis::Auto => "auto",
+            _ => "fest",
+        }
+    }
+
+    /// Feste Basis in Wiederholungen je Minute (`None` bei „auto").
+    fn fest(self) -> Option<u32> {
+        match self {
+            StroboBasis::Auto => None,
+            StroboBasis::Hz30 => Some(1800),
+            StroboBasis::Hz60 => Some(3600),
+        }
+    }
+}
+
+/// Basis in Wiederholungen je Minute: „auto" = gemessene Bildrate × 60
+/// (gerundet), sonst der feste Wert.
+fn basis_je_minute(basis: StroboBasis, fps: f64) -> u32 {
+    match basis.fest() {
+        Some(wert) => wert,
+        None => (fps.max(0.0) * 60.0).round() as u32,
+    }
+}
+
+/// Die Rate der Formel: Basis + Versatz (Vorzeichen = Richtung).
+fn rate_je_minute(basis: u32, versatz: i32) -> f64 {
+    basis as f64 + versatz as f64
+}
+
+/// Anzeige der Basis: „Basis 1200 (20 fps × 60)" für „auto", „Basis 1800"
+/// für fest. Die fps stehen so genau da, wie sie in die Basis eingehen.
+fn basis_text(basis: StroboBasis, fps: f64) -> String {
+    match basis {
+        StroboBasis::Auto => format!(
+            "Basis {} ({} fps × 60)",
+            basis_je_minute(basis, fps),
+            kurz(fps.max(0.0))
+        ),
+        fest => format!("Basis {}", basis_je_minute(fest, fps)),
+    }
+}
+
+/// Zahl mit Komma, höchstens zwei Nachkommastellen, ohne Nullen am Ende.
+fn kurz(v: f64) -> String {
+    format!("{v:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .replace('.', ",")
+}
+
+/// Ergebnis der Formel: „1920/min → 120 Durchläufe/Minute → 1 pro Beat bei
+/// 120 BPM"; bei Versatz 0 „Stillstand". Die Durchläufe sind die **sichtbare**
+/// Bewegung: die Basis ist der Stillstand (ein Durchlauf je Frame), sichtbar
+/// bleibt der Versatz.
+fn formel_text(basis: u32, versatz: i32, bpm: f32) -> String {
+    if versatz == 0 {
+        return "Stillstand".to_string();
+    }
+    let bpm = if bpm.is_finite() && bpm > 0.0 {
+        bpm as f64
+    } else {
+        120.0
+    };
+    let richtung = if versatz < 0 { " rückwärts" } else { "" };
+    format!(
+        "{:.0}/min → {} Durchläufe/Minute{} → {} pro Beat bei {:.0} BPM",
+        rate_je_minute(basis, versatz),
+        versatz.abs(),
+        richtung,
+        kurz(versatz.abs() as f64 / bpm),
+        bpm
+    )
+}
+// ==== ENDE STROBO-FORMEL ==================================================
+
 pub struct ImagePanel {
     texture: Option<egui::TextureHandle>,
     textur_masse: (usize, usize),
@@ -324,6 +779,17 @@ pub struct ImagePanel {
     strobo_letzte_zeit: std::time::Instant,
     /// Versatz der Ansicht in Pixeln (je Frame einmal gerechnet).
     strobo_versatz_px: i32,
+    /// Stroboskop-Formel (Max-Formel) an: Rate = Basis + Versatz in
+    /// Wiederholungen je Minute statt Umdrehungen/Takte je Zyklus.
+    strobo_formel: bool,
+    /// Basis der Formel: „auto" aus der gemessenen Bildrate, sonst fest.
+    strobo_basis: StroboBasis,
+    /// Versatz in Wiederholungen je Minute (±300, 0 = Stillstand).
+    strobo_versatz: i32,
+    /// Fortgeschriebener Versatz in Bildbreiten (nur Formel-Modus).
+    strobo_versatz_breiten: f64,
+    /// Geglättete Bildrate des Bild-Panels (fps ≈ 1/dt) für die Basis „auto".
+    strobo_fps: f64,
     /// Spiral-Scan (Desktop: Shift+F8): statt der Sweep-Spalte wird die Zelle
     /// am Spiralpunkt gelesen, die Tonhöhe kommt aus dem **Radius**
     /// (jamcore::spirale, Patch `spiralobpm`/`Matrizenleser_Spiral_archimedisch`).
@@ -387,6 +853,25 @@ pub struct ImagePanel {
     linienton_noten: Vec<i32>,
     /// Zuletzt protokollierte Harmonie (Band-Index) des Linien-/Bereichstons.
     harm_log: Option<usize>,
+    /// Eigener x-Bereich des Oszillator-„Bereich"-Modus (Anteile 0…1) —
+    /// **unabhängig** vom geteilten Scan-/Kreis-Bereich (`x_bereich`);
+    /// Nutzerentscheidung „A" (2026-10-18). Vorgabe: das ganze Bild.
+    oszi_bereich: (f32, f32),
+    /// Aufnahme („Rec"): das Raster fortlaufend als `.it` schreiben.
+    rec_an: bool,
+    /// „anhängen" (`true`) oder „ersetzen" (`false`): was mit dem Pattern in
+    /// der Zieldatei passiert.
+    rec_anhaengen: bool,
+    /// Zieldatei der Aufnahme (beim Einschalten bestimmt).
+    rec_pfad: Option<String>,
+    /// Samples der Zieldatei — sie bleiben in beiden Modi erhalten.
+    rec_samples: Vec<jamcore::itwrite::Sample>,
+    /// Patterns der Zieldatei (Grundlage für „anhängen").
+    rec_patterns: Vec<jamcore::itwrite::Pattern>,
+    /// Zeitpunkt des letzten Schreibens (für den ~2-s-Takt).
+    rec_letzte: std::time::Instant,
+    /// So viele Patterns hat diese Aufnahme geschrieben.
+    rec_geschrieben: u64,
 }
 
 impl Default for ImagePanel {
@@ -457,6 +942,13 @@ impl ImagePanel {
             strobo_takte_seit_start: 0.0,
             strobo_letzte_zeit: std::time::Instant::now(),
             strobo_versatz_px: 0,
+            strobo_formel: false,
+            // „auto" wie der Nutzerwunsch: die Basis kommt aus der gemessenen
+            // Bildrate des Panels; 1800/3600 sind die festen Umschalter.
+            strobo_basis: StroboBasis::Auto,
+            strobo_versatz: 0,
+            strobo_versatz_breiten: 0.0,
+            strobo_fps: 0.0,
             spirale_an: false,
             spirale: Spirale::neu(Familie::Archimedes),
             // Wie der Linien-Scan: Note 0…36 aus dem Radius plus Grundton 36.
@@ -490,6 +982,14 @@ impl ImagePanel {
             linienton_an: false,
             linienton_noten: Vec::new(),
             harm_log: None,
+            oszi_bereich: (0.0, 1.0),
+            rec_an: false,
+            rec_anhaengen: false,
+            rec_pfad: None,
+            rec_samples: Vec::new(),
+            rec_patterns: Vec::new(),
+            rec_letzte: std::time::Instant::now(),
+            rec_geschrieben: 0,
         }
     }
 
@@ -985,6 +1485,44 @@ impl ImagePanel {
         self.scan_rechts = v.max(b);
     }
 
+    /// Der **eigene** x-Bereich des Oszillator-Scans (Anteile 0..1), geklemmt
+    /// und in Ordnung gebracht; unbrauchbare Werte werden zum ganzen Bild.
+    /// Er ist vom geteilten Scan-/Kreis-Bereich ([`Self::x_bereich`])
+    /// unabhängig — Nutzerentscheidung „A" (2026-10-18).
+    fn oszi_bereich_geklemmt(&self) -> (f32, f32) {
+        let (von, bis) = self.oszi_bereich;
+        if !(von.is_finite() && bis.is_finite()) {
+            return (0.0, 1.0);
+        }
+        let (von, bis) = (von.clamp(0.0, 1.0), bis.clamp(0.0, 1.0));
+        (von.min(bis), von.max(bis))
+    }
+
+    /// Den eigenen Oszillator-Bereich setzen (Anteile 0..1) und protokollieren.
+    /// Quelle sind die beiden Fader der Bereich-Zeile bzw. die Knöpfe
+    /// „ganzes Bild" und „vom Scan übernehmen".
+    fn setze_oszi_bereich(&mut self, von: f32, bis: f32) {
+        let (von, bis) = (
+            if von.is_finite() { von } else { 0.0 },
+            if bis.is_finite() { bis } else { 1.0 },
+        );
+        self.oszi_bereich = (von.min(bis).clamp(0.0, 1.0), von.max(bis).clamp(0.0, 1.0));
+        self.oszi_bereich_log();
+    }
+
+    /// Status/Log des eigenen Oszillator-Bereichs:
+    /// „bild: Oszillator-Bereich 20-80 %".
+    fn oszi_bereich_log(&mut self) {
+        let (von, bis) = self.oszi_bereich_geklemmt();
+        let text = format!(
+            "Oszillator-Bereich {:.0}-{:.0} %",
+            von * 100.0,
+            bis * 100.0
+        );
+        log::info!("bild: {text}");
+        self.status = text;
+    }
+
     /// Pfad einer Austauschdatei im App-Ordner (KeyEventRender.txt, Snapshot …).
     fn app_datei(&self, name: &str) -> Option<std::path::PathBuf> {
         let app = crate::current_app().ok()?;
@@ -1064,6 +1602,188 @@ impl ImagePanel {
         }
     }
 
+    // ==== AUFNAHME („Rec"): das Raster fortlaufend in eine .it schreiben ====
+
+    /// Ziel-Datei der Aufnahme: der Pfad des letzten Slicer-Exports
+    /// ([`crate::slicer::letzter_export`]), sonst eine neue Datei
+    /// `<App-Ordner>/module/aufnahme.it`.
+    fn rec_zielpfad(&self) -> Result<String, String> {
+        if let Some(pfad) = crate::slicer::letzter_export() {
+            return Ok(pfad);
+        }
+        let app = crate::current_app()?;
+        let basis = crate::insets::external_files_dir(&app)
+            .ok_or_else(|| "kein App-Verzeichnis".to_string())?;
+        let ordner = std::path::PathBuf::from(basis).join("module");
+        std::fs::create_dir_all(&ordner).map_err(|e| format!("{}: {e}", ordner.display()))?;
+        Ok(ordner.join(REC_DATEI).display().to_string())
+    }
+
+    /// Neue Datei: die Slices aus dem Slicer als Samples übernehmen (Namen +
+    /// PCM, 16 Bit, `c5speed` = Abtastrate) — die Aufnahme klingt dann mit
+    /// denselben Slice-Klängen, die das Rhythmus-Raster spielt. Ohne Slices im
+    /// Slicer bleibt die Aufnahme eine reine Pattern-Datei.
+    fn rec_samples_vom_slicer(&mut self, pfad: &str) {
+        match crate::slicer::slices_fuer_it() {
+            Some((rate, slices)) => {
+                self.rec_samples = slices
+                    .into_iter()
+                    .map(|(name, daten)| jamcore::itwrite::Sample {
+                        name,
+                        daten,
+                        rate,
+                        c5speed: rate,
+                    })
+                    .collect();
+                log::info!(
+                    "bild: Rec neue Datei {pfad} ({} Slices vom Slicer als Samples, {rate} Hz)",
+                    self.rec_samples.len()
+                );
+            }
+            None => {
+                log::info!("bild: Rec neue Datei {pfad} (ohne Samples - kein Audio im Slicer)");
+            }
+        }
+    }
+
+    /// „anhaengen" / „ersetzen" für Log und Status (Logs sind ASCII).
+    fn rec_modus_text(&self) -> &'static str {
+        if self.rec_anhaengen {
+            "anhaengen"
+        } else {
+            "ersetzen"
+        }
+    }
+
+    /// Aufnahme einschalten: Zieldatei bestimmen, vorhandene Samples und
+    /// Patterns lesen (sie bleiben erhalten) und den Takt aufziehen.
+    fn rec_ein(&mut self) {
+        let pfad = match self.rec_zielpfad() {
+            Ok(pfad) => pfad,
+            Err(e) => {
+                self.status = format!("Rec: {e}");
+                log::warn!("bild: Rec nicht moeglich: {e}");
+                return;
+            }
+        };
+        self.rec_samples.clear();
+        self.rec_patterns.clear();
+        self.rec_geschrieben = 0;
+        match std::fs::read(&pfad) {
+            // Neue (oder leere) Datei: es gibt nichts zu erben — die Slices
+            // des Slicers werden zu ihren Samples.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.rec_samples_vom_slicer(&pfad);
+            }
+            Ok(daten) if daten.is_empty() => {
+                self.rec_samples_vom_slicer(&pfad);
+            }
+            Ok(daten) => match it_lesen(&daten) {
+                Ok((samples, patterns)) => {
+                    self.rec_samples = samples;
+                    self.rec_patterns = patterns;
+                    log::info!(
+                        "bild: Rec Datei gelesen ({} Samples, {} Patterns)",
+                        self.rec_samples.len(),
+                        self.rec_patterns.len()
+                    );
+                }
+                Err(e) => {
+                    // Nichts überschreiben, was wir nicht verstehen.
+                    self.status = format!("Rec: Datei nicht lesbar ({e})");
+                    log::warn!("bild: Rec abgebrochen — {e} ({pfad})");
+                    return;
+                }
+            },
+            Err(e) => {
+                self.status = format!("Rec: Datei-Fehler: {e}");
+                log::warn!("bild: Rec abgebrochen: {e} ({pfad})");
+                return;
+            }
+        }
+        self.rec_pfad = Some(pfad.clone());
+        self.rec_an = true;
+        // Der erste Durchlauf soll sofort schreiben (nicht erst nach
+        // [`REC_MINDEST_ABSTAND`]) — sonst bliebe ein kurzer Versuch leer.
+        self.rec_letzte = std::time::Instant::now() - REC_MINDEST_ABSTAND;
+        log::info!("bild: Rec an ({} -> {pfad})", self.rec_modus_text());
+        self.status = format!("Rec an ({} -> {})", self.rec_modus_text(), kurzname(&pfad));
+    }
+
+    /// Aufnahme ausschalten — die Datei bleibt, wie sie zuletzt geschrieben
+    /// wurde.
+    fn rec_aus(&mut self) {
+        self.rec_an = false;
+        self.rec_pfad = None;
+        self.rec_samples.clear();
+        self.rec_patterns.clear();
+        log::info!("bild: Rec aus");
+        self.status = "Rec aus".to_string();
+    }
+
+    /// Aufnahme-Takt: läuft ein Durchlauf länger als [`REC_ABSTAND`], wird auch
+    /// **mitten im** Durchlauf geschrieben; das Durchlauf-Ende meldet der Scan
+    /// selbst (siehe `scan_schritt`/`spiral_schritt`).
+    fn rec_takt(&mut self, pattern: &Pattern) {
+        if self.rec_an && self.scan_an && self.rec_letzte.elapsed() >= REC_ABSTAND {
+            self.rec_schreiben(pattern);
+        }
+    }
+
+    /// Ein Pattern-Durchlauf ist zu Ende: die Aufnahme schreibt das Raster.
+    /// Zwischen zwei Schreibvorgängen liegt mindestens
+    /// [`REC_MINDEST_ABSTAND`] — ein sehr kurzer Sweep (Vorgabe: 1/4 Takt)
+    /// würde sonst viele Male in der Sekunde dieselbe Datei schreiben.
+    fn rec_durchlauf_ende(&mut self, pattern: &Pattern) {
+        if self.rec_an && self.rec_letzte.elapsed() >= REC_MINDEST_ABSTAND {
+            self.rec_schreiben(pattern);
+        }
+    }
+
+    /// Das aktuelle Raster als IT-Pattern in die Zieldatei schreiben.
+    ///
+    /// „ersetzen" schreibt **ein** Pattern (die Samples der Datei bleiben),
+    /// „anhängen" hängt das neue Pattern hinten an die vorhandenen. Der Writer
+    /// schreibt immer die ganze Datei; Samples und Patterns kommen deshalb aus
+    /// dem Zustand, der beim Einschalten gelesen wurde.
+    fn rec_schreiben(&mut self, pattern: &Pattern) {
+        let Some(pfad) = self.rec_pfad.clone() else {
+            return;
+        };
+        self.rec_letzte = std::time::Instant::now();
+        let mut patterns = if self.rec_anhaengen {
+            self.rec_patterns.clone()
+        } else {
+            Vec::new()
+        };
+        patterns.push(it_pattern_aus_raster(pattern, self.rec_samples.len()));
+        let titel = std::path::Path::new(&pfad)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Aufnahme".to_string());
+        let takte = rec_takte_text(pattern.steps_per_cycle());
+        let ergebnis = jamcore::itwrite::bytes_mit_patterns(&self.rec_samples, &patterns, &titel)
+            .and_then(|daten| std::fs::write(&pfad, daten).map_err(|e| format!("{e} ({pfad})")));
+        match ergebnis {
+            Ok(()) => {
+                self.rec_patterns = patterns;
+                self.rec_geschrieben += 1;
+                log::info!(
+                    "bild: Pattern {} geschrieben ({takte})",
+                    self.rec_patterns.len()
+                );
+                self.status = format!(
+                    "Rec: Pattern {} geschrieben ({takte})",
+                    self.rec_patterns.len()
+                );
+            }
+            Err(e) => {
+                log::warn!("bild: Rec-Fehler: {e}");
+                self.status = format!("Rec-Fehler: {e}");
+            }
+        }
+    }
+
     /// Pattern aus dem gewählten Abschnitt der X-Auflösung: Start- und Endpunkt
     /// bestimmen, welcher Teil des Bildes ins Pattern kommt (und damit dessen
     /// Länge). Wird im Tagebuch für den Export gebraucht.
@@ -1102,20 +1822,38 @@ impl ImagePanel {
         self.strobo_an && kasten.x_range().contains(pos.x) && bild_rect.y_range().contains(pos.y)
     }
 
-    /// Stroboskop-Versatz fortschreiben (je Frame einmal): Takte laufen mit dem
-    /// Scan-Tempo, der Versatz kommt aus der Lissajous-Phase (endlos, Richtung).
+    /// Stroboskop-Versatz fortschreiben (je Frame einmal).
+    ///
+    /// Klassisch: Takte laufen mit dem Scan-Tempo, der Versatz kommt aus der
+    /// Lissajous-Phase (endlos, Richtung). Formel-Modus (Max-Formel): der
+    /// Versatz läuft **zeitbasiert** mit `Basis + Versatz` Wiederholungen je
+    /// Minute — `rate/60` Bildbreiten je Sekunde, Vorzeichen = Richtung.
+    ///
+    /// Nebenbei wird die Bildrate des Panels gemessen (`fps ≈ 1/dt`,
+    /// geglättet): die Basis „auto" ist `fps · 60`, denn ein Durchlauf je
+    /// Frame ist der Stillstand.
     fn strobo_schritt(&mut self) {
+        let jetzt = std::time::Instant::now();
+        let roh_dt = jetzt.duration_since(self.strobo_letzte_zeit).as_secs_f64();
+        self.strobo_letzte_zeit = jetzt;
+        // Auch ohne Stroboskop messen, damit „auto" beim Einschalten steht.
+        self.strobo_fps = fps_glaetten(self.strobo_fps, roh_dt);
         if !self.strobo_an {
             self.strobo_versatz_px = 0;
-            self.strobo_letzte_zeit = std::time::Instant::now();
             return;
         }
-        let jetzt = std::time::Instant::now();
-        let dt = jetzt
-            .duration_since(self.strobo_letzte_zeit)
-            .as_secs_f64()
-            .min(0.25);
-        self.strobo_letzte_zeit = jetzt;
+        let dt = roh_dt.min(0.25);
+        if self.strobo_formel {
+            let rate = rate_je_minute(self.strobo_basiswert(), self.strobo_versatz);
+            // In Breiten fortschreiben und gleich in 0…1 halten (kein
+            // Genauigkeitsverlust nach Stunden); der Pixelversatz folgt daraus.
+            self.strobo_versatz_breiten =
+                (self.strobo_versatz_breiten + rate / 60.0 * dt).rem_euclid(1.0);
+            let (w, _) = self.textur_masse;
+            self.strobo_versatz_px =
+                jamcore::stroboskop::versatz_pixel(self.strobo_versatz_breiten, w as i32);
+            return;
+        }
         self.strobo_takte_seit_start += dt * self.scan_bpm.max(1.0) as f64 / 60.0;
         let anteil = jamcore::stroboskop::versatz_anteil(
             self.strobo_takte_seit_start,
@@ -1125,6 +1863,39 @@ impl ImagePanel {
         );
         let (w, _) = self.textur_masse;
         self.strobo_versatz_px = jamcore::stroboskop::versatz_pixel(anteil, w as i32);
+    }
+
+    /// Die gerade wirksame Basis der Formel in Wiederholungen je Minute.
+    fn strobo_basiswert(&self) -> u32 {
+        basis_je_minute(self.strobo_basis, self.strobo_fps)
+    }
+
+    /// Formel-Modus umschalten. Beim Ein-/Ausschalten wird der aktuelle Versatz
+    /// übernommen, damit das Bild nicht springt; der klassische Takt-Weg bleibt
+    /// unberührt (er gilt nur, wenn die Formel aus ist).
+    fn strobo_formel_umschalten(&mut self) {
+        self.strobo_formel = !self.strobo_formel;
+        if self.strobo_formel {
+            // Der Pixelversatz von jetzt ist der Startwert in Bildbreiten.
+            let (w, _) = self.textur_masse;
+            self.strobo_versatz_breiten = if w > 0 {
+                self.strobo_versatz_px as f64 / w as f64
+            } else {
+                0.0
+            };
+            let basis = self.strobo_basiswert();
+            log::info!(
+                "bild: Stroboskop-Formel an (Basis {basis} {}, Versatz {} -> {:.0}/min)",
+                self.strobo_basis.quelle(),
+                self.strobo_versatz,
+                rate_je_minute(basis, self.strobo_versatz)
+            );
+        } else {
+            // Zurück in den Takt-Weg: die Phase übernehmen (kein Sprung).
+            self.strobo_takte_seit_start =
+                self.strobo_takte_fuer_anteil(self.strobo_versatz_breiten);
+            log::info!("bild: Stroboskop-Formel aus");
+        }
     }
 
     /// Ein Sweep-Schritt: Spalten scannen, Treffer als OSC-Noten senden.
@@ -1337,6 +2108,8 @@ impl ImagePanel {
                 self.sweep_doppelt = 0;
                 self.scan_puffer = None;
                 self.scan_x = 0;
+                // Durchlauf-Ende: die Aufnahme schreibt jetzt (Nutzerwunsch).
+                self.rec_durchlauf_ende(&*pattern);
             } else {
                 self.scan_x = naechster;
             }
@@ -1504,6 +2277,8 @@ impl ImagePanel {
             self.scan_puffer = None;
             self.spirale.phi = 0.0;
             self.spirale_letzter = None;
+            // Durchlauf-Ende: die Aufnahme schreibt jetzt (Nutzerwunsch).
+            self.rec_durchlauf_ende(&*pattern);
         } else {
             self.spirale_letzter = Some((px, py));
         }
@@ -1550,7 +2325,10 @@ impl ImagePanel {
             }
             ui.label(&self.status);
         });
-        ui.horizontal(|ui| {
+        // Umbricht statt abzuschneiden: die Zeile ist voll (Scan, Ton,
+        // Noten-Modus, Sweep-Zähler, ins Pattern, Rec, Snapshot) und passt im
+        // Hochformat sonst nicht mehr aufs Bild.
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .button(if self.scan_an { "Scan aus" } else { "Scan an" })
                 .clicked()
@@ -1600,6 +2378,47 @@ impl ImagePanel {
             ui.checkbox(&mut self.scan_aufnahme, "ins Pattern");
             if self.scan_aufnahme {
                 ui.label(format!("aufgenommen: {}", self.aufgenommen));
+            }
+            // Aufnahme: das laufende Raster fortlaufend in eine .it schreiben
+            // (Nutzerwunsch 2026-10-18).
+            if ui.selectable_label(self.rec_an, "Rec").clicked() {
+                if self.rec_an {
+                    self.rec_aus();
+                } else {
+                    self.rec_ein();
+                }
+            }
+            if self.rec_an {
+                if ui
+                    .selectable_label(self.rec_anhaengen, "anhängen")
+                    .clicked()
+                    && !self.rec_anhaengen
+                {
+                    self.rec_anhaengen = true;
+                    log::info!("bild: Rec Modus anhaengen");
+                    self.status = "Rec: anhängen".to_string();
+                }
+                if ui
+                    .selectable_label(!self.rec_anhaengen, "ersetzen")
+                    .clicked()
+                    && self.rec_anhaengen
+                {
+                    self.rec_anhaengen = false;
+                    log::info!("bild: Rec Modus ersetzen");
+                    self.status = "Rec: ersetzen".to_string();
+                }
+                if let Some(pfad) = self.rec_pfad.as_deref() {
+                    ui.label(
+                        egui::RichText::new(kurzname(pfad))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
+                ui.label(
+                    egui::RichText::new(format!("{}× geschrieben", self.rec_geschrieben))
+                        .small()
+                        .color(Color32::GRAY),
+                );
             }
             if ui.button("Snapshot").clicked() {
                 self.snapshot_sichern();
@@ -1714,6 +2533,9 @@ impl ImagePanel {
         self.textur_aktualisieren(ui.ctx());
         self.scan_schritt(ui.ctx(), pattern);
         self.linien_schritt();
+        // Aufnahme: läuft der Durchlauf länger als ~2 s, zwischendurch
+        // schreiben (das Ende schreibt der Scan selbst).
+        self.rec_takt(&*pattern);
         self.bild_zeichnen(ui, platz, flaeche, schritte, true);
 
         let basis = ui.min_rect().min;
@@ -1828,6 +2650,9 @@ impl ImagePanel {
 
         self.scan_schritt(ui.ctx(), pattern);
         self.linien_schritt();
+        // Aufnahme: läuft der Durchlauf länger als ~2 s, zwischendurch
+        // schreiben (das Ende schreibt der Scan selbst).
+        self.rec_takt(&*pattern);
 
         // Im Querformat liegt das Bild links und die Steuerung rechts in zwei
         // Spalten — untereinander wuerde die GUI die Hoehe fressen und das Bild
@@ -1890,7 +2715,10 @@ impl ImagePanel {
         }
     }
 
-    /// Stroboskop-Ansicht: an/aus, Richtung und Rate (wie im Lissa-Tab).
+    /// Stroboskop-Ansicht: an/aus, dann entweder die klassischen Regler
+    /// (Richtung, Umdrehungen und Takte je Zyklus) oder die **Formel**
+    /// (Basis aus der gemessenen Bildrate + Versatz in Wiederholungen je
+    /// Minute). Bild und B2 rufen dieselbe Zeile.
     fn zeile_stroboskop(&mut self, ui: &mut egui::Ui) {
         ui.horizontal_wrapped(|ui| {
             if ui.selectable_label(self.strobo_an, "Stroboskop").clicked() {
@@ -1902,59 +2730,116 @@ impl ImagePanel {
                     if self.strobo_an { "an" } else { "aus" }
                 );
             }
-            if self.strobo_an {
-                // Parameterwechsel halten die Phase (sonst springt das Bild).
-                if ui.selectable_label(!self.strobo_rechts, "◀").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_rechts = false;
-                }
-                if ui.selectable_label(self.strobo_rechts, "▶").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_rechts = true;
-                }
-                if ui.small_button("÷2").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_umdrehungen =
-                        jamcore::lissa::teile_umdrehungen(self.strobo_umdrehungen, 2.0);
-                }
-                if ui.small_button("×2").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_umdrehungen =
-                        jamcore::lissa::vielfache_umdrehungen(self.strobo_umdrehungen, 2.0);
-                }
-                if ui.small_button("÷3").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_umdrehungen =
-                        jamcore::lissa::teile_umdrehungen(self.strobo_umdrehungen, 3.0);
-                }
-                if ui.small_button("×3").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_umdrehungen =
-                        jamcore::lissa::vielfache_umdrehungen(self.strobo_umdrehungen, 3.0);
-                }
-                ui.label(format!(
-                    "{} / {}",
-                    jamcore::lissa::text_umdrehungen(self.strobo_umdrehungen),
-                    jamcore::takte::text(self.strobo_takte)
-                ));
-                if ui.small_button("÷2 Takt").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_takte = jamcore::takte::teile(self.strobo_takte, 2.0);
-                }
-                if ui.small_button("×2 Takt").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_takte = jamcore::takte::vielfache(self.strobo_takte, 2.0);
-                }
-                if ui.small_button("÷3 Takt").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_takte = jamcore::takte::teile(self.strobo_takte, 3.0);
-                }
-                if ui.small_button("×3 Takt").clicked() {
-                    self.strobo_phase_erhalten();
-                    self.strobo_takte = jamcore::takte::vielfache(self.strobo_takte, 3.0);
-                }
+            if !self.strobo_an {
+                return;
+            }
+            // Formel-Modus (Max-Formel): Basis + Versatz statt Umdrehungen und
+            // Takten je Zyklus. Aus = alles wie bisher (klassischer Weg).
+            if ui.selectable_label(self.strobo_formel, "Formel").clicked() {
+                self.strobo_formel_umschalten();
+            }
+            if self.strobo_formel {
+                self.regler_formel(ui);
+                return;
+            }
+            // Parameterwechsel halten die Phase (sonst springt das Bild).
+            if ui.selectable_label(!self.strobo_rechts, "◀").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_rechts = false;
+            }
+            if ui.selectable_label(self.strobo_rechts, "▶").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_rechts = true;
+            }
+            if ui.small_button("÷2").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_umdrehungen =
+                    jamcore::lissa::teile_umdrehungen(self.strobo_umdrehungen, 2.0);
+            }
+            if ui.small_button("×2").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_umdrehungen =
+                    jamcore::lissa::vielfache_umdrehungen(self.strobo_umdrehungen, 2.0);
+            }
+            if ui.small_button("÷3").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_umdrehungen =
+                    jamcore::lissa::teile_umdrehungen(self.strobo_umdrehungen, 3.0);
+            }
+            if ui.small_button("×3").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_umdrehungen =
+                    jamcore::lissa::vielfache_umdrehungen(self.strobo_umdrehungen, 3.0);
+            }
+            ui.label(format!(
+                "{} / {}",
+                jamcore::lissa::text_umdrehungen(self.strobo_umdrehungen),
+                jamcore::takte::text(self.strobo_takte)
+            ));
+            if ui.small_button("÷2 Takt").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_takte = jamcore::takte::teile(self.strobo_takte, 2.0);
+            }
+            if ui.small_button("×2 Takt").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_takte = jamcore::takte::vielfache(self.strobo_takte, 2.0);
+            }
+            if ui.small_button("÷3 Takt").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_takte = jamcore::takte::teile(self.strobo_takte, 3.0);
+            }
+            if ui.small_button("×3 Takt").clicked() {
+                self.strobo_phase_erhalten();
+                self.strobo_takte = jamcore::takte::vielfache(self.strobo_takte, 3.0);
             }
         });
+    }
+
+    /// Regler der Stroboskop-Formel: Basis („auto" aus der gemessenen
+    /// Bildrate, sonst fest 1800/3600) und Versatz ± in Wiederholungen je
+    /// Minute, darunter Basis- und Ergebnisanzeige.
+    fn regler_formel(&mut self, ui: &mut egui::Ui) {
+        for basis in [StroboBasis::Auto, StroboBasis::Hz30, StroboBasis::Hz60] {
+            if ui
+                .selectable_label(self.strobo_basis == basis, basis.knopf())
+                .clicked()
+                && self.strobo_basis != basis
+            {
+                self.strobo_basis = basis;
+                log::info!(
+                    "bild: Stroboskop-Basis {}",
+                    match basis.fest() {
+                        Some(wert) => wert.to_string(),
+                        None => format!("auto ({})", self.strobo_basiswert()),
+                    }
+                );
+            }
+        }
+        ui.label(
+            egui::RichText::new(basis_text(self.strobo_basis, self.strobo_fps))
+                .small()
+                .color(Color32::GRAY),
+        );
+        // Versatz: 0 = Stillstand, ± = Richtung (Wiederholungen je Minute).
+        ui.label("Versatz");
+        if ui
+            .add(
+                egui::DragValue::new(&mut self.strobo_versatz)
+                    .range(-300..=300)
+                    .suffix("/min"),
+            )
+            .changed()
+        {
+            log::info!("bild: Stroboskop-Versatz {}", self.strobo_versatz);
+        }
+        ui.label(
+            egui::RichText::new(formel_text(
+                self.strobo_basiswert(),
+                self.strobo_versatz,
+                self.scan_bpm,
+            ))
+            .small(),
+        );
     }
 
     /// Spiral-Scan (Desktop: Shift+F8): an/aus, Familie, Schrittweite ÷2/×2
@@ -2156,6 +3041,57 @@ impl ImagePanel {
                 self.bereich_maske = false;
                 self.bereich_log();
             }
+        });
+        // Eigener x-Bereich des Durchlaufs (Nutzerentscheidung „A", 2026-10-18):
+        // er ist **unabhängig** vom geteilten Scan-/Kreis-Bereich — der Sweep
+        // liest diesen Wert, nicht mehr `x_bereich()`.
+        ui.horizontal_wrapped(|ui| {
+            let (von, bis) = self.oszi_bereich_geklemmt();
+            let mut prozent_von = (von * 100.0).round();
+            let mut prozent_bis = (bis * 100.0).round();
+            ui.label("x von");
+            let a = ui.add(
+                egui::DragValue::new(&mut prozent_von)
+                    .range(0.0..=100.0)
+                    .suffix(" %"),
+            );
+            ui.label("x bis");
+            let b = ui.add(
+                egui::DragValue::new(&mut prozent_bis)
+                    .range(0.0..=100.0)
+                    .suffix(" %"),
+            );
+            if a.changed() || b.changed() {
+                // Die Grenzen laufen nicht übereinander: „von" bleibt unter
+                // „bis" (und umgekehrt), sonst gäbe es keinen Bereich.
+                let (von, bis) = if a.changed() {
+                    (prozent_von.min(prozent_bis), prozent_bis)
+                } else {
+                    (prozent_von, prozent_bis.max(prozent_von))
+                };
+                self.setze_oszi_bereich(von / 100.0, bis / 100.0);
+            }
+            if ui.button("ganzes Bild").clicked() {
+                self.setze_oszi_bereich(0.0, 1.0);
+            }
+            if ui.button("vom Scan übernehmen").clicked() {
+                // Einmalig kopieren (der geteilte Bereich bleibt unberührt):
+                // die beiden Fader sind danach wieder frei.
+                let (von, bis) = self.x_bereich();
+                self.oszi_bereich = (von, bis);
+                log::info!("bild: Oszillator-Bereich vom Scan uebernommen");
+                self.status = format!(
+                    "Oszillator-Bereich vom Scan uebernommen ({:.0}-{:.0} %)",
+                    von * 100.0,
+                    bis * 100.0
+                );
+            }
+            let (von, bis) = self.oszi_bereich_geklemmt();
+            ui.label(
+                egui::RichText::new(format!("x {:.0}–{:.0} %", von * 100.0, bis * 100.0))
+                    .small()
+                    .color(Color32::GRAY),
+            );
         });
     }
 
@@ -2387,7 +3323,9 @@ impl ImagePanel {
         // Welche Bildspalten klingen? Linie: eine; Bereich-Sweep: die Spalte
         // der Durchlaufposition; „alle": die Spalten des Bereichs (gedeckelt).
         // Stroboskop: gelesen wird die Quellspalte hinter der Ansicht.
-        let (von, bis) = self.bereich();
+        // Der Bereich ist der **eigene** Oszillator-Bereich (nicht der
+        // geteilte Scan-/Kreis-Bereich) — Nutzerentscheidung „A", 2026-10-18.
+        let (von, bis) = self.oszi_bereich_geklemmt();
         let mut spalten: Vec<(i32, f32)> = Vec::new();
         if self.linie_an {
             let ansicht = (self.linie_x.clamp(0.0, 1.0) * wi as f32).floor() as i32;
@@ -2470,6 +3408,15 @@ impl ImagePanel {
         }
     }
 
+    /// „Takte seit Start" so setzen, dass der Versatz `anteil` (0…1)
+    /// herauskommt — die Umkehrung von `versatz_anteil` (wie in
+    /// [`Self::strobo_phase_erhalten`]).
+    fn strobo_takte_fuer_anteil(&self, anteil: f64) -> f64 {
+        let vorzeichen = if self.strobo_rechts { 1.0 } else { -1.0 };
+        vorzeichen * anteil.rem_euclid(1.0) * self.strobo_takte
+            / self.strobo_umdrehungen.max(1e-9)
+    }
+
     /// Aktuellen Versatz in „Takte seit Start" umrechnen, damit ein
     /// Parameterwechsel (Richtung, Umdrehungen, Zyklus) die Phase hält.
     fn strobo_phase_erhalten(&mut self) {
@@ -2482,9 +3429,7 @@ impl ImagePanel {
             self.strobo_umdrehungen,
             self.strobo_rechts,
         );
-        let vorzeichen = if self.strobo_rechts { 1.0 } else { -1.0 };
-        self.strobo_takte_seit_start =
-            vorzeichen * anteil * self.strobo_takte / self.strobo_umdrehungen.max(1e-9);
+        self.strobo_takte_seit_start = self.strobo_takte_fuer_anteil(anteil);
     }
 
     /// Alle Regler unterhalb des Bildes (Hochformat, eine Spalte).
@@ -3132,7 +4077,8 @@ impl ImagePanel {
                 senkrecht(self.linie_x, gelb, 1.5);
             }
             if self.bereich_an {
-                let (von, bis) = self.bereich();
+                // Grenzen und Cursor des **eigenen** Oszillator-Bereichs.
+                let (von, bis) = self.oszi_bereich_geklemmt();
                 senkrecht(von, grau, 1.0);
                 senkrecht(bis, grau, 1.0);
                 if matches!(self.bereich_durchlauf, Durchlauf::Sweep) {
@@ -3401,5 +4347,69 @@ mod tests {
         }
         let aussen = jamcore::spirale::note_aus_radius(s.radius(640.0, 480.0), max, 36, 36);
         assert!(aussen > innen, "aussen hoeher: {innen} -> {aussen}");
+    }
+
+    #[test]
+    fn formel_basis_und_rate() {
+        // 30 Hz → 1800, 60 Hz → 3600; „auto" ist die gemessene Bildrate × 60,
+        // gerundet (Stillstand = ein Durchlauf je Frame).
+        assert_eq!(basis_je_minute(StroboBasis::Hz30, 20.0), 1800);
+        assert_eq!(basis_je_minute(StroboBasis::Hz60, 20.0), 3600);
+        assert_eq!(basis_je_minute(StroboBasis::Auto, 20.0), 1200);
+        assert_eq!(basis_je_minute(StroboBasis::Auto, 29.6), 1776, "gerundet");
+        assert_eq!(basis_je_minute(StroboBasis::Auto, 0.0), 0, "noch nichts gemessen");
+        // Der Versatz verschiebt die Rate in beide Richtungen.
+        assert_eq!(rate_je_minute(1800, 120), 1920.0);
+        assert_eq!(rate_je_minute(1800, -120), 1680.0);
+    }
+
+    #[test]
+    fn formel_text_rechnet_durchlaeufe_und_beats() {
+        // Der Nutzerwunsch-Fall: Basis 1800 (30 Hz) + 120 = 1920/min; sichtbar
+        // bleiben 120 Durchläufe/Minute = einer je Beat bei 120 BPM.
+        assert_eq!(
+            formel_text(1800, 120, 120.0),
+            "1920/min → 120 Durchläufe/Minute → 1 pro Beat bei 120 BPM"
+        );
+        assert_eq!(
+            formel_text(1800, -120, 120.0),
+            "1680/min → 120 Durchläufe/Minute rückwärts → 1 pro Beat bei 120 BPM"
+        );
+        assert_eq!(formel_text(1200, 0, 120.0), "Stillstand");
+        // Auto-Basis aus 20 fps: 1200 + 60 = 1260/min = 60/Minute = 0,5 je Beat.
+        assert_eq!(
+            formel_text(1200, 60, 120.0),
+            "1260/min → 60 Durchläufe/Minute → 0,5 pro Beat bei 120 BPM"
+        );
+        // 300/min bei 90 BPM = 3,33 je Beat (Komma, zwei Stellen).
+        assert_eq!(
+            formel_text(1800, 300, 90.0),
+            "2100/min → 300 Durchläufe/Minute → 3,33 pro Beat bei 90 BPM"
+        );
+        assert_eq!(kurz(2.5), "2,5");
+        assert_eq!(kurz(1.0), "1");
+        assert_eq!(kurz(0.333), "0,33");
+    }
+
+    #[test]
+    fn formel_fps_glaettet_und_verwirft_unbrauchbares() {
+        // Der erste brauchbare Wert wird übernommen …
+        assert_eq!(fps_glaetten(0.0, 0.05), 20.0);
+        // … danach nur ein Teil des neuen Werts (kein Springen): 20 → 24 bei
+        // einem 60-fps-Frame.
+        assert!((fps_glaetten(20.0, 1.0 / 60.0) - 24.0).abs() < 1e-9);
+        // Pause (Tab war weg) und Doppelaufruf im selben Frame ändern nichts.
+        assert_eq!(fps_glaetten(20.0, 5.0), 20.0);
+        assert_eq!(fps_glaetten(20.0, 0.6), 20.0, "Hakler unter 1 s zählt nicht");
+        assert_eq!(fps_glaetten(20.0, 0.0001), 20.0);
+        // Anzeige: „auto" nennt die fps, die in die Basis eingehen; fest nur
+        // die Zahl.
+        assert_eq!(
+            basis_text(StroboBasis::Auto, 20.0),
+            "Basis 1200 (20 fps × 60)"
+        );
+        assert_eq!(basis_text(StroboBasis::Auto, 19.8), "Basis 1188 (19,8 fps × 60)");
+        assert_eq!(basis_text(StroboBasis::Hz30, 20.0), "Basis 1800");
+        assert_eq!(basis_text(StroboBasis::Hz60, 20.0), "Basis 3600");
     }
 }

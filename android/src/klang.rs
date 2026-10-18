@@ -297,15 +297,36 @@ pub fn spielen_welle(midi: i32, welle: Welle) {
 /// der älteste wartende Puffer aus der Warteschlange.
 pub fn puffer_spielen(pcm: Vec<i16>, rate: u32, gain: f32) {
     if pcm.is_empty() || rate == 0 {
+        info!(
+            "klang: Puffer leer/ohne Rate verworfen ({} Samples, {} Hz)",
+            pcm.len(),
+            rate
+        );
         return;
     }
+    info!("klang: Puffer an ({} Samples, {} Hz)", pcm.len(), rate);
     let mut guard = match spieler_slot().lock() {
         Ok(g) => g,
         Err(_) => return,
     };
     sicherstellen(&mut guard);
-    if let Some(spieler) = guard.as_ref() {
-        let _ = spieler.tx.send(Auftrag::Puffer { pcm, rate, gain });
+    let Some(spieler) = guard.as_ref() else {
+        info!("klang: Puffer ohne Spieler verworfen");
+        return;
+    };
+    // Scheitert das Senden, ist der Klang-Thread beendet (z. B. nach einem
+    // Schreibfehler). Dann neu starten und den Puffer noch einmal schicken —
+    // sonst bliebe der Ton für den Rest der Sitzung stumm.
+    match spieler.tx.send(Auftrag::Puffer { pcm, rate, gain }) {
+        Ok(()) => {}
+        Err(zurueck) => {
+            info!("klang: Thread weg — Neustart");
+            *guard = None;
+            sicherstellen(&mut guard);
+            if let Some(spieler) = guard.as_ref() {
+                let _ = spieler.tx.send(zurueck.0);
+            }
+        }
     }
 }
 
@@ -413,6 +434,12 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
                     }
                 }
                 Auftrag::Puffer { pcm, rate, gain } => {
+                    info!(
+                        "klang: Puffer klingt ({} Samples, {} Hz, Warteschlange {})",
+                        pcm.len(),
+                        rate,
+                        puffer_schlange.len() + 1
+                    );
                     puffer_schlange.push_back(KlingenderPuffer::neu(pcm, rate, gain));
                     // Ueberlast: der aelteste Puffer faellt raus.
                     while puffer_schlange.len() > PUFFER_MAX {

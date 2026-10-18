@@ -11,6 +11,7 @@ pub mod gesten;
 pub mod grid;
 pub mod harmonie;
 pub mod instrument;
+pub mod laub;
 pub mod itwrite;
 pub mod klang;
 pub mod livescan;

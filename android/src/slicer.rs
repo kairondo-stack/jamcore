@@ -51,8 +51,118 @@ const ANZAHL_STANDARD: usize = 8;
 /// Rhythmus-Tab spielt sie über `klang::puffer_spielen`.
 static RASTER: OnceLock<Mutex<Vec<(Vec<i16>, u32)>>> = OnceLock::new();
 
+/// Pfad der zuletzt exportierten `.it` (für die Aufnahme im Bild-Tab, „Rec"):
+/// der Rec-Knopf schreibt dann in **dieselbe** Datei, statt eine neue anzulegen.
+static LETZTER_EXPORT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Merker-Datei im App-Ordner: der letzte Export überlebt so den App-Neustart.
+/// Nötig, weil das Raster (die klingenden Slices) nur im Speicher liegt — nach
+/// einem Neustart war „Slices" im Rhythmus-Tab sonst still (der Tongenerator
+/// sprang ein), obwohl die .it mit den Slices noch da ist.
+const EXPORT_MERKER: &str = "slicer-export.txt";
+
 fn raster_slot() -> &'static Mutex<Vec<(Vec<i16>, u32)>> {
     RASTER.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn export_slot() -> &'static Mutex<Option<String>> {
+    LETZTER_EXPORT.get_or_init(|| Mutex::new(None))
+}
+
+/// Pfad der zuletzt exportierten .it (None, wenn keine). Fragt beim ersten Mal
+/// den Merker im App-Ordner, damit er einen App-Neustart übersteht.
+pub fn letzter_export() -> Option<String> {
+    if let Some(pfad) = export_slot().lock().ok().and_then(|p| p.clone()) {
+        return Some(pfad);
+    }
+    let pfad = merker_lesen()?;
+    if let Ok(mut slot) = export_slot().lock() {
+        *slot = Some(pfad.clone());
+    }
+    Some(pfad)
+}
+
+/// Den Pfad des letzten Exports merken (Speicher **und** Merker-Datei).
+fn export_merken(pfad: &str) {
+    if let Ok(mut slot) = export_slot().lock() {
+        *slot = Some(pfad.to_string());
+    }
+    match app_ordner().map(|o| o.join(EXPORT_MERKER)) {
+        Ok(merker) => {
+            if let Err(e) = std::fs::write(&merker, pfad) {
+                info!("slicer: Merker {} nicht schreibbar: {e}", merker.display());
+            }
+        }
+        Err(e) => info!("slicer: Merker nicht ablegbar: {e}"),
+    }
+}
+
+/// Den gemerkten Export-Pfad lesen (`None`, wenn keiner gemerkt ist oder die
+/// Datei inzwischen fehlt).
+fn merker_lesen() -> Option<String> {
+    let merker = app_ordner().ok()?.join(EXPORT_MERKER);
+    let pfad = std::fs::read_to_string(&merker).ok()?.trim().to_string();
+    (!pfad.is_empty() && Path::new(&pfad).is_file()).then_some(pfad)
+}
+
+/// Das Raster aus dem letzten Export füllen, wenn es leer ist — z. B. nach
+/// einem App-Neustart, ohne den Slicer-Tab zu öffnen. `true`, wenn dafür
+/// Slices aus dem Export gelesen wurden (dann klingt „Slices" im Rhythmus-Tab
+/// sofort); `false`, wenn schon Slices bereitlagen oder es keinen Export gibt.
+pub fn raster_aus_letztem_export() -> bool {
+    if slice_anzahl() > 0 {
+        return false;
+    }
+    let Some(pfad) = letzter_export() else {
+        info!("slicer: kein letzter Export gemerkt (Raster bleibt leer)");
+        return false;
+    };
+    let Ok(daten) = std::fs::read(&pfad) else {
+        info!("slicer: letzter Export nicht lesbar: {pfad}");
+        return false;
+    };
+    match crate::image::it_lesen(&daten) {
+        Ok((samples, _)) => {
+            let neu: Vec<(Vec<i16>, u32)> = samples
+                .into_iter()
+                .map(|s| (s.daten, s.rate.max(1)))
+                .collect();
+            let anzahl = neu.len();
+            let rate = neu.first().map(|(_, r)| *r).unwrap_or(0);
+            if let Ok(mut slot) = raster_slot().lock() {
+                *slot = neu;
+            }
+            info!("slicer: Raster aus letztem Export {pfad} ({anzahl} Slices, {rate} Hz)");
+            anzahl > 0
+        }
+        Err(e) => {
+            info!("slicer: letzter Export nicht gelesen: {e} ({pfad})");
+            false
+        }
+    }
+}
+
+/// Slices als 16-Bit-PCM: (Rate, [(Name, Daten)]) für eine neue .it.
+///
+/// Genau die Puffer, die auch das Rhythmus-Raster spielt („Slices"); `None`,
+/// wenn kein Audio geladen ist. Die Namen sind dieselben wie beim Export
+/// („Slice 1", „Slice 2", …).
+pub fn slices_fuer_it() -> Option<(u32, Vec<(String, Vec<i16>)>)> {
+    let guard = raster_slot().lock().ok()?;
+    if guard.is_empty() {
+        return None;
+    }
+    let rate = guard
+        .iter()
+        .map(|(_, r)| *r)
+        .find(|r| *r > 0)
+        .unwrap_or(44100);
+    let slices = guard
+        .iter()
+        .enumerate()
+        .map(|(i, (pcm, _))| (format!("Slice {}", i + 1), pcm.clone()))
+        .collect();
+    Some((rate, slices))
 }
 
 /// Anzahl der Slices, die das Raster spielen kann (0 = nichts geladen).
@@ -66,8 +176,23 @@ pub fn slice_spielen(index: usize) -> bool {
         return false;
     };
     let Some((pcm, rate)) = guard.get(index) else {
+        // Kein Klang aus dem Raster (nichts geladen oder Index zu groß): der
+        // Aufrufer fällt auf den Tongenerator zurück. Das Log macht sichtbar,
+        // warum „Slices" still bleibt.
+        info!(
+            "slicer: Slice {} fehlt ({} im Raster)",
+            index + 1,
+            guard.len()
+        );
         return false;
     };
+    info!(
+        "slicer: Slice {} von {} -> Puffer ({} Samples, {} Hz)",
+        index + 1,
+        guard.len(),
+        pcm.len(),
+        rate
+    );
     crate::klang::puffer_spielen(pcm.clone(), *rate, 0.8);
     true
 }
@@ -418,6 +543,10 @@ impl SlicerPanel {
         let ziel = ordner.join(format!("{name}.it"));
         match jamcore::itwrite::schreibe(&ziel.display().to_string(), &samples, &name) {
             Ok(()) => {
+                // Für die Aufnahme im Bild-Tab („Rec"): die nächste Aufnahme
+                // schreibt in genau diese Datei, nicht in eine neue. Der Merker
+                // im App-Ordner überlebt den App-Neustart (das Raster nicht).
+                export_merken(&ziel.display().to_string());
                 self.status = format!(
                     "{anzahl} Slices -> {} (im Player-Tab ladbar)",
                     ziel.display()
@@ -781,6 +910,16 @@ fn app_module_ordner() -> Result<std::path::PathBuf, String> {
     let basis = crate::insets::external_files_dir(&app)
         .ok_or_else(|| "kein App-Verzeichnis".to_string())?;
     let ordner = std::path::PathBuf::from(basis).join("module");
+    std::fs::create_dir_all(&ordner).map_err(|e| format!("{}: {e}", ordner.display()))?;
+    Ok(ordner)
+}
+
+/// `<App-Ordner>` (ohne Unterordner) für kleine Merker-Dateien.
+fn app_ordner() -> Result<std::path::PathBuf, String> {
+    let app = crate::current_app()?;
+    let basis = crate::insets::external_files_dir(&app)
+        .ok_or_else(|| "kein App-Verzeichnis".to_string())?;
+    let ordner = std::path::PathBuf::from(basis);
     std::fs::create_dir_all(&ordner).map_err(|e| format!("{}: {e}", ordner.display()))?;
     Ok(ordner)
 }
