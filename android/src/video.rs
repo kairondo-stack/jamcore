@@ -2,12 +2,13 @@
 //!
 //! MediaExtractor/MediaCodec sind Java-APIs; die Klasse dekodiert synchron
 //! und ruft je Bild [`Java_org_jamcore_app_VideoBridge_nativeVideoFrame`].
-//! Die Konvertierung nach RGBA und der Framepuffer sind dieselben wie bei der
-//! Kamera (`camera::ablegen`).
+//! Die Konvertierung nach RGBA, die Drehung und der Framepuffer sind dieselben
+//! wie bei der Kamera (`camera::ablegen_gedreht`); die Drehung kommt hier aus
+//! den Datei-Metadaten (`MediaFormat.KEY_ROTATION`).
 
 use log::info;
 
-use crate::camera::{ablegen, klasse_holen};
+use crate::camera::{ablegen_gedreht, klasse_holen};
 use crate::jniutil;
 
 /// Startet die Wiedergabe; Rückgabe `Ok(())` oder der Fehlertext der Brücke.
@@ -97,6 +98,10 @@ pub fn java_meldung(app: &android_activity::AndroidApp) -> String {
 
 /// Wird von der Java-Brücke je dekodiertem Bild gerufen.
 ///
+/// `drehung` ist die Drehung aus den Datei-Metadaten (KEY_ROTATION, Grad im
+/// Uhrzeigersinn); der Dekoder liefert die Bilder ungedreht, deshalb dreht
+/// dieselbe Stelle wie bei der Kamera.
+///
 /// # Safety
 /// Aufruf erfolgt durch die JVM mit gültigen Array- und Größenargumenten.
 #[no_mangle]
@@ -114,6 +119,7 @@ pub extern "system" fn Java_org_jamcore_app_VideoBridge_nativeVideoFrame(
     v_pix: jni::sys::jint,
     width: jni::sys::jint,
     height: jni::sys::jint,
+    drehung: jni::sys::jint,
 ) {
     let (Ok(y), Ok(u), Ok(v)) = (
         env.convert_byte_array(&y),
@@ -123,7 +129,7 @@ pub extern "system" fn Java_org_jamcore_app_VideoBridge_nativeVideoFrame(
         info!("video: Bild-Arrays nicht lesbar");
         return;
     };
-    ablegen(
+    ablegen_gedreht(
         &y,
         y_row.max(0) as usize,
         y_pix.max(0) as usize,
@@ -135,5 +141,6 @@ pub extern "system" fn Java_org_jamcore_app_VideoBridge_nativeVideoFrame(
         v_pix.max(0) as usize,
         width.max(0) as usize,
         height.max(0) as usize,
+        drehung.max(0) as u32,
     );
 }

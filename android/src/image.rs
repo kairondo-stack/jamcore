@@ -7,6 +7,11 @@
 //! markiert (Anfang des "Malens"); Zähler und Trefferzahl stehen darunter.
 //! Die Anzeige folgt der Kamera, solange keine Auswahl steht; „Auswahl
 //! löschen" gibt sie wieder frei.
+//! „Tempo aus Video" (Plan 2026-10-18, Step 5) liest aus der Helligkeits-Reihe
+//! der laufenden Videoquelle das Tempo (`jamcore::videotempo`) und gibt es an
+//! `JamApp` weiter. Ein **Faktor** (1…128) dünnt die Reihe vor der Auswertung
+//! aus (nur jeden n-ten Frame): zu schnelle Muster landen per Aliasing im
+//! BPM-Bereich — Zeitlupe wie beim Stroboskop.
 
 use eframe::egui::{self, Color32, TextureOptions};
 
@@ -28,6 +33,9 @@ use crate::video;
 const TOLERANZ_STANDARD: i32 = 24;
 const ZOOM_MIN: f32 = 0.2;
 const ZOOM_MAX: f32 = 4.0;
+/// So viele Videobilder sammelt „Tempo aus Video" höchstens (120 s bei
+/// 30 fps); ältere fallen vorn heraus, damit die Reihe nicht unbegrenzt wächst.
+const VIDEO_REIHE_MAX: usize = 3600;
 /// Höhe der Maskenleiste oben im Bild in Punkten.
 const LEISTE_H: f32 = 18.0;
 /// Der Bildteil nimmt höchstens so viel Höhe, damit die Regler unten sichtbar
@@ -110,6 +118,28 @@ fn spirale_text(s: &Spirale) -> String {
 /// Zahl mit einer Nachkommastelle und Komma (die Statuszeile ist deutsch).
 fn zahl(v: f64) -> String {
     format!("{v:.1}").replace('.', ",")
+}
+
+/// Beschriftung eines Faktor-Knopfs: „×1", „×5/8", „×2".
+fn bruch_text(zaehler: u32, nenner: u32) -> String {
+    if nenner <= 1 {
+        format!("×{zaehler}")
+    } else {
+        format!("×{zaehler}/{nenner}")
+    }
+}
+
+/// Hinweis des gewählten Genre-Faktors für die Zeile unter den Knöpfen:
+/// „×5/8 (House/Groove 120–128)". Unbekannte Brüche zeigen nur den Bruch.
+fn faktor_hinweis(bruch: (u32, u32)) -> String {
+    let text = bruch_text(bruch.0, bruch.1);
+    match jamcore::videotempo::faktoren()
+        .iter()
+        .find(|(z, n, _)| (*z, *n) == bruch)
+    {
+        Some((_, _, hinweis)) => format!("{text} ({hinweis})"),
+        None => text,
+    }
 }
 
 /// Dauer des Bereichs-Durchlaufs klemmen: 1/64 … 4 Takt. `takte::teile`/
@@ -872,6 +902,21 @@ pub struct ImagePanel {
     rec_letzte: std::time::Instant,
     /// So viele Patterns hat diese Aufnahme geschrieben.
     rec_geschrieben: u64,
+    /// „Tempo aus Video": Helligkeits-Reihe je Videobild mit Zeitstempel
+    /// (Graumittel, Sekunden seit `vt_uhr`).
+    vt_reihe: Vec<(f32, f64)>,
+    /// Uhr der Sammlung — die Abtastrate der Reihe wird daraus gemessen.
+    vt_uhr: std::time::Instant,
+    /// Bildnummer der letzten Aufnahme in die Reihe (je Bild genau einmal).
+    vt_nummer: u64,
+    /// Genre-Faktor der Auswertung als Bruch (Zähler, Nenner): das **erkannte**
+    /// Tempo wird damit belegt (`jamcore::videotempo::faktoren`); ×1 = nichts
+    /// ändern. Die av4-Messung 2026-10-19 belegt ×5/8, ×2/3, ×5/6 und ×7/8
+    /// für die Genre-Bänder und ×2/×3 für tiefe Ausgaben — die früheren
+    /// ÷2/×2-Knöpfe dünnten nur die Reihe aus und änderten kein Tempo.
+    vt_bruch: (u32, u32),
+    /// Erkanntes Tempo, das `JamApp` genau einmal abholt.
+    vt_uebernommen: Option<f32>,
 }
 
 impl Default for ImagePanel {
@@ -990,6 +1035,11 @@ impl ImagePanel {
             rec_patterns: Vec::new(),
             rec_letzte: std::time::Instant::now(),
             rec_geschrieben: 0,
+            vt_reihe: Vec::new(),
+            vt_uhr: std::time::Instant::now(),
+            vt_nummer: 0,
+            vt_bruch: (1, 1),
+            vt_uebernommen: None,
         }
     }
 
@@ -1096,6 +1146,144 @@ impl ImagePanel {
         }
         self.video_laeuft = false;
         self.status = "Video gestoppt".to_string();
+    }
+
+    /// Ein Videobild in die Helligkeits-Reihe für „Tempo aus Video" aufnehmen.
+    ///
+    /// Läuft bei jeder Anzeige mit (Bild und B2) und kostet nur ein Graumittel
+    /// über den Framepuffer; gerechnet wird erst auf Knopfdruck — so blockiert
+    /// weder das Sammeln noch die Auswertung die Oberfläche. Je Bildnummer
+    /// genau ein Wert; läuft die Anzeige langsamer als das Video, fehlen
+    /// Bilder, die Abtastrate wird aber aus den Zeitstempeln gemessen und
+    /// stimmt daher trotzdem.
+    fn video_abtasten(&mut self) {
+        if !self.video_laeuft {
+            return;
+        }
+        let (nummer, _, _) = camera::stand();
+        if nummer == 0 || nummer == self.vt_nummer {
+            return;
+        }
+        let Some((_, _, rgba)) = camera::letztes_bild() else {
+            return;
+        };
+        self.vt_nummer = nummer;
+        let jetzt = self.vt_uhr.elapsed().as_secs_f64();
+        // Eine Lücke (Tab-Wechsel, Pause) ist kein Takt: die Reihe gilt nur für
+        // eine durchgehende Abtastung, also neu anfangen. Die Schwelle wächst
+        // mit der eingestellten Bildrate, denn 1 fps liefert 1-s-Abstände.
+        let grenze = (4.0 / self.video_fps.max(1) as f64).max(0.5);
+        if let Some((_, letzte)) = self.vt_reihe.last() {
+            if jetzt - letzte > grenze {
+                self.vt_reihe.clear();
+            }
+        }
+        self.vt_reihe
+            .push((jamcore::videotempo::graumittel(&rgba), jetzt));
+        if self.vt_reihe.len() > VIDEO_REIHE_MAX {
+            self.vt_reihe.remove(0);
+        }
+    }
+
+    /// Abtastrate der gesammelten Reihe: Median der Abstände der (ggf. um
+    /// Faktor `n` ausgedünnten) Werte — robust gegen einzelne Aussetzer der
+    /// Anzeige und aus den echten Zeitstempeln statt aus `video_fps` (die
+    /// Anzeige überspringt Bilder). Die App ruft sie mit 1 auf; das Ausdünnen
+    /// bleibt für Aliasing-Versuche im Kern ([`jamcore::videotempo::ausduennen`]).
+    /// 0, wenn es zu wenige Werte sind.
+    fn reihe_fps(&self, n: usize) -> f32 {
+        let n = n.max(1);
+        let zeit: Vec<f64> = self.vt_reihe.iter().step_by(n).map(|(_, t)| *t).collect();
+        if zeit.len() < 2 {
+            return 0.0;
+        }
+        let mut abst: Vec<f64> = zeit.windows(2).map(|w| w[1] - w[0]).collect();
+        abst.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mitte = abst.len() / 2;
+        let median = if abst.len() % 2 == 0 {
+            (abst[mitte - 1] + abst[mitte]) / 2.0
+        } else {
+            abst[mitte]
+        };
+        if median <= 0.0 {
+            0.0
+        } else {
+            (1.0 / median) as f32
+        }
+    }
+
+    /// Genre-Faktor für „Tempo aus Video" wählen (Knöpfe ×1, ×5/8, ×2/3, …):
+    /// der Bruch belegt das **erkannte** Tempo (`tempo_mit_faktor`). Nur eine
+    /// echte Änderung wird protokolliert.
+    fn vt_bruch_setzen(&mut self, zaehler: u32, nenner: u32) {
+        if (zaehler, nenner) != self.vt_bruch {
+            self.vt_bruch = (zaehler, nenner);
+            log::info!("bild: Tempo-Faktor {}", bruch_text(zaehler, nenner));
+        }
+    }
+
+    /// Knopf „Tempo aus Video": die gesammelte Helligkeits-Reihe auswerten.
+    ///
+    /// Gewählt wurde „beim Abspielen mitzählen, auf Knopfdruck auswerten"
+    /// statt „beim Druck 2 s lang Frames abwarten": das Abwarten würde die
+    /// Oberfläche anhalten, und die Reihe ist ohnehin schon da, weil die
+    /// Anzeige bei jedem Bild läuft. Die Abtastrate kommt aus den echten
+    /// Zeitstempeln. Der gewählte Genre-Faktor (Bruch) belegt das **erkannte**
+    /// Tempo und wird auf 40…220 BPM geklemmt; „nichts erkannt" bleibt „nichts
+    /// erkannt" (der Faktor ändert daran nichts). Nach einem Treffer beginnt
+    /// die Sammlung von vorn; ohne Treffer bleibt sie stehen.
+    fn tempo_aus_video(&mut self) {
+        if !self.video_laeuft {
+            self.status = "Tempo aus Video: keine Videoquelle (erst „Quelle an“)".to_string();
+            log::info!("bild: Tempo aus Video: keine Videoquelle");
+            return;
+        }
+        let n_alle = self.vt_reihe.len();
+        if n_alle == 0 {
+            self.status =
+                "Tempo aus Video: noch nichts gesammelt (Video kurz laufen lassen)".to_string();
+            log::info!("bild: Tempo aus Video: nichts erkannt (0 Frames)");
+            return;
+        }
+        let (zaehler, nenner) = self.vt_bruch;
+        let kuerzel = bruch_text(zaehler, nenner);
+        let werte: Vec<f32> = self.vt_reihe.iter().map(|(v, _)| *v).collect();
+        // Abtastrate aus den Zeitstempeln: die Anzeige nimmt nicht zwingend
+        // jedes Bild mit, und die eingestellte Video-fps muss nicht stimmen.
+        let fps = self.reihe_fps(1);
+        match jamcore::videotempo::bpm_aus_frames(&werte, fps) {
+            Some(bpm) => {
+                let k = jamcore::videotempo::konfidenz(&werte, fps, bpm);
+                // Der Bruch belegt das erkannte Tempo: ×5/8, ×2/3, ×5/6 und
+                // ×7/8 treffen bei ~200 BPM die Genre-Bänder, ×2/×3 heben
+                // tiefe Ausgaben (av4-Tabelle 2026-10-19).
+                let tempo = jamcore::videotempo::tempo_mit_faktor(bpm, zaehler, nenner);
+                self.status = format!(
+                    "Tempo aus Video: {bpm:.1} BPM (Konfidenz {k:.2}, {n_alle} Werte) {kuerzel} = {tempo:.1} BPM"
+                );
+                log::info!(
+                    "bild: Tempo aus Video: {bpm:.1} BPM (Konfidenz {k:.2}, {n_alle} Werte) {kuerzel} = {tempo:.1} BPM"
+                );
+                self.vt_uebernommen = Some(tempo);
+                // Frisches Material für den nächsten Druck.
+                self.vt_reihe.clear();
+            }
+            None => {
+                self.status = format!(
+                    "Tempo aus Video: nichts erkannt ({n_alle} Werte, Faktor {kuerzel})"
+                );
+                log::info!(
+                    "bild: Tempo aus Video: nichts erkannt ({n_alle} Werte, Faktor {kuerzel})"
+                );
+            }
+        }
+        self.vt_nummer = camera::stand().0;
+    }
+
+    /// Das aus dem Video erkannte Tempo; wird nach dem Lesen verworfen, damit
+    /// `JamApp` es genau einmal übernimmt (Muster: `mic::uebernommenes_tempo`).
+    pub fn uebernommenes_tempo(&mut self) -> Option<f32> {
+        self.vt_uebernommen.take()
     }
 
     pub fn set_target(&mut self, host: &str, port: &str) {
@@ -2316,13 +2504,48 @@ impl ImagePanel {
 
     /// Die beiden Zeilen mit Kamera, Scan und Aufnahme — immer erreichbar.
     fn zeilen_kamera(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        // Auch hier umbrechen: Kamera, „Tempo aus Video" und der Status passen
+        // im Hochformat sonst nicht mehr in eine Zeile.
+        ui.horizontal_wrapped(|ui| {
             if ui.button("Kamera an").clicked() {
                 self.kamera_an();
             }
             if ui.button("Kamera aus").clicked() {
                 self.kamera_aus();
             }
+            // „Tempo aus Video": aus der Helligkeits-Reihe der laufenden
+            // Videoquelle das Tempo lesen (jamcore::videotempo). Die Reihe
+            // füllt sich beim Abspielen, hier wird nur ausgewertet.
+            if ui.button("Tempo aus Video").clicked() {
+                self.tempo_aus_video();
+            }
+            if self.video_laeuft && !self.vt_reihe.is_empty() {
+                ui.label(
+                    egui::RichText::new(format!("{} Bilder", self.vt_reihe.len()))
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+            // Genre-Faktoren (av4-Tabelle 2026-10-19): der Bruch belegt das
+            // erkannte Tempo — ×5/8 → House/Groove, ×2/3 → Techno, ×5/6 →
+            // Breakbeat, ×7/8 → DnB, ×2/×3 für tiefe Ausgaben; ×1 = nichts
+            // ändern. Die Liste kommt aus dem Kern, damit App und Tests
+            // dieselben Brüche benutzen.
+            for &(zaehler, nenner, hinweis) in jamcore::videotempo::faktoren() {
+                let aktiv = self.vt_bruch == (zaehler, nenner);
+                if ui
+                    .selectable_label(aktiv, bruch_text(zaehler, nenner))
+                    .on_hover_text(hinweis)
+                    .clicked()
+                {
+                    self.vt_bruch_setzen(zaehler, nenner);
+                }
+            }
+            ui.label(
+                egui::RichText::new(faktor_hinweis(self.vt_bruch))
+                    .small()
+                    .color(Color32::GRAY),
+            );
             ui.label(&self.status);
         });
         // Umbricht statt abzuschneiden: die Zeile ist voll (Scan, Ton,
@@ -2531,6 +2754,8 @@ impl ImagePanel {
         self.schritte_wahl = schritte;
         self.laenge_anpassen(schritte);
         self.textur_aktualisieren(ui.ctx());
+        // „Tempo aus Video" sammelt hier mit (je Videobild ein Graumittel).
+        self.video_abtasten();
         self.scan_schritt(ui.ctx(), pattern);
         self.linien_schritt();
         // Aufnahme: läuft der Durchlauf länger als ~2 s, zwischendurch
@@ -2628,6 +2853,8 @@ impl ImagePanel {
         self.zeile_quelle(ui);
 
         self.textur_aktualisieren(ui.ctx());
+        // „Tempo aus Video" sammelt hier mit (je Videobild ein Graumittel).
+        self.video_abtasten();
 
         // X-Aufloesung (Schrittzahl) aus der Anzeigebreite mal Zoom — ist
         // zugleich die Patternlaenge. Die Maske waechst mit. Die Bildbreite

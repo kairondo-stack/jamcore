@@ -219,10 +219,16 @@ impl LissaPanel {
             }
             // Richtung der endlosen Drehung (nur wenn „∞" gewählt ist).
             if self.endlos {
-                if ui.selectable_label(!self.richtung_rechts, "◀ links").clicked() {
+                if ui
+                    .selectable_label(!self.richtung_rechts, "◀ links")
+                    .clicked()
+                {
                     self.richtung_rechts = false;
                 }
-                if ui.selectable_label(self.richtung_rechts, "rechts ▶").clicked() {
+                if ui
+                    .selectable_label(self.richtung_rechts, "rechts ▶")
+                    .clicked()
+                {
                     self.richtung_rechts = true;
                 }
             }
@@ -246,12 +252,9 @@ impl LissaPanel {
                     }),
             );
             ui.label(
-                egui::RichText::new(format!(
-                    "X {:.0} Hz · Y {:.0} Hz",
-                    stimmen[0], stimmen[1]
-                ))
-                .small()
-                .color(egui::Color32::GRAY),
+                egui::RichText::new(format!("X {:.0} Hz · Y {:.0} Hz", stimmen[0], stimmen[1]))
+                    .small()
+                    .color(egui::Color32::GRAY),
             );
         });
 
@@ -289,11 +292,7 @@ impl LissaPanel {
     /// Figur zeichnen; `voll` = Präsentation (füllt den ganzen Platz).
     fn figur(&self, ui: &mut egui::Ui, phi: f64, voll: bool) -> egui::Response {
         let breite = ui.available_width();
-        let hoehe = if voll {
-            ui.available_height()
-        } else {
-            breite
-        };
+        let hoehe = if voll { ui.available_height() } else { breite };
         let (response, painter) =
             ui.allocate_painter(egui::vec2(breite, hoehe), egui::Sense::click());
         let rect = response.rect;

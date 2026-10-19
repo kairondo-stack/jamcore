@@ -9,7 +9,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use jamcore::yuv::{yuv420_to_rgba, Plane};
+use jamcore::yuv::{rgba_drehen, yuv420_to_rgba, Plane};
 use log::info;
 
 use crate::jniutil;
@@ -161,6 +161,10 @@ pub fn stop(app: &android_activity::AndroidApp) {
 
 /// Wird von der Java-Brücke je Frame gerufen (YUV_420_888, drei Planes).
 ///
+/// `drehung` ist der Drehwinkel im Uhrzeigersinn (0/90/180/270), den die
+/// Brücke aus Sensor-Orientierung und Display-Drehung rechnet; damit steht
+/// das Bild aufrecht im Frame-Puffer.
+///
 /// # Safety
 /// Aufruf erfolgt durch die JVM mit gültigen Array- und Größenargumenten.
 #[no_mangle]
@@ -178,6 +182,7 @@ pub extern "system" fn Java_org_jamcore_app_CameraBridge_nativeFrame(
     v_pix: jni::sys::jint,
     width: jni::sys::jint,
     height: jni::sys::jint,
+    drehung: jni::sys::jint,
 ) {
     let breite = width.max(0) as usize;
     let hoehe = height.max(0) as usize;
@@ -192,7 +197,7 @@ pub extern "system" fn Java_org_jamcore_app_CameraBridge_nativeFrame(
         info!("frame: Arrays nicht lesbar");
         return;
     };
-    ablegen(
+    ablegen_gedreht(
         &y,
         y_row.max(0) as usize,
         y_pix.max(0) as usize,
@@ -204,6 +209,7 @@ pub extern "system" fn Java_org_jamcore_app_CameraBridge_nativeFrame(
         v_pix.max(0) as usize,
         breite,
         hoehe,
+        drehung.max(0) as u32,
     );
 }
 
@@ -224,9 +230,16 @@ pub fn ruhebild_setzen(breite: usize, hoehe: usize, rgba: Vec<u8>) {
     }
 }
 
-/// Rechnet drei YUV_420_888-Planes nach RGBA und legt das Bild in den
-/// Framepuffer. Kamera und Videodekoder teilen sich diesen Weg.
-pub(crate) fn ablegen(
+/// Rechnet drei YUV_420_888-Planes nach RGBA, dreht das fertige Bild um
+/// `drehung` Grad im Uhrzeigersinn (0/90/180/270) und legt es in den
+/// Framepuffer. Kamera und Videodekoder teilen sich diesen Weg: die Kamera
+/// rechnet den Winkel aus Sensor- und Display-Drehung, der Videodekoder
+/// nimmt die Drehung aus den Datei-Metadaten (`KEY_ROTATION`).
+///
+/// Bei 90/270 tauschen sich Breite und Hoehe; der Framepuffer traegt danach
+/// die gedrehten Maße, damit Vorschau und Bild-Scan dieselbe Ausrichtung
+/// lesen.
+pub(crate) fn ablegen_gedreht(
     y: &[u8],
     y_row: usize,
     y_pix: usize,
@@ -238,6 +251,7 @@ pub(crate) fn ablegen(
     v_pix: usize,
     breite: usize,
     hoehe: usize,
+    drehung: u32,
 ) {
     if breite == 0 || hoehe == 0 {
         return;
@@ -263,6 +277,11 @@ pub(crate) fn ablegen(
         hoehe,
         &mut rgba,
     );
+    let (breite, hoehe, rgba) = if drehung % 360 == 0 {
+        (breite, hoehe, rgba)
+    } else {
+        rgba_drehen(&rgba, breite, hoehe, drehung)
+    };
     if let Ok(mut frame) = frame_slot().lock() {
         frame.width = breite;
         frame.height = hoehe;

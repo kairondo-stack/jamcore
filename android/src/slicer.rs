@@ -253,7 +253,10 @@ impl SlicerPanel {
     }
 
     fn proben(&self) -> &[f32] {
-        self.audio.as_ref().map(|(p, _)| p.as_slice()).unwrap_or(&[])
+        self.audio
+            .as_ref()
+            .map(|(p, _)| p.as_slice())
+            .unwrap_or(&[])
     }
 
     fn rate(&self) -> u32 {
@@ -630,10 +633,7 @@ impl SlicerPanel {
             }
             if i > 0 {
                 painter.line_segment(
-                    [
-                        egui::pos2(x0, rect.top()),
-                        egui::pos2(x0, rect.bottom()),
-                    ],
+                    [egui::pos2(x0, rect.top()), egui::pos2(x0, rect.bottom())],
                     egui::Stroke::new(2.0, Color32::from_rgb(240, 200, 90)),
                 );
             }
@@ -708,10 +708,7 @@ impl SlicerPanel {
         if response.drag_stopped() {
             if self.zug_kante.is_some() {
                 self.raster_schmutzig = true;
-                self.status = format!(
-                    "Schnitt verschoben: {} Slices",
-                    self.schnitte.len()
-                );
+                self.status = format!("Schnitt verschoben: {} Slices", self.schnitte.len());
             }
             self.zug_kante = None;
         }
@@ -787,7 +784,10 @@ impl SlicerPanel {
                 self.modus = Schnittmodus::Gleichmaessig;
             }
             if ui
-                .selectable_label(self.modus == Schnittmodus::Transienten, "Transienten/Energie")
+                .selectable_label(
+                    self.modus == Schnittmodus::Transienten,
+                    "Transienten/Energie",
+                )
                 .clicked()
             {
                 self.modus = Schnittmodus::Transienten;
@@ -844,11 +844,17 @@ impl SlicerPanel {
         }
         let bereit = !self.schnitte.is_empty();
         ui.horizontal_wrapped(|ui| {
-            if ui.add_enabled(bereit, egui::Button::new("Vorhören")).clicked() {
+            if ui
+                .add_enabled(bereit, egui::Button::new("Vorhören"))
+                .clicked()
+            {
                 self.vorhoeren(self.auswahl);
             }
             if ui
-                .add_enabled(bereit && self.schnitte.len() > 1, egui::Button::new("× löschen"))
+                .add_enabled(
+                    bereit && self.schnitte.len() > 1,
+                    egui::Button::new("× löschen"),
+                )
                 .clicked()
             {
                 let _ = self.slice_loeschen(self.auswahl);

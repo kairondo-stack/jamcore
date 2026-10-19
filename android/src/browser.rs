@@ -1,13 +1,13 @@
-//! Einfacher Datei-Browser für Modul- **und** Audiodateien (Player-Tab
-//! „Öffnen", Slicer-Tab „Audio öffnen").
+//! Einfacher Datei-Browser für Modul-, Audio- **und** Bilddateien (Player-Tab
+//! „Öffnen", Slicer-Tab „Audio öffnen", Laub-Tab „Bild laden …").
 //!
 //! Kein SAF/Java: die Activity ist `android.app.NativeActivity` und hat kein
 //! `onActivityResult`. Der Browser läuft in egui und liest die Ordner direkt:
 //! App-eigene Ordner zuerst, mit der „Alle Dateien"-Berechtigung zusätzlich
 //! DCIM, Pictures, Music, Download und Documents (siehe
 //! [`startordner`] und `crate::paths::ordner`). Ordner stehen zuerst, Dateien
-//! werden nach [`Filter`] ausgewählt (Module oder Audio); sortiert wird mit der
-//! gemeinsamen Listen-Logik (`jamcore::modulebrowser::sortiere`).
+//! werden nach [`Filter`] ausgewählt (Module, Audio oder Bilder); sortiert wird
+//! mit der gemeinsamen Listen-Logik (`jamcore::modulebrowser::sortiere`).
 
 use eframe::egui;
 use jamcore::audio::ist_audio;
@@ -22,6 +22,8 @@ pub enum Filter {
     Module,
     /// Audiodateien (.wav/.mp3/.ogg/.flac/.m4a/…) — Slicer-Tab.
     Audio,
+    /// Bilddateien (.png/.jpg/.jpeg/.bmp) — Laub-Tab „Bild laden …".
+    Bild,
 }
 
 impl Filter {
@@ -30,25 +32,42 @@ impl Filter {
         match self {
             Filter::Module => ist_modul(name),
             Filter::Audio => ist_audio(name),
+            Filter::Bild => ist_bild(name),
         }
     }
 
-    /// Fenstertitel (unterscheidet auch die beiden Browser-Fenster).
+    /// Fenstertitel (unterscheidet auch die Browser-Fenster).
     fn titel(self) -> &'static str {
         match self {
             Filter::Module => "Modul öffnen",
             Filter::Audio => "Audio öffnen",
+            Filter::Bild => "Bild öffnen",
         }
     }
 
     /// Welche Ordnerliste gehört zu diesem Filter? (`paths::ordner` liefert
-    /// dieselbe Quelle für Player, Slicer und später den Bild-Tab.)
+    /// dieselbe Quelle für Player, Slicer und Laub.)
     pub fn art(self) -> crate::paths::OrdnerArt {
         match self {
             Filter::Module => crate::paths::OrdnerArt::Module,
             Filter::Audio => crate::paths::OrdnerArt::Audio,
+            Filter::Bild => crate::paths::OrdnerArt::Bild,
         }
     }
+}
+
+/// Ist die Datei ein Standbild? Endungen wie im Desktop-rrn5 und Bild-Tab
+/// (dort liegt dieselbe Prüfung als private Funktion in `image.rs`).
+fn ist_bild(pfad: &str) -> bool {
+    std::path::Path::new(pfad)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            ["png", "jpg", "jpeg", "bmp"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        })
+        .unwrap_or(false)
 }
 
 /// Startordner für einen Filter: App-eigene Ordner zuerst, danach (nur mit der
@@ -75,6 +94,11 @@ impl Browser {
     /// Browser für Audiodateien (Slicer-Tab: Wellenform zum Schneiden).
     pub fn neu_audio(start: Vec<PathBuf>) -> Self {
         Self::neu_filter(start, Filter::Audio)
+    }
+
+    /// Browser für Bilddateien (Laub-Tab: Foto → Blätter → Rhythmus).
+    pub fn neu_bild(start: Vec<PathBuf>) -> Self {
+        Self::neu_filter(start, Filter::Bild)
     }
 
     pub fn neu_filter(start: Vec<PathBuf>, filter: Filter) -> Self {

@@ -48,6 +48,37 @@ pub fn yuv420_to_rgba(
     }
 }
 
+/// Dreht ein RGBA-Bild um `grad` Grad **im Uhrzeigersinn** (0/90/180/270).
+///
+/// Gibt die neuen Maße und das gedrehte Bild zurück; bei 90/270 sind Breite
+/// und Höhe getauscht. Krumme Werte (nicht durch 90 teilbar) lassen das Bild
+/// stehen — die Kameraseite liefert nur 0/90/180/270.
+pub fn rgba_drehen(rgba: &[u8], breite: usize, hoehe: usize, grad: u32) -> (usize, usize, Vec<u8>) {
+    if breite == 0 || hoehe == 0 || rgba.len() < breite * hoehe * 4 {
+        return (breite, hoehe, Vec::new());
+    }
+    let (neu_b, neu_h) = match grad {
+        90 | 270 => (hoehe, breite),
+        180 => (breite, hoehe),
+        _ => return (breite, hoehe, rgba.to_vec()),
+    };
+    let mut out = vec![0u8; neu_b * neu_h * 4];
+    for y in 0..hoehe {
+        for x in 0..breite {
+            // Zielkoordinate im gedrehten Bild (Uhrzeigersinn).
+            let (nx, ny) = match grad {
+                90 => (hoehe - 1 - y, x),
+                180 => (breite - 1 - x, hoehe - 1 - y),
+                _ => (y, breite - 1 - x), // 270
+            };
+            let quelle = (y * breite + x) * 4;
+            let ziel = (ny * neu_b + nx) * 4;
+            out[ziel..ziel + 4].copy_from_slice(&rgba[quelle..quelle + 4]);
+        }
+    }
+    (neu_b, neu_h, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +158,74 @@ mod tests {
         let zweite = &out[4 * 4..4 * 4 + 4];
         assert!(erste[0] > 200, "Zeile 0 hell, war {}", erste[0]);
         assert!(zweite[0] < 80, "Zeile 1 dunkel, war {}", zweite[0]);
+    }
+
+    /// Ein Testbild mit eindeutigen Farben je Pixel: Farbe Nr. 1..n.
+    fn nummernbild(breite: usize, hoehe: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 1..=breite * hoehe {
+            out.push(i as u8);
+            out.push(0);
+            out.push(0);
+            out.push(255);
+        }
+        out
+    }
+
+    /// Rotkanal an (x, y) — die Testbilder kodieren die Nummer dort.
+    fn rot_an(bild: &[u8], breite: usize, x: usize, y: usize) -> u8 {
+        bild[(y * breite + x) * 4]
+    }
+
+    #[test]
+    fn drehung_90_geht_im_uhrzeigersinn() {
+        // 3x2-Bild, Nummern 1..6; nach 90° im Uhrzeigersinn steht die erste
+        // Spalte unten links aufrecht: 4 1 / 5 2 / 6 3.
+        let bild = nummernbild(3, 2);
+        let (b, h, gedreht) = rgba_drehen(&bild, 3, 2, 90);
+        assert_eq!((b, h), (2, 3), "Breite und Hoehe sind getauscht");
+        assert_eq!(rot_an(&gedreht, b, 0, 0), 4, "oben links");
+        assert_eq!(rot_an(&gedreht, b, 1, 0), 1, "oben rechts");
+        assert_eq!(rot_an(&gedreht, b, 0, 1), 5, "Mitte links");
+        assert_eq!(rot_an(&gedreht, b, 1, 1), 2, "Mitte rechts");
+        assert_eq!(rot_an(&gedreht, b, 0, 2), 6, "unten links");
+        assert_eq!(rot_an(&gedreht, b, 1, 2), 3, "unten rechts");
+    }
+
+    #[test]
+    fn drehung_180_und_270_stimmen() {
+        let bild = nummernbild(3, 2);
+        let (b, h, gedreht) = rgba_drehen(&bild, 3, 2, 180);
+        assert_eq!((b, h), (3, 2));
+        assert_eq!(rot_an(&gedreht, b, 0, 0), 6, "180: erste Nummer wandert ans Ende");
+        let (b, h, gedreht) = rgba_drehen(&bild, 3, 2, 270);
+        assert_eq!((b, h), (2, 3), "270: Breite und Hoehe sind getauscht");
+        assert_eq!(rot_an(&gedreht, b, 0, 0), 3, "270: oben links");
+        assert_eq!(rot_an(&gedreht, b, 0, 2), 1, "270: unten links");
+    }
+
+    #[test]
+    fn drehung_null_und_krumme_werte_lassen_das_bild_in_ruhe() {
+        let bild = nummernbild(3, 2);
+        for grad in [0, 45, 360, 725] {
+            let (b, h, gedreht) = rgba_drehen(&bild, 3, 2, grad);
+            assert_eq!((b, h), (3, 2), "Grad {grad} aendert die Masse nicht");
+            assert_eq!(gedreht, bild, "Grad {grad} laesst die Pixel stehen");
+        }
+    }
+
+    #[test]
+    fn zweimal_90_ist_180_und_viermal_90_ist_wieder_das_bild() {
+        let bild = nummernbild(4, 3);
+        let (b1, h1, einmal) = rgba_drehen(&bild, 4, 3, 90);
+        let (b2, h2, zweimal) = rgba_drehen(&einmal, b1, h1, 90);
+        let (_, _, direkt) = rgba_drehen(&bild, 4, 3, 180);
+        assert_eq!((b2, h2), (4, 3));
+        assert_eq!(zweimal, direkt, "zweimal 90 ist 180");
+        let (b3, h3, dreimal) = rgba_drehen(&zweimal, b2, h2, 90);
+        let (b4, h4, viermal) = rgba_drehen(&dreimal, b3, h3, 90);
+        assert_eq!((b4, h4), (4, 3));
+        assert_eq!(viermal, bild, "viermal 90 ist das Original");
     }
 
     #[test]

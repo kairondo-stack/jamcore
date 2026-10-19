@@ -30,13 +30,15 @@ public final class VideoBridge {
             byte[] y, int yRowStride, int yPixelStride,
             byte[] u, int uRowStride, int uPixelStride,
             byte[] v, int vRowStride, int vPixelStride,
-            int width, int height);
+            int width, int height, int rotation);
 
     private static MediaExtractor extractor;
     private static MediaCodec codec;
     private static Thread thread;
     private static volatile boolean running;
     private static volatile int fps = 20;
+    /** Drehung aus den Datei-Metadaten (KEY_ROTATION), 0/90/180/270. */
+    private static volatile int drehung;
     private static String fehler = "";
 
     /** Startet die Wiedergabe der Datei; Rueckgabe "" oder Fehlertext. */
@@ -64,13 +66,24 @@ public final class VideoBridge {
             }
             extractor.selectTrack(spur);
             String mime = format.getString(MediaFormat.KEY_MIME);
+            // Hochkant aufgenommene Videos tragen ihre Drehung nur als
+            // Metadaten; der Dekoder liefert die Bilder ungedreht. Der Wert
+            // geht je Bild an die native Seite (wie bei der Kamera).
+            drehung = 0;
+            if (format.containsKey(MediaFormat.KEY_ROTATION)) {
+                try {
+                    drehung = format.getInteger(MediaFormat.KEY_ROTATION);
+                } catch (Throwable ignored) {
+                    drehung = 0;
+                }
+            }
             codec = MediaCodec.createDecoderByType(mime);
             codec.configure(format, null, null, 0);
             codec.start();
             running = true;
             thread = new Thread(VideoBridge::schleife, "jam-video");
             thread.start();
-            Log.i(TAG, "start " + pfad + " (" + mime + ", " + fps + " fps)");
+            Log.i(TAG, "start " + pfad + " (" + mime + ", " + fps + " fps, rotation=" + drehung + ")");
         } catch (Throwable e) {
             fehler = e.getClass().getSimpleName() + ": " + e.getMessage();
             Log.i(TAG, "start: " + fehler);
@@ -107,7 +120,7 @@ public final class VideoBridge {
                                 planes[1].getPixelStride(),
                                 kopie(planes[2]), planes[2].getRowStride(),
                                 planes[2].getPixelStride(),
-                                bild.getWidth(), bild.getHeight());
+                                bild.getWidth(), bild.getHeight(), drehung);
                         bild.close();
                     }
                     codec.releaseOutputBuffer(outIdx, false);

@@ -10,6 +10,7 @@ mod insets;
 mod instr;
 mod jniutil;
 mod klang;
+mod laub;
 mod layout;
 mod link_support;
 mod lissa;
@@ -54,6 +55,7 @@ enum Tab {
     Rhythmus,
     Tempo,
     Bild,
+    Laub,
     Kreis,
     Tagebuch,
     Maske,
@@ -82,6 +84,8 @@ struct JamApp {
     browser: Option<browser::Browser>,
     /// Datei-Browser des Slicer-Tabs („Audio öffnen"), offen solange `Some`.
     browser_audio: Option<browser::Browser>,
+    /// Datei-Browser des Laub-Tabs („Bild laden …"), offen solange `Some`.
+    browser_bild: Option<browser::Browser>,
     looping: bool,
     player: Option<player::Player>,
     instr: instr::InstrumentPanel,
@@ -90,6 +94,7 @@ struct JamApp {
     slicer: slicer::SlicerPanel,
     mic: mic::MicPanel,
     bild: image::ImagePanel,
+    laub: laub::LaubPanel,
     kreis: quint::QuintPanel,
     lissa: lissa::LissaPanel,
     session: session_ui::SessionPanel,
@@ -143,6 +148,7 @@ impl Default for JamApp {
             selected: None,
             browser: None,
             browser_audio: None,
+            browser_bild: None,
             looping: true,
             player: None,
             instr: instr::InstrumentPanel::default(),
@@ -151,6 +157,7 @@ impl Default for JamApp {
             slicer: slicer::SlicerPanel::default(),
             mic: mic::MicPanel::default(),
             bild: image::ImagePanel::default(),
+            laub: laub::LaubPanel::default(),
             kreis: quint::QuintPanel::default(),
             lissa: lissa::LissaPanel::default(),
             session: session_ui::SessionPanel::default(),
@@ -385,6 +392,7 @@ impl eframe::App for JamApp {
                     ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
                     ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
                     ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
+                    ui.selectable_value(&mut self.tab, Tab::Laub, "Laub");
                     ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
                     ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
                     ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
@@ -426,6 +434,7 @@ impl eframe::App for JamApp {
             Tab::Rhythmus => self.view_rhythm(ui),
             Tab::Tempo => self.view_mic(ui),
             Tab::Bild => self.view_bild(ui),
+            Tab::Laub => self.view_laub(ui),
             Tab::Kreis => self.view_kreis(ui),
             Tab::Tagebuch => self.view_tagebuch(ui),
             Tab::Maske => self.view_maske(ui),
@@ -478,6 +487,21 @@ impl eframe::App for JamApp {
             }
             if offen {
                 self.browser_audio = Some(browser);
+            }
+        }
+
+        // Datei-Browser des Laub-Tabs („Bild laden …"): der Pfad geht ins
+        // Laub-Panel; das Bild landet auch im Kamera-Framepuffer (ein
+        // Standbild für Bild- und Laub-Tab).
+        if let Some(mut browser) = self.browser_bild.take() {
+            let mut offen = true;
+            let gewaehlt = browser.ui(ui.ctx(), &mut offen);
+            if let Some(path) = gewaehlt {
+                self.laub.laden(&path.display().to_string());
+                offen = false;
+            }
+            if offen {
+                self.browser_bild = Some(browser);
             }
         }
 
@@ -789,6 +813,13 @@ impl JamApp {
             self.tempo_setzen(nach);
             self.bild_tempo_sync = self.tempo_bpm;
         }
+        // „Tempo aus Video" auch in B2 (es ist derselbe Bild-Zustand).
+        if let Some(bpm) = self.bild.uebernommenes_tempo() {
+            self.tempo_setzen(bpm);
+            self.bild_tempo_sync = self.tempo_bpm;
+            self.status = format!("Tempo aus Video: {:.1} BPM", self.tempo_bpm);
+            log::info!("Tempo aus Video übernommen: {:.1} BPM", self.tempo_bpm);
+        }
     }
 
     fn view_lissa(&mut self, ui: &mut egui::Ui) {
@@ -942,6 +973,43 @@ impl JamApp {
         if (nach - effektiv).abs() > 0.01 {
             self.tempo_setzen(nach);
             self.bild_tempo_sync = self.tempo_bpm;
+        }
+        // „Tempo aus Video" (Knopf in der Kamera-Zeile): das erkannte Tempo
+        // wird das eine BPM der App. Erst nach dem Scan-Rückkanal, damit es
+        // nicht gleich wieder von einem alten Reglerwert überschrieben wird.
+        if let Some(bpm) = self.bild.uebernommenes_tempo() {
+            self.tempo_setzen(bpm);
+            self.bild_tempo_sync = self.tempo_bpm;
+            self.status = format!("Tempo aus Video: {:.1} BPM", self.tempo_bpm);
+            log::info!("Tempo aus Video übernommen: {:.1} BPM", self.tempo_bpm);
+        }
+    }
+
+    /// Laub-Tab: Foto/Bild → Blätter → Abstände → Genre-Rhythmus. Das Rendern
+    /// schreibt über [`rhythm::RhythmPanel::laub_setzen`] ins Raster, deshalb
+    /// bekommt das Panel das Rhythmus-Panel durchgereicht.
+    fn view_laub(&mut self, ui: &mut egui::Ui) {
+        // Das eine Tempo der App (der absolute Modus rechnet damit).
+        let tempo = self.tempo_aktuell();
+        self.laub.set_tempo(tempo);
+        let mut aktion = laub::Aktion::Keine;
+        egui::CentralPanel::default().show(ui, |ui| {
+            // Scrollen nur über die Leiste: jede Geste im Bild ist ein Tipp
+            // (Hintergrundfarbe wählen), kein Scrollen.
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
+                .id_salt("laub_inhalt")
+                .show(ui, |ui| {
+                    aktion = self.laub.ui(ui, &mut self.rhythm);
+                });
+        });
+        if aktion == laub::Aktion::BrowserOeffnen {
+            let start = match self.app() {
+                Some(app) => browser::startordner(app, browser::Filter::Bild),
+                None => Vec::new(),
+            };
+            self.browser_bild = Some(browser::Browser::neu_bild(start));
+            self.status = "Bild wählen …".to_string();
         }
     }
 

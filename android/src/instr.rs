@@ -105,7 +105,11 @@ const BIS_STANDARD: i32 = 72;
 fn bereiche_text(e: &Eintrag) -> String {
     let noten = match (e.von, e.bis) {
         (Some(von), Some(bis)) => {
-            format!("{}–{}", note_name(i32::from(von)), note_name(i32::from(bis)))
+            format!(
+                "{}–{}",
+                note_name(i32::from(von)),
+                note_name(i32::from(bis))
+            )
         }
         _ => "ohne Note".to_string(),
     };
@@ -129,17 +133,9 @@ fn prozent(von: f32, bis: f32) -> (f32, f32) {
 
 /// Ein Paar DragValues „von–bis" in Prozent; `true`, wenn eines bewegt wurde.
 fn xy_regler(ui: &mut egui::Ui, von: &mut f32, bis: &mut f32) -> bool {
-    let a = ui.add(
-        egui::DragValue::new(von)
-            .range(0.0..=100.0)
-            .suffix(" %"),
-    );
+    let a = ui.add(egui::DragValue::new(von).range(0.0..=100.0).suffix(" %"));
     ui.label(egui::RichText::new("–").small());
-    let b = ui.add(
-        egui::DragValue::new(bis)
-            .range(0.0..=100.0)
-            .suffix(" %"),
-    );
+    let b = ui.add(egui::DragValue::new(bis).range(0.0..=100.0).suffix(" %"));
     a.changed() || b.changed()
 }
 
@@ -387,12 +383,7 @@ impl InstrumentPanel {
                         let (mut y_von, mut y_bis) = prozent(e.y_von, e.y_bis);
                         let y_geaendert = xy_regler(ui, &mut y_von, &mut y_bis);
                         if x_geaendert || y_geaendert {
-                            e.xy_setzen(
-                                x_von / 100.0,
-                                x_bis / 100.0,
-                                y_von / 100.0,
-                                y_bis / 100.0,
-                            );
+                            e.xy_setzen(x_von / 100.0, x_bis / 100.0, y_von / 100.0, y_bis / 100.0);
                             geaendert = true;
                             self.status = format!(
                                 "{}: x {:.0}–{:.0} %, y {:.0}–{:.0} %",

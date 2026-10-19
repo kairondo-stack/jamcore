@@ -192,7 +192,10 @@ fn linienton_mischen(
         .iter()
         .map(|(f, _)| (*f as f64 / rate as f64).clamp(0.0, 0.5))
         .collect();
-    let staerken: Vec<f64> = stimmen.iter().map(|(_, g)| (*g as f64).clamp(0.0, 1.0)).collect();
+    let staerken: Vec<f64> = stimmen
+        .iter()
+        .map(|(_, g)| (*g as f64).clamp(0.0, 1.0))
+        .collect();
     let g = if gain.is_finite() {
         gain.clamp(0.0, 1.0) as f64 * kopf
     } else {
@@ -449,7 +452,10 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
             }
             auftrag = rx.try_recv().ok();
         }
-        if stimmen.is_empty() && dauerton.is_none() && linienton.is_none() && puffer_schlange.is_empty()
+        if stimmen.is_empty()
+            && dauerton.is_none()
+            && linienton.is_none()
+            && puffer_schlange.is_empty()
         {
             continue;
         }

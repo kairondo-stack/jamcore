@@ -32,6 +32,7 @@ pub mod slice;
 pub mod stroboskop;
 pub mod takte;
 pub mod transformation;
+pub mod videotempo;
 pub mod wav;
 pub mod yuv;
 

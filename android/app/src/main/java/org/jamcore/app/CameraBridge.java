@@ -3,6 +3,7 @@ package org.jamcore.app;
 import android.content.Context;
 import android.graphics.ImageFormat;
 import android.hardware.camera2.CameraCaptureSession;
+import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
@@ -11,6 +12,9 @@ import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
+import android.view.Display;
+import android.view.Surface;
+import android.view.WindowManager;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
@@ -33,6 +37,13 @@ public final class CameraBridge {
     private static HandlerThread thread;
     private static Handler handler;
     private static String fehler = "";
+    /** Activity fuer die Display-Drehung (nur waehrend die Kamera laeuft). */
+    private static Context kontext;
+    /** SENSOR_ORIENTATION der geoeffneten Kamera (typisch 90). */
+    private static int sensorOrientierung;
+    private static boolean frontKamera;
+    /** Zuletzt geloggter Winkel, damit die Zeile nicht je Frame kommt. */
+    private static int letzteDrehung = -1;
 
     static {
         System.loadLibrary("jamandroid");
@@ -42,9 +53,9 @@ public final class CameraBridge {
             byte[] y, int yRowStride, int yPixelStride,
             byte[] u, int uRowStride, int uPixelStride,
             byte[] v, int vRowStride, int vPixelStride,
-            int width, int height);
+            int width, int height, int rotation);
 
-    /** Startet die Vorschau der ersten Kamera; Rueckgabe "" oder Fehlertext. */
+    /** Startet die Vorschau (bevorzugt Rueckkamera); Rueckgabe "" oder Fehlertext. */
     public static synchronized String start(Context context, int width, int height) {
         if (geraet != null) {
             return "";
@@ -57,7 +68,18 @@ public final class CameraBridge {
 
             CameraManager manager =
                     (CameraManager) context.getSystemService(Context.CAMERA_SERVICE);
-            String id = manager.getCameraIdList()[0];
+            String id = kamera_waehlen(manager);
+            // Sensor-Orientierung und Blickrichtung fuer die Drehung: das
+            // rohe Kamerabild kommt in Sensor-Koordinaten, nicht aufrecht.
+            CameraCharacteristics eigenschaften = manager.getCameraCharacteristics(id);
+            Integer sensor = eigenschaften.get(CameraCharacteristics.SENSOR_ORIENTATION);
+            sensorOrientierung = sensor == null ? 0 : sensor;
+            Integer facing = eigenschaften.get(CameraCharacteristics.LENS_FACING);
+            frontKamera = facing != null && facing == CameraCharacteristics.LENS_FACING_FRONT;
+            kontext = context;
+            letzteDrehung = -1;
+            Log.i(TAG, "sensor=" + sensorOrientierung + " display=" + displayGrad()
+                    + " rotation=" + drehung() + (frontKamera ? " (Front)" : " (Rueck)"));
             reader = ImageReader.newInstance(width, height, ImageFormat.YUV_420_888, 2);
             reader.setOnImageAvailableListener(CameraBridge::onImage, handler);
             manager.openCamera(id, new CameraDevice.StateCallback() {
@@ -137,12 +159,20 @@ public final class CameraBridge {
             return;
         }
         try {
+            // Der Winkel kann sich waehrend der Vorschau aendern (das Geraet
+            // dreht sich, fullSensor) — je Frame neu rechnen.
+            int winkel = drehung();
+            if (winkel != letzteDrehung) {
+                letzteDrehung = winkel;
+                Log.i(TAG, "sensor=" + sensorOrientierung + " display=" + displayGrad()
+                        + " rotation=" + winkel);
+            }
             Image.Plane[] planes = bild.getPlanes();
             nativeFrame(
                     kopie(planes[0]), planes[0].getRowStride(), planes[0].getPixelStride(),
                     kopie(planes[1]), planes[1].getRowStride(), planes[1].getPixelStride(),
                     kopie(planes[2]), planes[2].getRowStride(), planes[2].getPixelStride(),
-                    bild.getWidth(), bild.getHeight());
+                    bild.getWidth(), bild.getHeight(), winkel);
         } catch (Exception e) {
             Log.i(TAG, "Frame: " + e);
         } finally {
@@ -155,6 +185,57 @@ public final class CameraBridge {
         byte[] bytes = new byte[puffer.remaining()];
         puffer.get(bytes);
         return bytes;
+    }
+
+    /**
+     * Kamera fuer die Bildquelle waehlen: die erste Rueckkamera, sonst die
+     * erste ueberhaupt. Auf dem Handy ist das die Hauptkamera wie bisher; auf
+     * dem Emulator die Virtual-Scene statt der Front-Kamera.
+     */
+    private static String kamera_waehlen(CameraManager manager) throws Exception {
+        String[] kennungen = manager.getCameraIdList();
+        for (String kandidat : kennungen) {
+            Integer blick = manager.getCameraCharacteristics(kandidat)
+                    .get(CameraCharacteristics.LENS_FACING);
+            if (blick != null && blick == CameraCharacteristics.LENS_FACING_BACK) {
+                return kandidat;
+            }
+        }
+        return kennungen[0];
+    }
+
+    /**
+     * Drehwinkel im Uhrzeigersinn (0/90/180/270), damit das Kamerabild
+     * aufrecht steht. Sensor- und Display-Drehung gehen beide ein:
+     * Rueckkamera sensor - display, Frontkamera (ungespiegelte Rohdaten)
+     * sensor + display — die uebliche Kamera-Rechnung.
+     */
+    private static int drehung() {
+        int display = displayGrad();
+        return frontKamera
+                ? (sensorOrientierung + display) % 360
+                : (sensorOrientierung - display + 360) % 360;
+    }
+
+    /** Display-Drehung als Gradzahl (ROTATION_0/90/180/270); 0 bei Fehler. */
+    private static int displayGrad() {
+        try {
+            WindowManager fenster =
+                    (WindowManager) kontext.getSystemService(Context.WINDOW_SERVICE);
+            Display display = fenster.getDefaultDisplay();
+            switch (display.getRotation()) {
+                case Surface.ROTATION_90:
+                    return 90;
+                case Surface.ROTATION_180:
+                    return 180;
+                case Surface.ROTATION_270:
+                    return 270;
+                default:
+                    return 0;
+            }
+        } catch (Exception e) {
+            return 0;
+        }
     }
 
     /** Beendet Vorschau und Kamera. */
@@ -179,6 +260,8 @@ public final class CameraBridge {
                 thread.quitSafely();
                 thread = null;
             }
+            kontext = null;
+            letzteDrehung = -1;
         } catch (Exception e) {
             Log.i(TAG, "stop: " + e.getMessage());
         }

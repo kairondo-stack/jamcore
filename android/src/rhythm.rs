@@ -303,6 +303,52 @@ impl RhythmPanel {
         );
     }
 
+    /// Den Laub-Rhythmus (Laub-Tab) ins aktuelle Raster schreiben — wie das
+    /// Euklid-Muster: erst `clear`, dann je Schritt eine Note auf der
+    /// Schlagzeug-Zeile [`EUCLID_PITCH`].
+    ///
+    /// `takt` ist je Schritt `(Schrittnummer im Takt, Instrument)`: die
+    /// Schrittnummern kommen aus `jamcore::laub::schritte_aus_abstaenden`
+    /// (0..Raster), das Instrument aus der Blattfarbe (Farbklasse 0…3 →
+    /// Instrument 0…3; bei der Klangquelle „Slices" sind das die ersten vier
+    /// Slices).
+    ///
+    /// Das Muster steht in Schritten **eines Takts** (Raster 96/128/192/256).
+    /// Das Pattern behält seine Länge: ist es länger als der Takt, wird das
+    /// Muster je Takt wiederholt (wie das Euklid-Muster); ist es kürzer, wird
+    /// der Takt in die Patternlänge skaliert (sonst fielen Schritte hinter dem
+    /// Patternende weg). Rückgabe: Zahl der Noten im Raster.
+    pub fn laub_setzen(&mut self, takt: &[(u32, u8)], raster: u16) -> usize {
+        let len = self.pattern().steps_per_cycle().max(1) as u32;
+        let raster = raster.max(1) as u32;
+        self.pattern_mut().clear();
+        for (schritt, instrument) in takt {
+            if len >= raster {
+                // Takt-Muster über die Patternlänge wiederholen.
+                let mut ziel = *schritt as u32 % raster;
+                while ziel < len {
+                    self.pattern_mut().insert(Note {
+                        step: ziel as u16,
+                        instrument: *instrument,
+                        pitch: EUCLID_PITCH,
+                        glide: false,
+                    });
+                    ziel += raster;
+                }
+            } else {
+                // Kürzer als ein Takt: den Takt hineinskalieren.
+                let ziel = ((*schritt as u32 * len + raster / 2) / raster).min(len - 1);
+                self.pattern_mut().insert(Note {
+                    step: ziel as u16,
+                    instrument: *instrument,
+                    pitch: EUCLID_PITCH,
+                    glide: false,
+                });
+            }
+        }
+        self.pattern().notes().len()
+    }
+
     /// Sinus-Interpolation wie `D`+`3` im Desktop-Recorder: zwischen den
     /// bestehenden Noten schwingende Zwischentöne einfügen.
     /// Alle Noten im Schrittbereich löschen (Desktop: `E`/remove-Teil).

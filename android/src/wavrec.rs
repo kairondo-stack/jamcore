@@ -409,7 +409,10 @@ fn aufnahme_schleife(
         }
         // Pegel für die Oberfläche (f32-Bits; positive Werte sind als i32
         // monoton, deshalb genügt fetch_max).
-        peak.fetch_max((spitze as f32 / 32767.0).to_bits() as i32, Ordering::Relaxed);
+        peak.fetch_max(
+            (spitze as f32 / 32767.0).to_bits() as i32,
+            Ordering::Relaxed,
+        );
     }
 }
 
