@@ -35,3 +35,25 @@ Pad-Raster als zweiter Ansicht. Damit wird das Raster **polyphon**.
 
 ## Rollback
 Additiv: neues Kern-Modul + neue Ansicht; Raster bleibt unverändert.
+
+## Ergebnis (2026-10-20)
+
+- **Kern** (`core/src/tracker.rs`, `grid.rs`): `Note.channel: u8` (0…63),
+  `zelle_text` (`C-4 01` / `--- --`), `nach_kanal`, `setzen`, `loeschen`,
+  `sortiere`; Kern-Suite **381 Tests grün** (davon 9 neu für Kanäle/Zellen).
+  Bewusst: `instrument` bleibt `u8`, `note_name` bleibt Renoise-Schreibweise
+  (60 = `C-4`); `Pattern::insert` (Rampe/Euklid/Laub/CSV/XML) ersetzt weiter
+  alle Noten eines Schritts — zellenweise arbeiten nur `setzen`/`loeschen`.
+- **App** (`android/src/tracker.rs` + `rhythm.rs`): Umschalter
+  „Ansicht [Raster] [Tracker]", 64 Kanal-Spalten (horizontal) und bis zu 512
+  Zeilen (vertikal) in einem `ScrollArea`, Zellwahl per Tipp, Pads als
+  Tastatur, „Zelle löschen", Schritt-/Kanal-Schalter, Wiedergabe polyphon
+  (alle Noten, mehrere je Schritt).
+- **Belegt am Emulator** (2026-10-20, 1080×2400, APK arm64/x86_64):
+  - Umschalten loggt `tracker: Ansicht Tracker`; Ansicht zeigt
+    `Step | Ch1 … Ch64` mit `--- --`-Zellen.
+  - Tipp auf Zeile 452, Kanal 3: `tracker: Zelle Schritt 452 Kanal 3 gewählt (--- --)`
+    (die Ansicht folgt dem laufenden Schritt); Kopfzeile `Kanal 3 / 64`.
+  - Screenshots: `/tmp/opencode/laub_video/31_tracker.png`, `32_zelle.png`.
+- Offen: Noteneingabe über Pads am Gerät durchspielen (Code-Pfad
+  `setzen` + `note_klingen` gebaut, Log `tracker: Zelle … <- C-5 01`).

@@ -97,3 +97,26 @@ Bass**; Raster **96/128/192/256 Schritte pro Takt** (Pattern bis 1024 Schritte).
 ## Rollback
 
 Additiv: neuer Kern-Modul + neuer Tab; nichts Bestehendes wird umgebaut.
+
+## Ergebnis Video + Zoom (2026-10-20)
+
+- **„Video laden …"** (`laub.rs`): Datei-Browser mit Video-Filter
+  (`browser.rs`, `Filter::Video`: `.mp4/.mkv/.mov/.webm/…`, Startordner wie
+  Bilder, eigenes `files/videos/`), Dekodierung über die vorhandene
+  `crate::video`-Brücke, **bis zu 30 Bilder** (`VIDEO_FPS = 15`, Fristen
+  10 s/40 s) werden geprüft, das Bild mit den **meisten Blättern** gewinnt und
+  läuft durch dieselbe Kette wie ein Foto (Hintergrund, Abstände, Rendern).
+- **Belegt am Emulator** (2026-10-20): Testvideo 640×640 (4 s Laubbild, 6 s
+  grau) → `laub: Video geladen: …/blatt.mp4 (640x640, 30 Frames geprueft,
+  bester Frame 1, 104 Blaetter)`, Status „Video geladen, bester Frame 1/30
+  (104 Blätter)", Median-Abstand 153 px, Marker auf dem Bild.
+  Screenshots: `/tmp/opencode/laub_video/24_laeuft.png` … `28_reset.png`.
+- **Zoom im Laub-Bild**: Regler **100–800 %** (logarithmisch) + „ganzes Bild";
+  **Ziehen verschiebt**, der Versatz ist auf den Bildrand begrenzt; ein
+  reiner **Tipp** wählt weiter die Hintergrundfarbe. Marker/Kreise/Nummern
+  skalieren mit (belegt: 330 %, Pan, Reset — `26_zoom.png`, `27_pan.png`,
+  `28_reset.png`).
+- Beobachtung: Das Video-Prüfen sieht nur die **ersten 30 dekodierten Bilder**
+  (bei 15 fps ≈ erste 2 s). Für kurze Handaufnahmen mit Blättern ab Sekunde 1
+  reicht das; bei längeren Fahrten wäre eine Stichprobe über das ganze Video
+  besser (z. B. jedes n-te Bild) — offener Punkt.
