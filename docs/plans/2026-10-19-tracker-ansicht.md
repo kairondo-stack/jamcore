@@ -57,3 +57,10 @@ Additiv: neues Kern-Modul + neue Ansicht; Raster bleibt unverändert.
   - Screenshots: `/tmp/opencode/laub_video/31_tracker.png`, `32_zelle.png`.
 - Offen: Noteneingabe über Pads am Gerät durchspielen (Code-Pfad
   `setzen` + `note_klingen` gebaut, Log `tracker: Zelle … <- C-5 01`).
+- **Noteneingabe belegt** (2026-10-20): Pad `C-3` gedrückt →
+  `tracker: Zelle Schritt 452 Kanal 3 <- C-3 00`, Kopfzeile
+  „Zelle Schritt 452 · Kanal 3 · C-3 00", Status „1 Noten im …";
+  Screenshots `33_scroll.png` (Pads unter dem Tracker), `34_note.png`.
+- Hinweis Bedienung: Der Tracker hat eine eigene Scrollfläche; um an die Pads
+  zu kommen, die **Seite** außerhalb des Trackers ziehen (z. B. in der
+  Werkzeugzeile) — sonst scrollt der Tracker selbst.

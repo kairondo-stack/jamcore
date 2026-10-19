@@ -120,3 +120,11 @@ Additiv: neuer Kern-Modul + neuer Tab; nichts Bestehendes wird umgebaut.
   (bei 15 fps ≈ erste 2 s). Für kurze Handaufnahmen mit Blättern ab Sekunde 1
   reicht das; bei längeren Fahrten wäre eine Stichprobe über das ganze Video
   besser (z. B. jedes n-te Bild) — offener Punkt.
+
+## Desktop-Paket (2026-10-20)
+
+- `nix-build -A it_live` und `-A jam-tools` bauen wieder: Ursache war der
+  **Platzhalter-Hash** (`sha256-AAAA…`) in `hashes.nix` des Spiegels
+  `~/jam-nix` — `sync.sh` schloss `hashes.nix` aus, der Spiegel behielt also
+  den leeren Eintrag. Echter Hash (`sha256-vuI5…`) eingetragen, `sync.sh`
+  kopiert `hashes.nix` jetzt mit (Zeile entfernt).
