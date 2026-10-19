@@ -143,6 +143,9 @@ pub struct LaubPanel {
     px_pro_meter: f32,
     /// Das eine Tempo der App (JamApp setzt es je Frame).
     bpm: f32,
+    /// Zoom im Bild (1.0 = ganze Breite, bis 8.0) und Verschiebung in Punkten.
+    zoom: f32,
+    pan: egui::Vec2,
     /// Laufendes Video-Prüfen („Video laden …“), sonst `None`.
     videolauf: Option<Videolauf>,
     /// Zeile unter der Steuerung („ins Raster geschrieben …“).
@@ -175,6 +178,8 @@ impl LaubPanel {
             schrittlaenge: jamcore::laub::SCHRITTLANGE_M,
             px_pro_meter: PX_PRO_METER,
             bpm: jamcore::laub::BPM_VORGABE,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
             videolauf: None,
             status: "Kamera an + „Foto aufnehmen“, „Bild laden …“ oder „Video laden …“."
                 .to_string(),
@@ -315,11 +320,7 @@ impl LaubPanel {
                 }
             }
         }
-        if lauf.geprueft >= VIDEO_FRAMES_MAX
-            || (lauf.geprueft == 0
-                && lauf.start.elapsed() >= std::time::Duration::from_secs(VIDEO_START_FRIST_S))
-            || lauf.start.elapsed() >= std::time::Duration::from_secs(VIDEO_FRIST_S)
-        {
+        if video_fertig(lauf.geprueft, lauf.start.elapsed().as_secs_f64()) {
             self.video_beenden(lauf, ctx);
         } else {
             self.videolauf = Some(lauf);
@@ -625,6 +626,24 @@ impl LaubPanel {
                 );
             }
         });
+        // Zoom: Regler + „ganzes Bild“ (Ziehen im Bild verschiebt).
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Zoom").small().color(Color32::GRAY));
+            ui.add(
+                egui::Slider::new(&mut self.zoom, 1.0..=8.0)
+                    .logarithmic(true)
+                    .show_value(false),
+            );
+            ui.label(
+                RichText::new(format!("{:.0} %", self.zoom * 100.0))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            if ui.button("ganzes Bild").clicked() {
+                self.zoom = 1.0;
+                self.pan = egui::Vec2::ZERO;
+            }
+        });
         aktion
     }
 
@@ -645,12 +664,25 @@ impl LaubPanel {
         let (w, h) = (*w, *h);
         let platz = ui.available_width().max(80.0);
         let flaeche = ui.available_height().max(120.0);
-        let skala = (platz / w as f32).min(flaeche / h as f32);
+        let basis = (platz / w as f32).min(flaeche / h as f32);
+        let skala = basis * self.zoom;
         let bild_b = (w as f32 * skala).max(1.0);
         let bild_h = (h as f32 * skala).max(1.0);
+        let sicht = bild_h.min(flaeche);
         let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(platz, bild_h), egui::Sense::click());
-        let bild_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(bild_b, bild_h));
+            ui.allocate_exact_size(egui::vec2(platz, sicht), egui::Sense::click_and_drag());
+        // Verschiebung begrenzen: das Bild bleibt im Kasten (wie im Bild-Tab).
+        let max_x = ((bild_b - rect.width()) / 2.0).max(0.0);
+        let max_y = ((bild_h - rect.height()) / 2.0).max(0.0);
+        self.pan.x = self.pan.x.clamp(-max_x, max_x);
+        self.pan.y = self.pan.y.clamp(-max_y, max_y);
+        if response.dragged() {
+            self.pan += response.drag_delta();
+        }
+        let bild_rect = egui::Rect::from_center_size(
+            rect.center() + self.pan,
+            egui::vec2(bild_b, bild_h),
+        );
         {
             let painter = ui.painter().with_clip_rect(rect);
             painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 12, 14));
@@ -692,8 +724,10 @@ impl LaubPanel {
         }
 
         // Tipp ins Bild: die Farbe an der Stelle wird der Hintergrund (wie die
-        // Farbwahl im Bild-Tab), danach neu erkennen.
-        if let Some(pos) = response.interact_pointer_pos() {
+        // Farbwahl im Bild-Tab), danach neu erkennen. Ziehen verschiebt nur
+        // (Zoom), deshalb zählt hier der reine Klick.
+        if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
             if rect.contains(pos) {
                 let x = ((pos.x - bild_rect.min.x) / skala).floor();
                 let y = ((pos.y - bild_rect.min.y) / skala).floor();
@@ -712,6 +746,7 @@ impl LaubPanel {
                         }
                     }
                 }
+            }
             }
         }
     }
@@ -830,6 +865,16 @@ impl LaubPanel {
             ui.label(&self.status);
         }
     }
+}
+
+/// Ist das Video-Prüfen fertig? Nach [`VIDEO_FRAMES_MAX`] Bildern; ohne ein
+/// einziges Bild nach [`VIDEO_START_FRIST_S`] Sekunden (hängender Dekoder);
+/// sonst spätestens nach [`VIDEO_FRIST_S`] Sekunden (Notbremse — das beste
+/// bisherige Bild wird dann trotzdem übernommen).
+fn video_fertig(geprueft: usize, sekunden: f64) -> bool {
+    geprueft >= VIDEO_FRAMES_MAX
+        || (geprueft == 0 && sekunden >= VIDEO_START_FRIST_S as f64)
+        || sekunden >= VIDEO_FRIST_S as f64
 }
 
 /// Häufigste Farbe eines RGB8-Bildes: grobes Histogramm (jeder 4. Punkt, je
@@ -1207,6 +1252,16 @@ mod tests {
         let schon_klein = image::RgbaImage::from_pixel(100, 50, image::Rgba([1, 2, 3, 255]));
         let gleich = verkleinern(schon_klein);
         assert_eq!((gleich.width(), gleich.height()), (100, 50), "klein bleibt");
+    }
+
+    #[test]
+    fn video_fertig_nach_bildern_oder_frist() {
+        assert!(!video_fertig(0, 0.0), "frisch gestartet");
+        assert!(!video_fertig(29, 39.0), "kurz vor dem letzten Bild");
+        assert!(video_fertig(30, 6.0), "30 Bilder reichen");
+        assert!(video_fertig(0, 10.0), "kein Bild: hängender Dekoder");
+        assert!(!video_fertig(1, 10.0), "ein Bild: weiter prüfen");
+        assert!(video_fertig(1, 40.0), "Notbremse greift");
     }
 
     /// Ein Videobild wird wie ein Foto vorbereitet: verkleinert und mit der
