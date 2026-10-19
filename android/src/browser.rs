@@ -1,13 +1,15 @@
-//! Einfacher Datei-Browser für Modul-, Audio- **und** Bilddateien (Player-Tab
-//! „Öffnen", Slicer-Tab „Audio öffnen", Laub-Tab „Bild laden …").
+//! Einfacher Datei-Browser für Modul-, Audio-, Bild- **und** Videodateien
+//! (Player-Tab „Öffnen", Slicer-Tab „Audio öffnen", Laub-Tab „Bild laden …"
+//! und „Video laden …").
 //!
 //! Kein SAF/Java: die Activity ist `android.app.NativeActivity` und hat kein
 //! `onActivityResult`. Der Browser läuft in egui und liest die Ordner direkt:
 //! App-eigene Ordner zuerst, mit der „Alle Dateien"-Berechtigung zusätzlich
 //! DCIM, Pictures, Music, Download und Documents (siehe
 //! [`startordner`] und `crate::paths::ordner`). Ordner stehen zuerst, Dateien
-//! werden nach [`Filter`] ausgewählt (Module, Audio oder Bilder); sortiert wird
-//! mit der gemeinsamen Listen-Logik (`jamcore::modulebrowser::sortiere`).
+//! werden nach [`Filter`] ausgewählt (Module, Audio, Bilder oder Videos);
+//! sortiert wird mit der gemeinsamen Listen-Logik
+//! (`jamcore::modulebrowser::sortiere`).
 
 use eframe::egui;
 use jamcore::audio::ist_audio;
@@ -24,6 +26,8 @@ pub enum Filter {
     Audio,
     /// Bilddateien (.png/.jpg/.jpeg/.bmp) — Laub-Tab „Bild laden …".
     Bild,
+    /// Videodateien (.mp4/.mkv/.mov/.webm/…) — Laub-Tab „Video laden …".
+    Video,
 }
 
 impl Filter {
@@ -33,6 +37,7 @@ impl Filter {
             Filter::Module => ist_modul(name),
             Filter::Audio => ist_audio(name),
             Filter::Bild => ist_bild(name),
+            Filter::Video => ist_video(name),
         }
     }
 
@@ -42,6 +47,7 @@ impl Filter {
             Filter::Module => "Modul öffnen",
             Filter::Audio => "Audio öffnen",
             Filter::Bild => "Bild öffnen",
+            Filter::Video => "Video öffnen",
         }
     }
 
@@ -52,6 +58,10 @@ impl Filter {
             Filter::Module => crate::paths::OrdnerArt::Module,
             Filter::Audio => crate::paths::OrdnerArt::Audio,
             Filter::Bild => crate::paths::OrdnerArt::Bild,
+            // Videos liegen in denselben Ordnern wie die Bilder: App-eigenes
+            // `videos/` und (mit „Alle Dateien") `DCIM`, `Pictures`, `Download`,
+            // `Documents` — dort die Kamera-Videos in `DCIM/Camera`.
+            Filter::Video => crate::paths::OrdnerArt::Bild,
         }
     }
 }
@@ -64,6 +74,20 @@ fn ist_bild(pfad: &str) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| {
             ["png", "jpg", "jpeg", "bmp"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x))
+        })
+        .unwrap_or(false)
+}
+
+/// Ist die Datei ein Video? Endungen wie die Videoquellen des Bild-Tabs
+/// (`image.rs`): mp4/mkv/mov/webm und die dort ebenfalls gelisteten avi/3gp.
+fn ist_video(pfad: &str) -> bool {
+    std::path::Path::new(pfad)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| {
+            ["mp4", "mkv", "mov", "webm", "avi", "3gp"]
                 .iter()
                 .any(|x| e.eq_ignore_ascii_case(x))
         })
@@ -99,6 +123,11 @@ impl Browser {
     /// Browser für Bilddateien (Laub-Tab: Foto → Blätter → Rhythmus).
     pub fn neu_bild(start: Vec<PathBuf>) -> Self {
         Self::neu_filter(start, Filter::Bild)
+    }
+
+    /// Browser für Videodateien (Laub-Tab: Video → bestes Bild → Blätter).
+    pub fn neu_video(start: Vec<PathBuf>) -> Self {
+        Self::neu_filter(start, Filter::Video)
     }
 
     pub fn neu_filter(start: Vec<PathBuf>, filter: Filter) -> Self {

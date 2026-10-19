@@ -17,8 +17,18 @@ use eframe::egui::{self, Color32, Grid, RichText, Sense};
 use jamcore::euclid;
 use jamcore::grid::{note_name, Note, Pattern, MAX_STEPS_PER_CYCLE, STEPS_PER_CYCLE as STEP_COUNT};
 use jamcore::osc::{OscOut, Renoise, DEFAULT_BASE_PORT};
+use jamcore::tracker::{klemme_kanal, loeschen, setzen, zelle_text, KANAELE};
 use jamcore::transformation;
 use log::info;
+
+// Die Tracker-Ansicht steht bewusst hier statt über ein `mod tracker;` in
+// `lib.rs`: so bleibt die neue Ansicht auf `rhythm.rs` + `tracker.rs`
+// beschränkt (in `lib.rs` arbeitet parallel die Laub-/Video-Aufgabe).
+// Kanonisch gehörte die Zeile `mod tracker;` in `lib.rs`.
+#[path = "tracker.rs"]
+mod tracker;
+
+use self::tracker::{Ansicht, Zustand as TrackerZustand};
 
 const ROWS: [i32; 4] = [36, 48, 60, 72];
 const CELL: f32 = 22.0;
@@ -31,6 +41,29 @@ const EUCLID_PITCH: i32 = ROWS[0];
 /// „125 ms“ zur Tonlaenge — die ms haengen am aktuellen BPM.
 fn ms_text(e: crate::klang::Einstellungen) -> String {
     format!("{} ms", e.notenwert.ms(e.bpm))
+}
+
+/// Note fuer das Pad-Raster: Pads und Werkzeuge (Rampe, Euklid, Laub,
+/// Skalieren, Interpolieren) schreiben auf **Kanal 0**; die Kanäle 2…64
+/// gehören der Tracker-Ansicht, die über `jamcore::tracker::setzen` schreibt.
+fn raster_note(step: u16, instrument: u8, pitch: i32) -> Note {
+    Note {
+        step,
+        instrument,
+        pitch,
+        glide: false,
+        channel: 0,
+    }
+}
+
+/// Zahl der verschiedenen Kanäle in einer Notenliste — für Status und Log der
+/// Wiedergabe („N Noten auf M Kanälen“). Die Noten stehen als
+/// `(Schritt, Tonhöhe, Instrument, Kanal)`, wie sie der Render-Thread spielt.
+fn kanaele_anzahl(noten: &[(u16, i32, u8, u8)]) -> usize {
+    let mut kanaele: Vec<u8> = noten.iter().map(|(_, _, _, kanal)| *kanal).collect();
+    kanaele.sort_unstable();
+    kanaele.dedup();
+    kanaele.len()
 }
 
 /// Note ueber das Modul spielen — mit der Zuordnung aus dem Instrument-Tab.
@@ -108,6 +141,14 @@ pub struct RhythmPanel {
     euclid_schlag: usize,
     euclid_schritte: usize,
     euclid_versatz: usize,
+    /// Ansicht des Tabs: Pad-Raster (Step-Editor) oder Tracker (64 Kanäle).
+    ansicht: Ansicht,
+    /// Gewählte Tracker-Zelle — dorthin schreiben die Pads ihre Note.
+    tracker_schritt: u16,
+    tracker_kanal: u8,
+    /// Zeile, die die Tracker-Ansicht als Nächstes in den Blick holen soll
+    /// („Schritt ±“); wird von der Ansicht verbraucht.
+    tracker_scroll: Option<u16>,
 }
 
 impl Default for RhythmPanel {
@@ -155,6 +196,10 @@ impl RhythmPanel {
             euclid_schlag: 5,
             euclid_schritte: 16,
             euclid_versatz: 0,
+            ansicht: Ansicht::Raster,
+            tracker_schritt: 0,
+            tracker_kanal: 0,
+            tracker_scroll: None,
         }
     }
 
@@ -189,10 +234,20 @@ impl RhythmPanel {
     /// Eine Note klingen lassen: Modul-Sample, Slice oder Tongenerator.
     /// Ausserhalb von Threads; fuer die Threads wird die Logik dort wiederholt.
     /// `instrument` ist die Instrumentnummer des Rasters — bei der Klangquelle
-    /// „Slices" ist sie der Slice-Index.
-    fn note_klingen(&self, pitch: i32, instrument: i32) {
+    /// „Slices" ist sie der Slice-Index. `kanal` ist der Tracker-Kanal der
+    /// Note: **alle** Kanäle klingen (polyphon) — das Modul vergibt je Note
+    /// einen freien Modul-Kanal, der Tongenerator-Mixer je Note eine Stimme.
+    /// Die Klangwege kennen keinen Kanalparameter, deshalb steht er hier nur
+    /// im Log (welche Note auf welchem Kanal liegt, zeigt der Status).
+    fn note_klingen(&self, pitch: i32, instrument: u8, kanal: u8) {
+        log::debug!(
+            "Klang: Kanal {} {} (Instr {})",
+            kanal as usize + 1,
+            note_name(pitch),
+            instrument
+        );
         if self.klangquelle == Klangquelle::Slices
-            && crate::slicer::slice_spielen(instrument.max(0) as usize)
+            && crate::slicer::slice_spielen(instrument as usize)
         {
             return;
         }
@@ -238,12 +293,8 @@ impl RhythmPanel {
         self.pattern_mut().clear();
         for (t, pitch) in rampe {
             let step = ((t * steps as f32).round() as i64).rem_euclid(steps as i64) as u16;
-            self.pattern_mut().insert(Note {
-                step,
-                instrument,
-                pitch: pitch.clamp(0, 127),
-                glide: false,
-            });
+            self.pattern_mut()
+                .insert(raster_note(step, instrument, pitch.clamp(0, 127)));
         }
         self.status = format!(
             "Rampe: {} Noten (59 … {})",
@@ -282,18 +333,14 @@ impl RhythmPanel {
         self.pattern_mut().clear();
         for step in 0..schritte {
             if muster[step as usize % muster.len()] {
-                self.pattern_mut().insert(Note {
-                    step,
-                    instrument,
-                    pitch: EUCLID_PITCH,
-                    glide: false,
-                });
+                self.pattern_mut()
+                    .insert(raster_note(step, instrument, EUCLID_PITCH));
             }
         }
         // Nur ein Probe-Ton: das Muster kann hunderte Noten setzen, alle
         // gleichzeitig wären auf dem Handy nur ein Knall.
         self.play(EUCLID_PITCH, self.velocity);
-        self.note_klingen(EUCLID_PITCH, instrument as i32);
+        self.note_klingen(EUCLID_PITCH, instrument, 0);
         let noten = self.pattern().notes().len();
         self.status = format!(
             "Euklid {}/{}: {noten} Noten (Muster wiederholt, {})",
@@ -327,23 +374,15 @@ impl RhythmPanel {
                 // Takt-Muster über die Patternlänge wiederholen.
                 let mut ziel = *schritt as u32 % raster;
                 while ziel < len {
-                    self.pattern_mut().insert(Note {
-                        step: ziel as u16,
-                        instrument: *instrument,
-                        pitch: EUCLID_PITCH,
-                        glide: false,
-                    });
+                    self.pattern_mut()
+                        .insert(raster_note(ziel as u16, *instrument, EUCLID_PITCH));
                     ziel += raster;
                 }
             } else {
                 // Kürzer als ein Takt: den Takt hineinskalieren.
                 let ziel = ((*schritt as u32 * len + raster / 2) / raster).min(len - 1);
-                self.pattern_mut().insert(Note {
-                    step: ziel as u16,
-                    instrument: *instrument,
-                    pitch: EUCLID_PITCH,
-                    glide: false,
-                });
+                self.pattern_mut()
+                    .insert(raster_note(ziel as u16, *instrument, EUCLID_PITCH));
             }
         }
         self.pattern().notes().len()
@@ -380,12 +419,8 @@ impl RhythmPanel {
         self.pattern_mut().clear();
         for (t, pitch) in out {
             let step = ((t * steps as f32).round() as i64).rem_euclid(steps as i64) as u16;
-            self.pattern_mut().insert(Note {
-                step,
-                instrument,
-                pitch: pitch.clamp(0, 127),
-                glide: false,
-            });
+            self.pattern_mut()
+                .insert(raster_note(step, instrument, pitch.clamp(0, 127)));
         }
         self.status = format!(
             "Auf den Zyklus gestreckt: {} Noten",
@@ -418,12 +453,8 @@ impl RhythmPanel {
         self.pattern_mut().clear();
         for (t, pitch) in out {
             let step = ((t * steps as f32).round() as i64).rem_euclid(steps as i64) as u16;
-            self.pattern_mut().insert(Note {
-                step,
-                instrument,
-                pitch: pitch.clamp(0, 127),
-                glide: false,
-            });
+            self.pattern_mut()
+                .insert(raster_note(step, instrument, pitch.clamp(0, 127)));
         }
         self.status = format!("Interpoliert: {} Noten", self.pattern().notes().len());
     }
@@ -456,11 +487,11 @@ impl RhythmPanel {
         if self.render_laeuft {
             return;
         }
-        let noten: Vec<(u16, i32, i32)> = self
+        let noten: Vec<(u16, i32, u8, u8)> = self
             .pattern()
             .notes()
             .iter()
-            .map(|n| (n.step, n.pitch, n.instrument as i32))
+            .map(|n| (n.step, n.pitch, n.instrument, n.channel))
             .collect();
         // Die Laenge des Zyklus fuer den Render-Thread: die gemeinsame
         // Patternlaenge (frueher fest 16).
@@ -470,6 +501,9 @@ impl RhythmPanel {
             return;
         }
         let anzahl = noten.len();
+        // Polyphon: alle Kanaele klingen — mehrere Noten auf demselben Schritt
+        // (verschiedene Kanaele) werden alle gespielt, nicht nur die erste.
+        let kanaele = kanaele_anzahl(&noten);
         let (host, port) = self.target.clone();
         let bpm = self.render_bpm.max(20.0);
         let transport = self.transport_mit;
@@ -491,9 +525,15 @@ impl RhythmPanel {
                 }
                 let mut i: u16 = 0;
                 let mut klang_gemeldet = false;
+                info!("tracker: Wiedergabe {anzahl} Noten auf {kanaele} Kanälen (polyphon)");
                 while !stopp_c.load(Ordering::Relaxed) {
                     let start = Instant::now();
-                    for (s, pitch, instrument) in &noten {
+                    // Alle Noten dieses Schritts klingen — auch mehrere auf
+                    // demselben Schritt aus verschiedenen Kanälen. Die
+                    // Klangwege nehmen keinen Kanal entgegen: das Modul vergibt
+                    // je Note einen freien Modul-Kanal, der Mixer je Note eine
+                    // Stimme; deshalb steht der Kanal nur im Log/Status.
+                    for (s, pitch, instrument, kanal) in &noten {
                         if *s == i {
                             let gespielt = match klangquelle {
                                 Klangquelle::Modul => modul_gespielt(&modul, *pitch),
@@ -511,7 +551,10 @@ impl RhythmPanel {
                                     (true, Klangquelle::Slices) => "Slices",
                                     _ => "Tongenerator",
                                 };
-                                info!("Klang: {name}");
+                                info!(
+                                    "Klang: {name} (erster Ton auf Kanal {})",
+                                    *kanal as usize + 1
+                                );
                                 klang_gemeldet = true;
                             }
                             if let Some(o) = out.as_ref() {
@@ -538,8 +581,10 @@ impl RhythmPanel {
                 self.render_stopp = Some(stopp);
                 self.render_schritt = schritt;
                 self.render_laeuft = true;
-                self.status = format!("Rendern läuft ({anzahl} Noten, {bpm:.0} BPM)");
-                info!("Rendern gestartet ({anzahl} Noten)");
+                self.status = format!(
+                    "Rendern läuft ({anzahl} Noten auf {kanaele} Kanälen, {bpm:.0} BPM)"
+                );
+                info!("Rendern gestartet ({anzahl} Noten auf {kanaele} Kanälen)");
             }
             Err(e) => self.status = format!("Rendern-Thread: {e}"),
         }
@@ -552,17 +597,19 @@ impl RhythmPanel {
         if self.render_laeuft {
             self.rendern_stoppen();
         }
-        let mut noten: Vec<(u16, i32, i32)> = self
+        let mut noten: Vec<(u16, i32, u8, u8)> = self
             .pattern()
             .notes()
             .iter()
-            .map(|n| (n.step, n.pitch, n.instrument as i32))
+            .map(|n| (n.step, n.pitch, n.instrument, n.channel))
             .collect();
         if noten.is_empty() {
             self.status = "Slot ist leer.".to_string();
             return;
         }
-        noten.sort_by_key(|(s, _, _)| *s);
+        // Nach (Schritt, Kanal) sortieren: die Noten eines Schritts aus allen
+        // Kanälen werden nacheinander **alle** gespielt (polyphon).
+        noten.sort_by_key(|(s, _, _, kanal)| (*s, *kanal));
         let bpm = self.render_bpm.max(20.0);
         let (host, port) = self.target.clone();
         let basis = self.clock;
@@ -571,6 +618,7 @@ impl RhythmPanel {
         let modul = self.modul_quelle.clone();
         let schrittzeit = 60.0 / bpm / 4.0;
         let anzahl = noten.len();
+        let kanaele = kanaele_anzahl(&noten);
         let ergebnis = std::thread::Builder::new()
             .name("jam-slot".to_string())
             .spawn(move || {
@@ -582,7 +630,9 @@ impl RhythmPanel {
                 }
                 let out = OscOut::new(&host, port).ok();
                 let start = Instant::now();
-                for (step, pitch, instrument) in &noten {
+                // Alle Noten, auch mehrere auf demselben Schritt (Kanäle):
+                // die Wiedergabe ist polyphon, der Kanal steht im Log/Status.
+                for (step, pitch, instrument, kanal) in &noten {
                     let ziel = *step as f32 * schrittzeit;
                     let rest = ziel - start.elapsed().as_secs_f32();
                     if rest > 0.0 {
@@ -601,14 +651,21 @@ impl RhythmPanel {
                     if let Some(o) = out.as_ref() {
                         let _ = Renoise::new(o).note_on(7000, *pitch, 100);
                     }
+                    log::debug!(
+                        "Slot: Schritt {} Kanal {} {}",
+                        *step + 1,
+                        *kanal as usize + 1,
+                        note_name(*pitch)
+                    );
                 }
             });
         match ergebnis {
             Ok(_) => {
                 self.status = format!(
-                    "Slot {} gespielt ({} Noten, quantisiert)",
+                    "Slot {} gespielt ({} Noten auf {} Kanälen, quantisiert)",
                     self.slot + 1,
-                    anzahl
+                    anzahl,
+                    kanaele
                 );
                 info!("Slot {} einmal gespielt", self.slot + 1);
             }
@@ -780,14 +837,9 @@ impl RhythmPanel {
                 % self.pattern().steps_per_cycle().max(1);
             if !self.pattern_mut().has_at(ziel, pitch) {
                 let instrument = self.instrument;
-                self.pattern_mut().insert(Note {
-                    step: ziel,
-                    instrument,
-                    pitch,
-                    glide: false,
-                });
+                self.pattern_mut().insert(raster_note(ziel, instrument, pitch));
                 self.play(pitch, self.velocity);
-                self.note_klingen(pitch, instrument as i32);
+                self.note_klingen(pitch, instrument, 0);
                 self.status = format!(
                     "Aufnahme: Schritt {} <- {} ({} Noten)",
                     ziel + 1,
@@ -802,19 +854,14 @@ impl RhythmPanel {
         let added = if self.pattern_mut().has_at(step, pitch) {
             self.pattern_mut().toggle(step, pitch)
         } else {
-            self.pattern_mut().insert(Note {
-                step,
-                instrument,
-                pitch,
-                glide: false,
-            });
+            self.pattern_mut().insert(raster_note(step, instrument, pitch));
             true
         };
         if added {
             self.play(pitch, self.velocity);
             // Der Ton klingt auch lokal (im Demo-Video hoerbar) — mit der
             // gewaehlten Klangquelle.
-            self.note_klingen(pitch, instrument as i32);
+            self.note_klingen(pitch, instrument, 0);
             self.status = format!(
                 "Schritt {}: {} ({} Noten)",
                 step + 1,
@@ -834,6 +881,13 @@ impl RhythmPanel {
     /// Buendels (bei Buendelung 1 genau wie [`Self::toggle_pad`]). In der
     /// Aufnahme zaehlt weiter der laufende Schritt.
     fn pad_buendel(&mut self, von: u16, bis: u16, pitch: i32) {
+        // Tracker-Ansicht: die Pads sind die Notentastatur — der Ton landet in
+        // der **gewählten** Zelle (Schritt/Kanal), nicht auf dem angetippten
+        // Rasterschritt.
+        if self.ansicht == Ansicht::Tracker {
+            self.tracker_setzen(pitch);
+            return;
+        }
         if von == bis || (self.aufnahme && self.render_laeuft) {
             self.toggle_pad(von, pitch);
             return;
@@ -842,7 +896,7 @@ impl RhythmPanel {
         let gesetzt = self.pattern_mut().toggle_buendel(von, bis, pitch);
         if gesetzt {
             self.play(pitch, self.velocity);
-            self.note_klingen(pitch, self.instrument as i32);
+            self.note_klingen(pitch, self.instrument, 0);
         }
         self.status = format!(
             "{} Schritte {}: {} ({} Noten)",
@@ -851,6 +905,186 @@ impl RhythmPanel {
             note_name(pitch),
             self.pattern().notes().len()
         );
+    }
+
+    /// Ansicht des Rhythmus-Tabs umschalten (Umschalter „Raster ⇄ Tracker“).
+    fn ansicht_umschalten(&mut self, ansicht: Ansicht) {
+        if self.ansicht == ansicht {
+            return;
+        }
+        self.ansicht = ansicht;
+        self.tracker_scroll = Some(self.tracker_schritt);
+        match ansicht {
+            Ansicht::Raster => {
+                info!("tracker: Ansicht Raster");
+                self.status = "Ansicht: Raster (Step-Editor, Pads setzen Rasterzellen)".to_string();
+            }
+            Ansicht::Tracker => {
+                info!("tracker: Ansicht Tracker");
+                self.status = format!(
+                    "Ansicht: Tracker — Zelle antippen; ein Pad drückt die Note in die Zelle (Kanal {})",
+                    self.tracker_kanal as usize + 1
+                );
+            }
+        }
+    }
+
+    /// Die Note der gewählten Tracker-Zelle (`None` = leer).
+    fn tracker_zelle(&self) -> Option<Note> {
+        self.pattern()
+            .zelle(self.tracker_schritt, self.tracker_kanal)
+            .copied()
+    }
+
+    /// Zellwahl aus der Tracker-Ansicht (Tipp auf eine Zelle).
+    fn tracker_zelle_waehlen(&mut self, step: u16, kanal: u8) {
+        self.tracker_schritt = step % self.pattern().steps_per_cycle().max(1);
+        self.tracker_kanal = kanal;
+        let text = zelle_text(self.tracker_zelle().as_ref());
+        info!(
+            "tracker: Zelle Schritt {} Kanal {} gewählt ({})",
+            self.tracker_schritt + 1,
+            kanal as usize + 1,
+            text
+        );
+        self.status = format!(
+            "Zelle Schritt {} Kanal {} ({})",
+            self.tracker_schritt + 1,
+            kanal as usize + 1,
+            text
+        );
+    }
+
+    /// Eine Note in die **gewählte** Tracker-Zelle setzen — die Pads und
+    /// Tasten des Tabs sind dort die Notentastatur (Instrument = aktuelle
+    /// Auswahl, Skalenfilter wie im Raster). Eine belegte Zelle wird ersetzt.
+    fn tracker_setzen(&mut self, pitch: i32) {
+        let pitch = self.skaliere_pitch(pitch);
+        let note = Note {
+            step: self.tracker_schritt,
+            instrument: self.instrument,
+            pitch,
+            glide: false,
+            channel: self.tracker_kanal,
+        };
+        // `setzen` ersetzt die Zelle; die Rückgabe sagt nur, ob sie vorher
+        // leer war („angelegt“) — kein Fehlerfall.
+        let war_leer = setzen(self.pattern_mut(), note);
+        // Sofort hören (wie beim Pad im Raster) und per OSC nach draussen.
+        self.play(pitch, self.velocity);
+        self.note_klingen(pitch, note.instrument, note.channel);
+        // Den Text aus dem Pattern lesen: er zeigt, was wirklich steht.
+        let text = zelle_text(self.tracker_zelle().as_ref());
+        info!(
+            "tracker: Zelle Schritt {} Kanal {} <- {}",
+            note.step + 1,
+            note.channel as usize + 1,
+            text
+        );
+        self.status = format!(
+            "Zelle Schritt {} Kanal {} {} {} ({} Noten)",
+            note.step + 1,
+            note.channel as usize + 1,
+            if war_leer { "gesetzt" } else { "ersetzt" },
+            text,
+            self.pattern().notes().len()
+        );
+    }
+
+    /// Die gewählte Tracker-Zelle löschen.
+    fn tracker_loeschen(&mut self) {
+        let (step, kanal) = (self.tracker_schritt, self.tracker_kanal);
+        if loeschen(self.pattern_mut(), step, kanal) {
+            info!(
+                "tracker: Zelle Schritt {} Kanal {} gelöscht",
+                step + 1,
+                kanal as usize + 1
+            );
+            self.status = format!(
+                "Zelle Schritt {} Kanal {} gelöscht",
+                step + 1,
+                kanal as usize + 1
+            );
+        } else {
+            self.status = format!(
+                "Zelle Schritt {} Kanal {} war leer",
+                step + 1,
+                kanal as usize + 1
+            );
+        }
+    }
+
+    /// Gewählten Schritt verschieben (Knopf „Schritt ±“); die Ansicht holt die
+    /// Zeile danach in den Blick.
+    fn tracker_schritt_verschieben(&mut self, delta: i32) {
+        let schritte = self.pattern().steps_per_cycle().max(1) as i32;
+        self.tracker_schritt = (self.tracker_schritt as i32 + delta).rem_euclid(schritte) as u16;
+        self.tracker_scroll = Some(self.tracker_schritt);
+        self.tracker_status();
+    }
+
+    /// Gewählten Kanal verschieben (Knopf „Kanal ±“), 0…63 geklemmt.
+    fn tracker_kanal_verschieben(&mut self, delta: i32) {
+        self.tracker_kanal = klemme_kanal(self.tracker_kanal as i32 + delta);
+        self.tracker_status();
+    }
+
+    /// Statuszeile auf die gewählte Tracker-Zelle setzen.
+    fn tracker_status(&mut self) {
+        let text = zelle_text(self.tracker_zelle().as_ref());
+        self.status = format!(
+            "Zelle Schritt {} Kanal {} ({})",
+            self.tracker_schritt + 1,
+            self.tracker_kanal as usize + 1,
+            text
+        );
+    }
+
+    /// Werkzeugzeile der Tracker-Ansicht: Zellwahl, löschen, verschieben,
+    /// Instrument (die Instr-Knöpfe stehen weiter unten wie im Raster).
+    fn tracker_werkzeuge(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            let zelle = zelle_text(self.tracker_zelle().as_ref());
+            ui.label(
+                RichText::new(format!(
+                    "Zelle Schritt {} · Kanal {} · {}",
+                    self.tracker_schritt + 1,
+                    self.tracker_kanal as usize + 1,
+                    zelle
+                ))
+                .strong(),
+            );
+            if ui.button("Zelle löschen").clicked() {
+                self.tracker_loeschen();
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("Schritt -").clicked() {
+                self.tracker_schritt_verschieben(-1);
+            }
+            if ui.button("Schritt +").clicked() {
+                self.tracker_schritt_verschieben(1);
+            }
+            if ui.button("Kanal -").clicked() {
+                self.tracker_kanal_verschieben(-1);
+            }
+            if ui.button("Kanal +").clicked() {
+                self.tracker_kanal_verschieben(1);
+            }
+            ui.label(format!("Kanal {} / {}", self.tracker_kanal as usize + 1, KANAELE));
+            ui.label(format!("Instr {}", self.instrument));
+            let noten = self
+                .pattern()
+                .notes()
+                .iter()
+                .filter(|n| n.channel == self.tracker_kanal)
+                .count();
+            ui.label(
+                RichText::new(format!("{noten} Noten im Kanal"))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
     }
 
     /// Musterordner im externen App-Verzeichnis (ohne Berechtigung, per adb erreichbar).
@@ -969,6 +1203,33 @@ impl RhythmPanel {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.tick_own_clock();
         ui.ctx().request_repaint_after(Duration::from_millis(50));
+
+        // Umschalter „Raster ⇄ Tracker“: dieselbe Pattern, zwei Ansichten.
+        // Raster = Step-Editor wie bisher (Euklid, Laub, Maske, CSV/XML
+        // arbeiten unverändert darauf), Tracker = 64 Kanal-Spalten wie im
+        // Impulse Tracker.
+        ui.horizontal(|ui| {
+            ui.label("Ansicht");
+            if ui
+                .selectable_label(self.ansicht == Ansicht::Raster, "Raster")
+                .clicked()
+            {
+                self.ansicht_umschalten(Ansicht::Raster);
+            }
+            if ui
+                .selectable_label(self.ansicht == Ansicht::Tracker, "Tracker")
+                .clicked()
+            {
+                self.ansicht_umschalten(Ansicht::Tracker);
+            }
+            if self.ansicht == Ansicht::Tracker {
+                ui.label(
+                    RichText::new("Pads unten = Tastatur für die gewählte Zelle")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            }
+        });
 
         ui.horizontal(|ui| {
             // Acht Slots wie im Desktop-Recorder; gespeichert wird je Slot
@@ -1390,11 +1651,38 @@ impl RhythmPanel {
             self.presenter_zeichnen(ui);
         }
 
+        // Tracker-Ansicht: Zellwahl per Tipp, Werkzeugzeile darüber. Die Pads
+        // darunter sind hier die Notentastatur — sie schreiben in die gewählte
+        // Zelle (siehe `pad_buendel`).
+        if self.ansicht == Ansicht::Tracker {
+            // Die Patternlaenge kann sich inzwischen geaendert haben (Laenge-
+            // Regler, CSV/XML): die Zellwahl auf vorhandene Schritte klemmen,
+            // sonst zeigte die Ansicht keine Auswahl mehr, während ein Pad
+            // seine Note umgebrochen woandershin setzt.
+            self.tracker_schritt = self
+                .tracker_schritt
+                .min(self.pattern().steps_per_cycle().saturating_sub(1));
+            self.tracker_werkzeuge(ui);
+            let zustand = TrackerZustand {
+                schritt: self.tracker_schritt,
+                kanal: self.tracker_kanal,
+                spiel_schritt: self.current_step,
+            };
+            let mut scroll = self.tracker_scroll.take();
+            let getippt = tracker::ansicht(ui, self.pattern(), &zustand, &mut scroll);
+            self.tracker_scroll = scroll;
+            if let Some((step, kanal)) = getippt {
+                self.tracker_zelle_waehlen(step, kanal);
+            }
+        }
+
         // Ein Block je 8 Zellen (16 passen nicht nebeneinander auf die
         // Handy-Breite). Die Blockzahl folgt der **Patternlaenge** und der
         // Buendelung: bei der Vorgabe 512 und Buendelung 1 sind das 64
         // Bloecke, die ScrollArea traegt sie. Eine Zelle fasst `buendel`
         // Schritte zusammen und leuchtet, wenn darin eine Note liegt.
+        // Im Tracker-Modus sind diese Pads die Notentastatur: der Tipp geht in
+        // die dort gewählte Zelle (Schritt/Kanal), nicht in die Rasterzelle.
         let schritte = self.pattern().steps_per_cycle().max(1);
         let buendel = self.buendel.max(1);
         let je_block = BLOCK * buendel;

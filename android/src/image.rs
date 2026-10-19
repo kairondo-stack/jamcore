@@ -2227,6 +2227,8 @@ impl ImagePanel {
                                 instrument: 0,
                                 pitch: note,
                                 glide: false,
+                                // Bild-Follow schreibt ins Raster (Kanal 0).
+                                channel: 0,
                             });
                             self.aufgenommen += 1;
                         }
@@ -2429,6 +2431,8 @@ impl ImagePanel {
                             instrument: 0,
                             pitch: note,
                             glide: false,
+                            // Bild-Follow schreibt ins Raster (Kanal 0).
+                            channel: 0,
                         });
                         self.aufgenommen += 1;
                     }

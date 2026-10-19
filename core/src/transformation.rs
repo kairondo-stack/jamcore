@@ -122,6 +122,7 @@ mod tests {
             instrument: 0,
             pitch,
             glide: false,
+            channel: 0,
         }
     }
 

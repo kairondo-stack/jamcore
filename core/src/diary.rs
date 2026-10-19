@@ -162,12 +162,14 @@ mod tests {
             instrument: 0,
             pitch: 60,
             glide: false,
+            channel: 0,
         });
         e.noten.insert(Note {
             step: 4,
             instrument: 1,
             pitch: 67,
             glide: true,
+            channel: 0,
         });
         e
     }

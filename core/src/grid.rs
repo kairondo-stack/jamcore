@@ -31,12 +31,19 @@ const NOTE_NAMES: [&str; 12] = [
 
 /// Eine Note auf einem Schritt. `instrument` und `glide` werden nur für den
 /// CSV-Austausch mit dem Desktop gebraucht.
+///
+/// `channel` macht das Raster **polyphon** (Tracker-Ansicht, 2026-10-19): auf
+/// demselben Schritt dürfen Noten in verschiedenen Kanälen liegen. Vorgabe ist
+/// 0; beim Eintragen in ein [`Pattern`] wird auf 0..=63 geklemmt
+/// ([`crate::tracker::klemme_kanal`]). Die Raster-Funktionen (Euklid, Laub,
+/// Bild-Follow, Maske) legen weiter Noten auf Kanal 0 an.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Note {
     pub step: u16,
     pub instrument: u8,
     pub pitch: i32,
     pub glide: bool,
+    pub channel: u8,
 }
 
 /// Pattern-Raster mit höchstens einer Note je Schritt.
@@ -129,12 +136,33 @@ impl Pattern {
         &self.notes
     }
 
+    /// Notenliste zum Bearbeiten (Kern-intern: Tracker-Ansicht,
+    /// [`crate::tracker::setzen`] und [`crate::tracker::sortiere`]).
+    pub(crate) fn noten_mut(&mut self) -> &mut Vec<Note> {
+        &mut self.notes
+    }
+
+    /// Die Note in genau dieser **Zelle** (Schritt + Kanal); Schritte außerhalb
+    /// der Patternlänge treffen nichts. Für die Tracker-Ansicht hält eine Zelle
+    /// höchstens eine Note ([`crate::tracker::setzen`] ersetzt sie).
+    pub fn zelle(&self, step: u16, kanal: u8) -> Option<&Note> {
+        if step >= self.steps_per_cycle {
+            return None;
+        }
+        self.notes
+            .iter()
+            .find(|n| n.step == step && n.channel == kanal)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.notes.is_empty()
     }
 
     /// Legt die Note an oder entfernt sie; `true` heißt „angelegt“.
     /// Schritte ausserhalb der Patternlänge werden umgebrochen.
+    ///
+    /// Das Raster arbeitet schrittweise (eine Note je Schritt, Kanal 0); die
+    /// Tracker-Ansicht arbeitet zellenweise über [`crate::tracker::setzen`].
     pub fn toggle(&mut self, step: u16, pitch: i32) -> bool {
         let step = step % self.steps_per_cycle;
         match self.notes.iter().position(|n| n.step == step) {
@@ -153,20 +181,26 @@ impl Pattern {
                     instrument: 0,
                     pitch,
                     glide: false,
+                    channel: 0,
                 });
-                self.notes.sort_by_key(|n| (n.step, n.pitch));
+                self.notes.sort_by_key(|n| (n.step, n.channel, n.pitch));
                 true
             }
         }
     }
 
     /// Setzt eine Note (inklusive Instrument) auf dem Schritt; vorhandene Noten
-    /// auf dem Schritt werden ersetzt.
+    /// auf dem Schritt werden ersetzt. Der Kanal wird auf 0..=63 geklemmt.
     pub fn insert(&mut self, note: Note) -> bool {
         let step = self.abschnitt_step(note.step);
+        let channel = crate::tracker::klemme_kanal(i32::from(note.channel));
         self.notes.retain(|n| n.step != step);
-        self.notes.push(Note { step, ..note });
-        self.notes.sort_by_key(|n| (n.step, n.pitch));
+        self.notes.push(Note {
+            step,
+            channel,
+            ..note
+        });
+        self.notes.sort_by_key(|n| (n.step, n.channel, n.pitch));
         true
     }
 
@@ -323,9 +357,11 @@ impl Pattern {
                 instrument,
                 pitch,
                 glide,
+                // Das Desktop-CSV kennt keinen Kanal; alles landet auf Kanal 0.
+                channel: 0,
             });
         }
-        pattern.notes.sort_by_key(|n| (n.step, n.pitch));
+        pattern.notes.sort_by_key(|n| (n.step, n.channel, n.pitch));
         Ok(pattern)
     }
 
@@ -387,6 +423,7 @@ impl Pattern {
                         instrument: 0,
                         pitch,
                         glide: false,
+                        channel: 0,
                     });
                 }
                 step = rest
@@ -419,6 +456,7 @@ impl Pattern {
                         instrument,
                         pitch,
                         glide: false,
+                        channel: 0,
                     });
                 }
             }
@@ -429,9 +467,10 @@ impl Pattern {
                 instrument: 0,
                 pitch,
                 glide: false,
+                channel: 0,
             });
         }
-        pattern.notes.sort_by_key(|n| (n.step, n.pitch));
+        pattern.notes.sort_by_key(|n| (n.step, n.channel, n.pitch));
         Ok(pattern)
     }
 }
@@ -584,18 +623,21 @@ mod tests {
             instrument: 0,
             pitch: 60,
             glide: false,
+            channel: 0,
         });
         p.insert(Note {
             step: 5,
             instrument: 0,
             pitch: 64,
             glide: false,
+            channel: 0,
         });
         p.insert(Note {
             step: 15,
             instrument: 0,
             pitch: 67,
             glide: false,
+            channel: 0,
         });
         p.set_steps_per_cycle(6);
         assert_eq!(p.steps_per_cycle(), 6);
@@ -617,12 +659,14 @@ mod tests {
             instrument: 0,
             pitch: 60,
             glide: false,
+            channel: 0,
         });
         p.insert(Note {
             step: 3,
             instrument: 0,
             pitch: 60,
             glide: false,
+            channel: 0,
         });
         p.set_steps_per_cycle(1);
         assert_eq!(p.notes().len(), 1);
@@ -659,12 +703,14 @@ mod tests {
             instrument: 0,
             pitch: 36,
             glide: false,
+            channel: 0,
         });
         b.insert(Note {
             step: 0,
             instrument: 0,
             pitch: 36,
             glide: false,
+            channel: 0,
         });
         assert_eq!(a.to_csv(), b.to_csv());
         assert_eq!(a.to_csv(), "0,0,36,0\n");
@@ -689,6 +735,7 @@ mod tests {
             instrument: 0,
             pitch: 72,
             glide: false,
+            channel: 0,
         });
         let xml = p.to_renoise_xml();
         assert!(xml.contains("Line index=\"39\""), "letzter Schritt: {xml}");
@@ -721,12 +768,14 @@ mod tests {
             instrument: 0,
             pitch: 36,
             glide: false,
+            channel: 0,
         });
         p.insert(Note {
             step: 20,
             instrument: 0,
             pitch: 72,
             glide: false,
+            channel: 0,
         });
         // Der CSV bleibt normiert 0..1: Schritt 16 von 17 ist 16/17.
         assert_eq!(p.to_csv(), "0,0,36,0\n0.9411765,0,72,0\n");
@@ -766,6 +815,7 @@ mod tests {
             instrument: 0,
             pitch: 60,
             glide: false,
+            channel: 0,
         });
         assert_eq!(ganz.notes()[0].step, 16);
         // Start hinter dem Ende: es gibt kein sinnvolles Fenster, also wird mit dem
@@ -791,6 +841,7 @@ mod tests {
                 instrument: 0,
                 pitch,
                 glide: false,
+                channel: 0,
             });
         }
         let s = p.to_schism();
@@ -989,6 +1040,7 @@ mod tests {
             instrument: 10,
             pitch: 60,
             glide: false,
+            channel: 0,
         });
         let xml = p.to_renoise_xml();
         assert!(
@@ -1019,5 +1071,28 @@ mod tests {
     #[test]
     fn renoise_xml_meldet_fehlende_zeilen_root() {
         assert!(Pattern::from_renoise_xml("<html>", 16).is_err());
+    }
+
+    #[test]
+    fn insert_klemmt_den_kanal_auf_0_bis_63() {
+        let mut p = Pattern::with_steps(16);
+        p.insert(Note {
+            step: 0,
+            instrument: 0,
+            pitch: 60,
+            glide: false,
+            channel: 200,
+        });
+        assert_eq!(p.notes()[0].channel, 63, "ueber 63 wird geklemmt");
+        p.insert(Note {
+            step: 1,
+            instrument: 0,
+            pitch: 60,
+            glide: false,
+            channel: 5,
+        });
+        assert_eq!(p.zelle(1, 5).map(|n| n.channel), Some(5), "Zelle (1, 5)");
+        assert_eq!(p.zelle(1, 0), None, "andere Zelle desselben Schritts");
+        assert_eq!(p.zelle(99, 5), None, "hinter der Patternlaenge");
     }
 }

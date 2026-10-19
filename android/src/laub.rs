@@ -1,12 +1,27 @@
 //! Laub-Tab (Plan `docs/plans/2026-10-18-laub-rhythmus.md`, Step 3):
-//! Foto aufnehmen oder Bild laden → Blätter finden → Abstände anzeigen →
-//! Genre, Raster und Modus wählen → „als Rhythmus rendern“ schreibt die
-//! Schrittnummern ins Rhythmus-Raster.
+//! Foto aufnehmen, Bild **oder Video** laden → Blätter finden → Abstände
+//! anzeigen → Genre, Raster und Modus wählen → „als Rhythmus rendern“ schreibt
+//! die Schrittnummern ins Rhythmus-Raster.
 //!
 //! Das Rechnen liegt im Kern (`jamcore::laub`, Step 1+2); hier stehen
 //! Aufnahme, Anzeige, Bedienung und der Weg ins Raster
 //! ([`crate::rhythm::RhythmPanel::laub_setzen`]). Das Standbild liegt als RGB8
 //! in [`LaubPanel::bild`] (die Kamera liefert RGBA), die Anzeige als Textur.
+//!
+//! # Video („Video laden …“)
+//!
+//! Der Videodekoder (`crate::video`, Java-Brücke `VideoBridge`) liefert seine
+//! Bilder in denselben Framepuffer wie die Kamera. Statt zu warten, bis das
+//! Video durch ist, sieht [`LaubPanel::video_schritt`] (von der JamApp je
+//! Anzeigeframe gerufen, auch außerhalb des Tabs) **bis zu
+//! [`VIDEO_FRAMES_MAX`] Bilder** an und behält das mit den **meisten
+//! Blättern**. Danach wird der Dekoder gestoppt und dieses Bild läuft durch
+//! dieselbe Kette wie ein Foto.
+//!
+//! Warum der beste **einzelne** Frame und keine Sammlung über die Zeit: beim
+//! Filmen bewegt sich die Kamera, dasselbe Blatt liegt in verschiedenen Bildern
+//! an verschiedenen Bildpositionen — ein Vereinigen in Bildkoordinaten würde
+//! es mehrfach zählen. Ein einzelnes Bild hält die Abstände ehrlich.
 //!
 //! # Farben → Instrumente
 //!
@@ -43,12 +58,58 @@ const PX_PRO_METER: f32 = 200.0;
 /// Lange Kante eines geladenen Bildes (wie Kamera und Bild-Tab).
 const BILD_KANTE: u32 = 640;
 
+/// Wie viele Videobilder höchstens geprüft werden (bei [`VIDEO_FPS`] ≈ 2 s
+/// Dekodierzeit; die Auswertung je Bild kommt hinzu — auf dem Pixel 10 Pro
+/// dauerten 30 Bilder eines 1080p-Videos gemessen ≈ 6 s).
+const VIDEO_FRAMES_MAX: usize = 30;
+
+/// Bildrate beim Video-Prüfen: 15 fps (30 Bilder in ≈ 2 s Dekodierzeit).
+const VIDEO_FPS: u32 = 15;
+
+/// Frist ohne ein einziges Bild (Sekunden): kommt in dieser Zeit kein Frame,
+/// gilt der Dekoder als hängend und das Prüfen endet mit Meldung.
+const VIDEO_START_FRIST_S: u64 = 10;
+
+/// Obergrenze für das ganze Prüfen (Sekunden) — nur eine Notbremse. Die 30
+/// Bilder sollen normal durchlaufen: gemessen auf dem Pixel 10 Pro dauerten
+/// sie ≈ 6 s (1080p, 360x640 analysiert) bzw. ≈ 13 s (4K, 2160x3840).
+const VIDEO_FRIST_S: u64 = 40;
+
 /// Was der Laub-Tab von außen braucht (JamApp zeigt die Fenster).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Aktion {
     Keine,
     /// „Bild laden …“: JamApp öffnet den Datei-Browser (Filter Bilder).
-    BrowserOeffnen,
+    BrowserBild,
+    /// „Video laden …“: JamApp öffnet den Datei-Browser (Filter Videos).
+    BrowserVideo,
+}
+
+/// Ein laufendes Video-Prüfen: Bilder ansehen, das beste übernehmen
+/// ([`LaubPanel::video_schritt`]).
+struct Videolauf {
+    /// Der geladene Pfad (für Status und Log).
+    pfad: String,
+    /// Beginn des Prüfens (für die Frist [`VIDEO_FRIST_S`]).
+    start: std::time::Instant,
+    /// Zuletzt ausgewertete Framenummer aus [`camera::stand`].
+    letzte_nummer: u64,
+    /// Wie viele Bilder geprüft wurden.
+    geprueft: usize,
+    /// Das bisher beste Bild (die meisten Blätter).
+    bester: Option<BestesBild>,
+}
+
+/// Das bisher beste Videobild samt Zählung.
+struct BestesBild {
+    /// Wie vieltes geprüftes Bild (1-basiert) — „bester Frame 17/30“.
+    index: usize,
+    w: usize,
+    h: usize,
+    /// Das Bild in Analysegröße (lange Kante höchstens [`BILD_KANTE`]).
+    rgba: Vec<u8>,
+    /// Gefundene Blätter in diesem Bild.
+    blaetter: usize,
 }
 
 pub struct LaubPanel {
@@ -82,6 +143,8 @@ pub struct LaubPanel {
     px_pro_meter: f32,
     /// Das eine Tempo der App (JamApp setzt es je Frame).
     bpm: f32,
+    /// Laufendes Video-Prüfen („Video laden …“), sonst `None`.
+    videolauf: Option<Videolauf>,
     /// Zeile unter der Steuerung („ins Raster geschrieben …“).
     status: String,
     /// Zeile der Erkennung („13 Blätter, Median-Abstand 47 px“).
@@ -112,7 +175,9 @@ impl LaubPanel {
             schrittlaenge: jamcore::laub::SCHRITTLANGE_M,
             px_pro_meter: PX_PRO_METER,
             bpm: jamcore::laub::BPM_VORGABE,
-            status: "Kamera an + „Foto aufnehmen“ oder „Bild laden …“.".to_string(),
+            videolauf: None,
+            status: "Kamera an + „Foto aufnehmen“, „Bild laden …“ oder „Video laden …“."
+                .to_string(),
             erkennung: String::new(),
         }
     }
@@ -153,6 +218,186 @@ impl LaubPanel {
         }
     }
 
+    /// Ein Video laden (Datei-Browser): die Dekodierung startet, die Bilder
+    /// sammelt [`LaubPanel::video_schritt`] ein. Kehrt sofort zurück — die
+    /// Analyse läuft über die nächsten Anzeigeframes.
+    pub fn video_laden(&mut self, pfad: &str) {
+        self.video_stoppen();
+        if let Ok(app) = crate::current_app() {
+            camera::stop(&app);
+        }
+        let ergebnis = crate::current_app()
+            .map_err(|e| e.to_string())
+            .and_then(|app| crate::video::start(&app, pfad, VIDEO_FPS));
+        match ergebnis {
+            Ok(()) => {
+                let name = pfad.rsplit('/').next().unwrap_or(pfad);
+                self.videolauf = Some(Videolauf {
+                    pfad: pfad.to_string(),
+                    start: std::time::Instant::now(),
+                    letzte_nummer: camera::stand().0,
+                    geprueft: 0,
+                    bester: None,
+                });
+                self.status = format!(
+                    "Video läuft: {name} — bis zu {VIDEO_FRAMES_MAX} Bilder werden geprüft …"
+                );
+                log::info!(
+                    "laub: Video startet: {pfad} ({VIDEO_FPS} fps, bis zu {VIDEO_FRAMES_MAX} Bilder)"
+                );
+            }
+            Err(e) => {
+                self.status = format!("Video: {e}");
+                log::info!("laub: Video nicht startbar: {pfad}: {e}");
+            }
+        }
+    }
+
+    /// Läuft gerade ein Video-Prüfen?
+    pub fn video_laeuft(&self) -> bool {
+        self.videolauf.is_some()
+    }
+
+    /// „Video abbrechen“: laufendes Prüfen verwerfen, Dekoder stoppen.
+    pub fn video_abbrechen(&mut self) {
+        if self.video_laeuft() {
+            self.video_stoppen();
+            self.status = "Video abgebrochen".to_string();
+            log::info!("laub: Video abgebrochen");
+        }
+    }
+
+    /// Den Dekoder stoppen und das laufende Prüfen vergessen (ohne Status).
+    fn video_stoppen(&mut self) {
+        if self.videolauf.take().is_some() {
+            if let Ok(app) = crate::current_app() {
+                crate::video::stop(&app);
+            }
+        }
+    }
+
+    /// Ein Schritt des Video-Prüfens: **ein** neues Bild ansehen, Blätter
+    /// zählen, das beste behalten; nach [`VIDEO_FRAMES_MAX`] Bildern (oder
+    /// wenn gar nichts kommt bzw. [`VIDEO_FRIST_S`] abgelaufen ist)
+    /// abschließen. Die JamApp ruft das je Anzeigeframe auf — auch außerhalb
+    /// des Laub-Tabs, damit der Dekoder nicht im Hintergrund weiterläuft.
+    pub fn video_schritt(&mut self, ctx: &egui::Context) {
+        let Some(mut lauf) = self.videolauf.take() else {
+            return;
+        };
+        let (nummer, _, _) = camera::stand();
+        if nummer != lauf.letzte_nummer {
+            if let Some((w, h, rgba)) = camera::letztes_bild() {
+                // Nach dem Lesen noch einmal fragen: kommt während der
+                // Auswertung ein neues Bild, wird es übersprungen statt
+                // doppelt gezählt.
+                lauf.letzte_nummer = camera::stand().0.max(nummer);
+                if let Some((bw, bh, brgba, blaetter)) = self.videobild_pruefen(w, h, rgba) {
+                    lauf.geprueft += 1;
+                    let besser = lauf
+                        .bester
+                        .as_ref()
+                        .map(|b| blaetter > b.blaetter)
+                        .unwrap_or(true);
+                    if besser {
+                        lauf.bester = Some(BestesBild {
+                            index: lauf.geprueft,
+                            w: bw,
+                            h: bh,
+                            rgba: brgba,
+                            blaetter,
+                        });
+                    }
+                    self.status = format!(
+                        "Video prüft Bild {}/{} … ({blaetter} Blätter)",
+                        lauf.geprueft, VIDEO_FRAMES_MAX
+                    );
+                }
+            }
+        }
+        if lauf.geprueft >= VIDEO_FRAMES_MAX
+            || (lauf.geprueft == 0
+                && lauf.start.elapsed() >= std::time::Duration::from_secs(VIDEO_START_FRIST_S))
+            || lauf.start.elapsed() >= std::time::Duration::from_secs(VIDEO_FRIST_S)
+        {
+            self.video_beenden(lauf, ctx);
+        } else {
+            self.videolauf = Some(lauf);
+            // Ohne Nutzereingabe zeichnet egui nicht neu — der nächste Schritt
+            // braucht aber einen neuen Durchlauf.
+            ctx.request_repaint_after(std::time::Duration::from_millis(40));
+        }
+    }
+
+    /// Das Video-Prüfen abschließen: Dekoder stoppen und das beste Bild als
+    /// Analysebild übernehmen (Marker, Abstände, Rendern wie beim Foto).
+    fn video_beenden(&mut self, lauf: Videolauf, ctx: &egui::Context) {
+        if let Ok(app) = crate::current_app() {
+            crate::video::stop(&app);
+        }
+        let Some(best) = lauf.bester else {
+            let meldung = match crate::current_app() {
+                Ok(app) => crate::video::java_meldung(&app),
+                Err(_) => String::new(),
+            };
+            self.status = if meldung.is_empty() {
+                "Video ohne Bilder — Format prüfen.".to_string()
+            } else {
+                format!("Video: {meldung}")
+            };
+            log::info!("laub: Video ohne Bilder: {} ({meldung})", lauf.pfad);
+            ctx.request_repaint();
+            return;
+        };
+        // Wie beim geladenen Bild: das übernommene Bild liegt auch im
+        // Kamera-Framepuffer, damit der Bild-Tab dasselbe Standbild sieht.
+        camera::ruhebild_setzen(best.w, best.h, best.rgba.clone());
+        self.bild_uebernehmen(best.w, best.h, best.rgba);
+        self.status = format!(
+            "Video geladen, bester Frame {}/{} ({} Blätter)",
+            best.index, lauf.geprueft, best.blaetter
+        );
+        log::info!(
+            "laub: Video geladen: {} ({}x{}, {} Frames geprueft, bester Frame {}, {} Blaetter)",
+            lauf.pfad,
+            best.w,
+            best.h,
+            lauf.geprueft,
+            best.index,
+            best.blaetter
+        );
+        ctx.request_repaint();
+    }
+
+    /// Ein Videobild für die Analyse vorbereiten: auf die lange Kante
+    /// [`BILD_KANTE`] begrenzen (wie „Bild laden …“), Blätter zählen.
+    ///
+    /// Hintergrund für das Zählen: im Automatik-Modus die häufigste Farbe des
+    /// Bildes selbst — genau die, die [`LaubPanel::auto_hintergrund_waehlen`]
+    /// für das gewählte Bild nimmt; sonst die vom Nutzer getippte Farbe.
+    fn videobild_pruefen(
+        &self,
+        w: usize,
+        h: usize,
+        rgba: Vec<u8>,
+    ) -> Option<(usize, usize, Vec<u8>, usize)> {
+        if w == 0 || h == 0 || rgba.len() != w * h * 4 {
+            return None;
+        }
+        let bild = verkleinern(image::RgbaImage::from_raw(w as u32, h as u32, rgba)?);
+        let (bw, bh) = (bild.width() as usize, bild.height() as usize);
+        let rgba = bild.into_raw();
+        let rgb = rgb_aus_rgba(&rgba);
+        let hintergrund = if self.auto_hintergrund {
+            haeufigste_farbe(bw, bh, &rgb).unwrap_or(self.hintergrund)
+        } else {
+            self.hintergrund
+        };
+        let n =
+            jamcore::laub::blaetter(&rgb, bw as i32, bh as i32, hintergrund, self.toleranz).len();
+        Some((bw, bh, rgba, n))
+    }
+
     /// Foto: den letzten Kameraframe als Standbild übernehmen.
     fn foto_aufnehmen(&mut self) {
         match camera::letztes_bild() {
@@ -175,10 +420,7 @@ impl LaubPanel {
             self.status = "Bild hat unerwartete Maße".to_string();
             return;
         }
-        let mut rgb = Vec::with_capacity(w * h * 3);
-        for p in rgba.chunks_exact(4) {
-            rgb.extend_from_slice(&p[..3]);
-        }
+        let rgb = rgb_aus_rgba(&rgba);
         self.bild = Some((w, h, rgb));
         self.textur_offen = Some((w, h, rgba));
         if self.auto_hintergrund {
@@ -194,25 +436,10 @@ impl LaubPanel {
         let Some((w, h, rgb)) = self.bild.as_ref() else {
             return;
         };
-        let mut zaehler: HashMap<u32, (u64, u64, u64, u64)> = HashMap::new();
-        for y in (0..*h).step_by(4) {
-            for x in (0..*w).step_by(4) {
-                let i = (y * *w + x) * 3;
-                let (r, g, b) = (rgb[i], rgb[i + 1], rgb[i + 2]);
-                let schluessel = ((r >> 3) as u32) << 10 | ((g >> 3) as u32) << 5 | (b >> 3) as u32;
-                let e = zaehler.entry(schluessel).or_insert((0, 0, 0, 0));
-                e.0 += 1;
-                e.1 += r as u64;
-                e.2 += g as u64;
-                e.3 += b as u64;
-            }
-        }
-        if let Some((_, (n, r, g, b))) = zaehler.into_iter().max_by_key(|(_, e)| e.0) {
-            if n > 0 {
-                self.hintergrund = ((r / n) as u8, (g / n) as u8, (b / n) as u8);
-                let (r, g, b) = self.hintergrund;
-                log::info!("laub: Hintergrund automatisch RGB({r}, {g}, {b})");
-            }
+        if let Some(farbe) = haeufigste_farbe(*w, *h, rgb) {
+            self.hintergrund = farbe;
+            let (r, g, b) = farbe;
+            log::info!("laub: Hintergrund automatisch RGB({r}, {g}, {b})");
         }
     }
 
@@ -346,6 +573,9 @@ impl LaubPanel {
     }
 
     /// Der Tab: Kamera-Zeile, Bild mit Markern, Erkennung und Steuerung.
+    ///
+    /// Das Video-Prüfen ruft die JamApp je Frame ([`LaubPanel::video_schritt`],
+    /// auch außerhalb des Tabs) — hier kommt nur der fertige Zustand an.
     pub fn ui(&mut self, ui: &mut egui::Ui, rhythm: &mut crate::rhythm::RhythmPanel) -> Aktion {
         if let Some((w, h, rgba)) = self.textur_offen.take() {
             self.textur_setzen(ui.ctx(), w, h, &rgba);
@@ -375,7 +605,16 @@ impl LaubPanel {
                 self.foto_aufnehmen();
             }
             if ui.button("Bild laden …").clicked() {
-                aktion = Aktion::BrowserOeffnen;
+                aktion = Aktion::BrowserBild;
+            }
+            if ui.button("Video laden …").clicked() {
+                aktion = Aktion::BrowserVideo;
+            }
+            if self.video_laeuft() {
+                if ui.button("Video abbrechen").clicked() {
+                    self.video_abbrechen();
+                }
+                ui.spinner();
             }
             let (frames, breite, hoehe) = camera::stand();
             if frames > 0 {
@@ -395,7 +634,8 @@ impl LaubPanel {
         let Some(texture) = self.texture.clone() else {
             ui.colored_label(
                 Color32::GRAY,
-                "Noch kein Bild: „Kamera an“ + „Foto aufnehmen“ oder „Bild laden …“.",
+                "Noch kein Bild: „Kamera an“ + „Foto aufnehmen“, „Bild laden …“ oder \
+                 „Video laden …“.",
             );
             return;
         };
@@ -590,6 +830,59 @@ impl LaubPanel {
             ui.label(&self.status);
         }
     }
+}
+
+/// Häufigste Farbe eines RGB8-Bildes: grobes Histogramm (jeder 4. Punkt, je
+/// Kanal auf 8 Stufen), Rückgabe ist der Mittelwert der Siegerzelle.
+///
+/// Auf einem Weg-Foto ist das der Weg — dieselbe Rechnung nutzen die
+/// automatische Hintergrundwahl und das Video-Prüfen.
+fn haeufigste_farbe(w: usize, h: usize, rgb: &[u8]) -> Option<(u8, u8, u8)> {
+    if w == 0 || h == 0 || rgb.len() < w * h * 3 {
+        return None;
+    }
+    let mut zaehler: HashMap<u32, (u64, u64, u64, u64)> = HashMap::new();
+    for y in (0..h).step_by(4) {
+        for x in (0..w).step_by(4) {
+            let i = (y * w + x) * 3;
+            let (r, g, b) = (rgb[i], rgb[i + 1], rgb[i + 2]);
+            let schluessel = ((r >> 3) as u32) << 10 | ((g >> 3) as u32) << 5 | (b >> 3) as u32;
+            let e = zaehler.entry(schluessel).or_insert((0, 0, 0, 0));
+            e.0 += 1;
+            e.1 += r as u64;
+            e.2 += g as u64;
+            e.3 += b as u64;
+        }
+    }
+    zaehler
+        .into_iter()
+        .filter(|(_, e)| e.0 > 0)
+        .max_by_key(|(_, e)| e.0)
+        .map(|(_, (n, r, g, b))| ((r / n) as u8, (g / n) as u8, (b / n) as u8))
+}
+
+/// RGB8 aus RGBA8: Kamera und Videodekoder liefern RGBA, der Kern rechnet RGB.
+fn rgb_aus_rgba(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for p in rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&p[..3]);
+    }
+    rgb
+}
+
+/// Ein RGBA-Bild auf die lange Kante [`BILD_KANTE`] begrenzen (Triangle, wie
+/// `image::DynamicImage::resize` in [`LaubPanel::laden`]); kleinere Bilder
+/// bleiben unverändert. Videobilder kommen in Dekodiergröße (z. B. 1920×1080)
+/// — die Analyse rechnet wie bei Foto und Bild auf höchstens 640 Punkten.
+fn verkleinern(bild: image::RgbaImage) -> image::RgbaImage {
+    let (w, h) = (bild.width(), bild.height());
+    if w.max(h) <= BILD_KANTE {
+        return bild;
+    }
+    let skala = BILD_KANTE as f32 / w.max(h) as f32;
+    let nw = ((w as f32 * skala).round() as u32).max(1);
+    let nh = ((h as f32 * skala).round() as u32).max(1);
+    image::imageops::resize(&bild, nw, nh, image::imageops::FilterType::Triangle)
 }
 
 /// Abstände zwischen aufeinanderfolgenden Blättern (euklidisch, Pixel) — die
@@ -859,6 +1152,79 @@ mod tests {
             spiegel.dedup();
             assert_eq!(spiegel, kern, "Spiegel ≠ Kern für {d:?} @ {raster}");
         }
+    }
+
+    /// Ein synthetisches RGBA-Bild: grauer Weg, zwei rote Blätter.
+    fn video_testbild(w: usize, h: usize) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                let blatt = (2..6).contains(&x) && (2..6).contains(&y)
+                    || (10..13).contains(&x) && (10..13).contains(&y);
+                let p: [u8; 4] = if blatt {
+                    [200, 40, 30, 255]
+                } else {
+                    [128, 128, 128, 255]
+                };
+                rgba.extend_from_slice(&p);
+            }
+        }
+        rgba
+    }
+
+    #[test]
+    fn haeufigste_farbe_findet_den_weg() {
+        // 16x16: 12 graue Spalten, 4 rote — der Weg ist die größte Fläche.
+        let (w, h) = (16usize, 16usize);
+        let mut rgb = Vec::with_capacity(w * h * 3);
+        for _y in 0..h {
+            for x in 0..w {
+                let p: [u8; 3] = if x < 12 {
+                    [128, 128, 128]
+                } else {
+                    [200, 30, 20]
+                };
+                rgb.extend_from_slice(&p);
+            }
+        }
+        assert_eq!(haeufigste_farbe(w, h, &rgb), Some((128, 128, 128)));
+        assert_eq!(haeufigste_farbe(0, 0, &[]), None);
+        assert_eq!(haeufigste_farbe(4, 4, &[0, 0, 0]), None, "zu kurz");
+    }
+
+    #[test]
+    fn rgb_aus_rgba_laesst_alpha_weg() {
+        let rgba = vec![1, 2, 3, 255, 4, 5, 6, 0];
+        assert_eq!(rgb_aus_rgba(&rgba), vec![1, 2, 3, 4, 5, 6]);
+        assert!(rgb_aus_rgba(&[]).is_empty());
+    }
+
+    #[test]
+    fn verkleinern_begrenzt_die_lange_kante() {
+        let gross = image::RgbaImage::from_pixel(1280, 640, image::Rgba([1, 2, 3, 255]));
+        let klein = verkleinern(gross);
+        assert_eq!((klein.width(), klein.height()), (640, 320), "lange Kante 640");
+        let schon_klein = image::RgbaImage::from_pixel(100, 50, image::Rgba([1, 2, 3, 255]));
+        let gleich = verkleinern(schon_klein);
+        assert_eq!((gleich.width(), gleich.height()), (100, 50), "klein bleibt");
+    }
+
+    /// Ein Videobild wird wie ein Foto vorbereitet: verkleinert und mit der
+    /// Blattzahl des Kerns zurückgegeben.
+    #[test]
+    fn videobild_pruefen_zaehlt_die_blaetter() {
+        let panel = LaubPanel::new();
+        let (w, h) = (16usize, 16usize);
+        let (bw, bh, _, n) = panel
+            .videobild_pruefen(w, h, video_testbild(w, h))
+            .expect("Bild");
+        assert_eq!((bw, bh), (w, h), "kleines Bild bleibt");
+        assert_eq!(n, 2, "zwei Blätter");
+        assert!(panel.videobild_pruefen(0, 0, Vec::new()).is_none());
+        assert!(
+            panel.videobild_pruefen(4, 4, vec![0; 8]).is_none(),
+            "falsche Länge"
+        );
     }
 
     #[test]

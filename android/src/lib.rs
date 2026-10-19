@@ -86,6 +86,8 @@ struct JamApp {
     browser_audio: Option<browser::Browser>,
     /// Datei-Browser des Laub-Tabs („Bild laden …"), offen solange `Some`.
     browser_bild: Option<browser::Browser>,
+    /// Datei-Browser des Laub-Tabs („Video laden …"), offen solange `Some`.
+    browser_video: Option<browser::Browser>,
     looping: bool,
     player: Option<player::Player>,
     instr: instr::InstrumentPanel,
@@ -149,6 +151,7 @@ impl Default for JamApp {
             browser: None,
             browser_audio: None,
             browser_bild: None,
+            browser_video: None,
             looping: true,
             player: None,
             instr: instr::InstrumentPanel::default(),
@@ -426,6 +429,10 @@ impl eframe::App for JamApp {
         // (Klangquelle „Modul-Samples").
         self.rhythm
             .set_modul_quelle(self.player.as_ref().map(|p| p.modul_quelle()));
+        // Ein laufendes Laub-Video wird hier geprüft — nicht erst im Laub-Tab:
+        // so läuft der Dekoder auch nach einem Tab-Wechsel nur seine kurze
+        // Bilder-Reihe weiter und wird danach sicher gestoppt.
+        self.laub.video_schritt(ui.ctx());
         match self.tab {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),
@@ -502,6 +509,22 @@ impl eframe::App for JamApp {
             }
             if offen {
                 self.browser_bild = Some(browser);
+            }
+        }
+
+        // Datei-Browser des Laub-Tabs („Video laden …"): das Video wird
+        // geprüft (bis zu 30 Bilder, das beste wird zum Standbild), der
+        // Laub-Tab rendert danach unverändert weiter.
+        if let Some(mut browser) = self.browser_video.take() {
+            let mut offen = true;
+            let gewaehlt = browser.ui(ui.ctx(), &mut offen);
+            if let Some(path) = gewaehlt {
+                self.status = format!("Video: {} — Bilder werden geprüft …", file_name(&path));
+                self.laub.video_laden(&path.display().to_string());
+                offen = false;
+            }
+            if offen {
+                self.browser_video = Some(browser);
             }
         }
 
@@ -1003,13 +1026,21 @@ impl JamApp {
                     aktion = self.laub.ui(ui, &mut self.rhythm);
                 });
         });
-        if aktion == laub::Aktion::BrowserOeffnen {
+        if aktion == laub::Aktion::BrowserBild {
             let start = match self.app() {
                 Some(app) => browser::startordner(app, browser::Filter::Bild),
                 None => Vec::new(),
             };
             self.browser_bild = Some(browser::Browser::neu_bild(start));
             self.status = "Bild wählen …".to_string();
+        }
+        if aktion == laub::Aktion::BrowserVideo {
+            let start = match self.app() {
+                Some(app) => browser::startordner(app, browser::Filter::Video),
+                None => Vec::new(),
+            };
+            self.browser_video = Some(browser::Browser::neu_video(start));
+            self.status = "Video wählen …".to_string();
         }
     }
 
