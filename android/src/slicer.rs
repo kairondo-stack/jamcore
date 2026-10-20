@@ -171,6 +171,11 @@ pub fn slice_anzahl() -> usize {
 }
 
 /// Slice `index` einmal abspielen (Rhythmus-Raster). `true`, wenn es ihn gibt.
+///
+/// Der Aufruf **ersetzt keine laufende Stimme**: jeder Slice ist eine eigene
+/// Stimme in `klang::puffer_spielen` (mit eigener Hüllkurve), die vorige klingt
+/// zu Ende. Genau das verhindert das Abschneiden des vorherigen Samples; der
+/// Tracker-Kanal ist nur die Ordnung im Raster, kein Stimmenschalter.
 pub fn slice_spielen(index: usize) -> bool {
     let Ok(guard) = raster_slot().lock() else {
         return false;
@@ -187,7 +192,7 @@ pub fn slice_spielen(index: usize) -> bool {
         return false;
     };
     info!(
-        "slicer: Slice {} von {} -> Puffer ({} Samples, {} Hz)",
+        "slicer: Slice {} von {} -> Puffer ({} Samples, {} Hz, klingt über der vorigen Stimme)",
         index + 1,
         guard.len(),
         pcm.len(),

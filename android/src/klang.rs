@@ -8,8 +8,12 @@
 //!
 //! Dritter Auftragstyp neben Note und Dauerton: fertige PCM-Puffer
 //! ([`puffer_spielen`], z. B. Slices aus dem Slicer). Sie klingen **einmal**
-//! (keine Schleife), werden auf die Ausgaberate umgerechnet und bei Ueberlast
-//! fällt der **aelteste** Puffer raus — wie bei den Stimmen.
+//! (keine Schleife), werden auf die Ausgaberate umgerechnet und **übereinander**
+//! gemischt: eine Stimme je Aufruf, damit ein neues Sample das vorherige nicht
+//! abschneidet. Bei Überlast (mehr als [`PUFFER_MAX`] Stimmen) blendet die
+//! älteste in wenigen Millisekunden aus, statt hart zu enden; erst über der
+//! harten Grenze fällt eine Stimme wirklich weg. So bleibt der Klang polyphon
+//! und der Speicher begrenzt (jede Stimme hält ihren Puffer).
 //!
 //! Dazu kommen die dauerhaften **Linien-/Bereichsstimmen** des
 //! Oszillator-Scans ([`linienton_setzen`]): ein ganzer Satz (Hz, Gain), den
@@ -33,8 +37,16 @@ const ENCODING_PCM_16BIT: i32 = 2;
 const MODE_STREAM: i32 = 1;
 /// Blockgroesse des Mischers: ~10 ms. Fluessig genug und wenige JNI-Aufrufe.
 const BLOCK: usize = 441;
-/// So viele fertige Puffer warten hoechstens; der aelteste faellt raus.
-const PUFFER_MAX: usize = 8;
+/// So viele fertige Puffer klingen hoechstens gleichzeitig (eine Stimme je
+/// Aufruf). 16 statt 8: ein Sample, das laenger als acht Schritte klingt, wurde
+/// sonst mitten im Klang abgeschnitten, sobald die naechste Note kam.
+const PUFFER_MAX: usize = 16;
+/// Harte Obergrenze **waehrend des Ausblendens**: verdraengte Stimmen klingen
+/// noch ein paar Millisekunden aus, statt sofort zu enden (kein Klick). Erst
+/// darueber faellt wirklich eine Stimme weg, damit der Speicher begrenzt bleibt.
+const PUFFER_HART: usize = PUFFER_MAX + 8;
+/// Ausblendzeit einer verdraengten Stimme.
+const AUSBLEND_MS: f64 = 5.0;
 
 /// Ein Auftrag an den Klang-Thread.
 enum Auftrag {
@@ -53,6 +65,12 @@ struct KlingenderPuffer {
     /// So viele Quell-Samples je Ausgabe-Sample.
     schritt: f64,
     gain: f32,
+    /// Rest-Lautstaerke beim Verdraengen (1.0 = unveraendert). Sie faellt je
+    /// Ausgabe-Sample um `abnahme`, damit die Stimme weich endet statt zu
+    /// klicken, wenn eine neue Note denselben Platz braucht.
+    rest: f32,
+    /// Abnahme je Ausgabe-Sample; 0.0, solange der Puffer nicht verdraengt ist.
+    abnahme: f32,
 }
 
 impl KlingenderPuffer {
@@ -67,11 +85,26 @@ impl KlingenderPuffer {
             pos: 0.0,
             schritt,
             gain: gain.clamp(0.0, 1.0),
+            rest: 1.0,
+            abnahme: 0.0,
         }
     }
 
+    /// Sanft ausblenden statt hart abschneiden: die Stimme faellt nach
+    /// [`AUSBLEND_MS`] aus der Schlange. Ein zweiter Aufruf startet das
+    /// Ausblenden nicht neu — sonst bliebe eine alte Stimme laenger als noetig.
+    fn verdraengen(&mut self) {
+        if self.abnahme == 0.0 {
+            self.abnahme = (1.0 / (RATE as f64 * AUSBLEND_MS / 1000.0)) as f32;
+        }
+    }
+
+    fn verdraengt(&self) -> bool {
+        self.abnahme > 0.0
+    }
+
     fn fertig(&self) -> bool {
-        self.pos >= self.pcm.len() as f64
+        self.rest <= 0.0 || self.pos >= self.pcm.len() as f64
     }
 
     /// In den Block mischen (addieren) und die Position weiterruecken. Am Ende
@@ -91,9 +124,17 @@ impl KlingenderPuffer {
             let anteil = (self.pos - i as f64) as f32;
             let quelle =
                 self.pcm[i] as f32 + (self.pcm[i + 1] as f32 - self.pcm[i] as f32) * anteil;
-            let add = (quelle * self.gain) as i32;
+            let add = (quelle * self.gain * self.rest) as i32;
             *wert = (*wert as i32 + add).clamp(-32768, 32767) as i16;
             self.pos += self.schritt;
+            if self.abnahme > 0.0 {
+                self.rest -= self.abnahme;
+                if self.rest <= 0.0 {
+                    self.rest = 0.0;
+                    self.pos = n as f64;
+                    break;
+                }
+            }
         }
         if self.pos >= (n - 1) as f64 {
             self.pos = n as f64;
@@ -296,8 +337,10 @@ pub fn spielen_welle(midi: i32, welle: Welle) {
 }
 
 /// Einen fertigen PCM-Puffer (mono, 16 Bit) **einmal** abspielen — für Slices
-/// aus dem Slicer. Läuft neben den Tongenerator-Stimmen; bei Überlast fällt
-/// der älteste wartende Puffer aus der Warteschlange.
+/// aus dem Slicer. Läuft **übereinander** mit den Tongenerator-Stimmen und mit
+/// weiteren Puffern (eine Stimme je Aufruf, bis [`PUFFER_MAX`]); ein neuer
+/// Aufruf schneidet den vorherigen also nicht ab. Bei Überlast blendet die
+/// älteste Stimme kurz aus.
 pub fn puffer_spielen(pcm: Vec<i16>, rate: u32, gain: f32) {
     if pcm.is_empty() || rate == 0 {
         info!(
@@ -437,16 +480,35 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
                     }
                 }
                 Auftrag::Puffer { pcm, rate, gain } => {
-                    info!(
-                        "klang: Puffer klingt ({} Samples, {} Hz, Warteschlange {})",
-                        pcm.len(),
-                        rate,
-                        puffer_schlange.len() + 1
-                    );
+                    let laenge = pcm.len();
                     puffer_schlange.push_back(KlingenderPuffer::neu(pcm, rate, gain));
-                    // Ueberlast: der aelteste Puffer faellt raus.
-                    while puffer_schlange.len() > PUFFER_MAX {
+                    // Ueberlast: die aeltesten Stimmen weich ausblenden, damit
+                    // das vorherige Sample nicht mitten im Klang abbricht. Nur
+                    // ueber der harten Grenze (Ausblendende mitgezaehlt) faellt
+                    // wirklich eine weg — der Speicher bleibt begrenzt.
+                    while puffer_schlange.len() > PUFFER_HART {
                         puffer_schlange.pop_front();
+                    }
+                    let ueber = puffer_schlange.len().saturating_sub(PUFFER_MAX);
+                    let mut frisch_ausgeblendet = 0;
+                    for i in 0..ueber {
+                        if let Some(p) = puffer_schlange.get_mut(i) {
+                            if !p.verdraengt() {
+                                p.verdraengen();
+                                frisch_ausgeblendet += 1;
+                            }
+                        }
+                    }
+                    info!(
+                        "klang: Puffer klingt ({laenge} Samples, {rate} Hz, {} Stimmen)",
+                        puffer_schlange.len()
+                    );
+                    if frisch_ausgeblendet > 0 {
+                        info!(
+                            "klang: {} Slice-Stimmen (Grenze {PUFFER_MAX}) — \
+                             {frisch_ausgeblendet} blendet in {AUSBLEND_MS:.0} ms aus",
+                            puffer_schlange.len()
+                        );
                     }
                 }
             }

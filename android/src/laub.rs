@@ -9,20 +9,60 @@
 //! ([`crate::rhythm::RhythmPanel::laub_setzen`]). Das Standbild liegt als RGB8
 //! in [`LaubPanel::bild`] (die Kamera liefert RGBA), die Anzeige als Textur.
 //!
+//! # Vorschau
+//!
+//! Läuft die Kamera und ist kein Standbild eingefroren, zeichnet der Tab das
+//! neueste Kamerabild mit denselben Zoom/Pan-Regeln wie das Standbild.
+//! „Foto aufnehmen“ friert ein, „Live“ schaltet zurück. Kopiert wird nur bei
+//! neuer Framenummer ([`LaubPanel::vorschau_aktualisieren`]) — 1,2 MB je
+//! Kamerabild und Anzeigeframe wären sonst reine Verschwendung. Nach einer
+//! Sekunde ohne neues Bild gilt die Kamera als aus und das Standbild kehrt
+//! zurück, auch wenn sie in einem anderen Tab gestoppt wurde.
+//!
+//! # Taktgruppen
+//!
+//! Ein Takt ist die Abstandsfolge **einer** Gruppe aus
+//! [`jamcore::laub::gruppiere_abstaende`]. Eine Taktgruppe ordnet mehrere
+//! Takte hintereinander an (`G1 G2 G1 G3`), weil die Abstände eines Genres
+//! variieren. „Taktgruppe → Patterns“ schreibt die Folge ab Zeile 0 im
+//! Abstand von `feinheit` Zeilen; was nicht mehr in den Slot passt, setzt sich
+//! im nächsten fort (Ring 8).
+//!
+//! # Anhören-Marker
+//!
+//! Beim Anhören schreibt der Thread den gerade klingenden Rasterschritt in
+//! [`LaubPanel::spiel_position`]. Die Zeichnung markiert die Blätter dieses
+//! Schritts weiß und zeigt unten eine Schrittleiste; Stop setzt 0. Der
+//! Status-/Log-Text bleibt dabei unverändert (kein Spam je Schritt).
+//!
 //! # Video („Video laden …“)
 //!
 //! Der Videodekoder (`crate::video`, Java-Brücke `VideoBridge`) liefert seine
-//! Bilder in denselben Framepuffer wie die Kamera. Statt zu warten, bis das
-//! Video durch ist, sieht [`LaubPanel::video_schritt`] (von der JamApp je
-//! Anzeigeframe gerufen, auch außerhalb des Tabs) **bis zu
-//! [`VIDEO_FRAMES_MAX`] Bilder** an und behält das mit den **meisten
-//! Blättern**. Danach wird der Dekoder gestoppt und dieses Bild läuft durch
-//! dieselbe Kette wie ein Foto.
+//! Bilder in denselben Framepuffer wie die Kamera. Statt nur die ersten
+//! Sekunden zu prüfen, sieht [`LaubPanel::video_schritt`] (von der JamApp je
+//! Anzeigeframe gerufen, auch außerhalb des Tabs) **über die ganze Dauer**
+//! verteilt Bilder an: höchstens eines alle 400 ms Wanduhr, bis zu
+//! [`VIDEO_FRAMES_MAX`] Stück bzw. [`VIDEO_FRIST_S`] Sekunden. Das Bild mit
+//! den **meisten Blättern** gewinnt. Danach wird der Dekoder gestoppt und
+//! dieses Bild läuft durch dieselbe Kette wie ein Foto.
+//!
+//! Warum Wanduhr statt `jamcore::laub::stichproben_zeiten`: die Java-Brücke
+//! liefert keine Videodauer, und der Dekoder läuft nach dem Dateiende in
+//! Schleife. Die Drosselung braucht beides nicht und tastet ein
+//! Echtzeit-Video trotzdem gleichmäßig ab (15 Dekodier-fps genügen für 2,5
+//! Proben je Sekunde).
 //!
 //! Warum der beste **einzelne** Frame und keine Sammlung über die Zeit: beim
 //! Filmen bewegt sich die Kamera, dasselbe Blatt liegt in verschiedenen Bildern
 //! an verschiedenen Bildpositionen — ein Vereinigen in Bildkoordinaten würde
 //! es mehrfach zählen. Ein einzelnes Bild hält die Abstände ehrlich.
+//!
+//! # Kamera-Sammeln
+//!
+//! „Sammeln 10 s“ wertet alle 500 ms ein Kamerabild aus (ohne Anzeige) und
+//! übernimmt am Ende das Bild mit den meisten Blättern — dieselbe Idee wie
+//! beim Video, nur live und ohne Dekoder. Es läuft nur, solange der Laub-Tab
+//! sichtbar ist; ein Tab-Wechsel bricht es ab.
 //!
 //! # Farben → Instrumente
 //!
@@ -36,8 +76,8 @@
 //! Blattfarbe auf einem Schritt gewinnt — bei einem gefalteten Takt ist das
 //! das erste Blatt, das dort ankommt.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,22 +102,62 @@ const PX_PRO_METER: f32 = 200.0;
 /// Lange Kante eines geladenen Bildes (wie Kamera und Bild-Tab).
 const BILD_KANTE: u32 = 640;
 
-/// Wie viele Videobilder höchstens geprüft werden (bei [`VIDEO_FPS`] ≈ 2 s
-/// Dekodierzeit; die Auswertung je Bild kommt hinzu — auf dem Pixel 10 Pro
-/// dauerten 30 Bilder eines 1080p-Videos gemessen ≈ 6 s).
-const VIDEO_FRAMES_MAX: usize = 30;
+/// Harte Obergrenze ausgewerteter Videobilder. Bei [`VIDEO_ABTAST_MS`] sind
+/// das gut 30 s Film — genug, um Blätter auch in der zweiten Hälfte eines
+/// Videos zu finden; die Auswertung je Bild kostet auf dem Handy spürbar Zeit,
+/// deshalb keine unbegrenzte Sammlung.
+const VIDEO_FRAMES_MAX: usize = 80;
 
-/// Bildrate beim Video-Prüfen: 15 fps (30 Bilder in ≈ 2 s Dekodierzeit).
+/// Bildrate beim Video-Prüfen: 15 fps. Der Dekoder läuft damit ungefähr in
+/// Echtzeit; ausgewertet wird trotzdem nur alle [`VIDEO_ABTAST_MS`].
 const VIDEO_FPS: u32 = 15;
+
+/// Wanduhr-Abstand zwischen zwei ausgewerteten Videobildern: 400 ms
+/// (≈ 2,5 Bilder je Sekunde Film). Der Dekoder liefert 15 fps; dazwischen
+/// liegende Bilder werden bewusst übersprungen, sonst kostet ein langes Video
+/// Minuten statt Sekunden.
+const VIDEO_ABTAST_MS: u64 = 400;
 
 /// Frist ohne ein einziges Bild (Sekunden): kommt in dieser Zeit kein Frame,
 /// gilt der Dekoder als hängend und das Prüfen endet mit Meldung.
 const VIDEO_START_FRIST_S: u64 = 10;
 
-/// Obergrenze für das ganze Prüfen (Sekunden) — nur eine Notbremse. Die 30
-/// Bilder sollen normal durchlaufen: gemessen auf dem Pixel 10 Pro dauerten
-/// sie ≈ 6 s (1080p, 360x640 analysiert) bzw. ≈ 13 s (4K, 2160x3840).
-const VIDEO_FRIST_S: u64 = 40;
+/// Ende, wenn der Dekoder so lange kein neues Bild mehr liefert (Sekunden).
+/// Der Java-Dekoder läuft normalerweise in Schleife; das greift also nur bei
+/// einem hängenden oder am Dateiende stehengebliebenen Dekoder.
+const VIDEO_ENDE_OHNE_BILD_S: f64 = 1.5;
+
+/// Obergrenze für das ganze Prüfen (Sekunden). Sie deckt auch Videos ab, deren
+/// Dauer die App nicht kennt (die Java-Brücke liefert sie nicht): nach 45 s
+/// ist Schluss und das beste bisherige Bild wird übernommen.
+const VIDEO_FRIST_S: f64 = 45.0;
+
+/// Dauer des Kamera-Sammelns und Zahl der Proben (eine alle 500 ms).
+const SAMMELN_DAUER_S: f32 = 10.0;
+const SAMMELN_PROBEN: usize = 20;
+const SAMMELN_ABSTAND_MS: u64 = 500;
+
+/// Gruppen im Laub-Tab: so viele Abstände bilden einen Takt. 0 wäre „alles
+/// ein Takt“; die UI bietet 2/4/8, Vorgabe 4.
+const GRUPPEN_VORGABE: usize = 4;
+const GRUPPEN_MAX: usize = 8;
+
+/// Wählbare Längen einer Taktgruppe in Takten (ein Pattern-Slot fasst
+/// höchstens acht; mehr ergäbe für die Anzeige keinen Sinn).
+const TAKTGRUPPE_WAHL: [usize; 4] = [1, 2, 4, 8];
+
+/// Vorgabe-Länge einer Taktgruppe: 4 Takte, eine musikalische Phrase (das
+/// Nutzerbeispiel ist `G1 G2 G1 G3`).
+const TAKTGRUPPE_VORGABE: usize = 4;
+
+/// Nach so langer Bildstille gilt die Kamera als aus: Die Vorschau holt das
+/// Standbild zurück, auch wenn die Kamera in einem anderen Tab gestoppt wurde.
+/// Ein Kamerabild kommt sonst etwa 30-mal je Sekunde.
+const VORSCHAU_STILL_MS: u64 = 1000;
+
+/// Auffrischung der Live-Vorschau: ~30 fps, wie die Kamera liefert. Ohne
+/// diesen Anstoß zeichnet egui nur bei Eingaben und das Bild stünde still.
+const VORSCHAU_MS: u64 = 33;
 
 /// Was der Laub-Tab von außen braucht (JamApp zeigt die Fenster).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -96,17 +176,39 @@ struct Videolauf {
     pfad: String,
     /// Beginn des Prüfens (für die Frist [`VIDEO_FRIST_S`]).
     start: std::time::Instant,
-    /// Zuletzt ausgewertete Framenummer aus [`camera::stand`].
+    /// Zuletzt gesehene Framenummer aus [`camera::stand`].
     letzte_nummer: u64,
+    /// Wann zuletzt ein **neues** Dekodierbild ankam — daraus folgt das Ende
+    /// „seit [`VIDEO_ENDE_OHNE_BILD_S`] kein neues Bild“.
+    letzte_bildzeit: Instant,
+    /// Wann zuletzt ein Bild ausgewertet wurde (Drosselung auf
+    /// [`VIDEO_ABTAST_MS`]).
+    letzte_pruefung: Option<Instant>,
     /// Wie viele Bilder geprüft wurden.
     geprueft: usize,
     /// Das bisher beste Bild (die meisten Blätter).
     bester: Option<BestesBild>,
 }
 
+/// Ein laufendes Kamera-Sammeln („Sammeln 10 s“): über die Dauer verteilt
+/// Bilder auswerten, das beste behalten.
+struct Sammellauf {
+    /// Beginn des Sammelns (Dauer und Log).
+    start: Instant,
+    /// Zuletzt ausgewertete Framenummer — dasselbe Bild wird nicht doppelt
+    /// gezählt, wenn die Kamera gerade nicht liefert.
+    letzte_nummer: u64,
+    /// Wann zuletzt eine Probe fiel (Takt von [`SAMMELN_ABSTAND_MS`]).
+    letzte_probe: Option<Instant>,
+    /// Zahl der ausgewerteten Bilder.
+    geprueft: usize,
+    /// Das bisher beste Bild.
+    bester: Option<BestesBild>,
+}
+
 /// Das bisher beste Videobild samt Zählung.
 struct BestesBild {
-    /// Wie vieltes geprüftes Bild (1-basiert) — „bester Frame 17/30“.
+    /// Wie vieltes geprüftes Bild (1-basiert) — „bester Frame 17“.
     index: usize,
     w: usize,
     h: usize,
@@ -117,10 +219,25 @@ struct BestesBild {
 }
 
 pub struct LaubPanel {
-    /// Anzeige-Textur des Standbilds.
+    /// Anzeige-Textur des Standbilds oder der Live-Vorschau.
     texture: Option<egui::TextureHandle>,
     /// Neues Bild für die Textur, bis der nächste `ui`-Aufruf es hochlädt.
     textur_offen: Option<(usize, usize, Vec<u8>)>,
+    /// Maße der aktuellen Textur: Livebild und Standbild können verschiedene
+    /// Größen haben, Zoom/Pan und Marker rechnen mit diesen Maßen.
+    anzeige_masse: (usize, usize),
+    /// In der Textur liegt gerade das Livebild (sonst das Standbild).
+    textur_live: bool,
+    /// Vorschau live (`true`) oder eingefrorenes Standbild (`false`).
+    vorschau_live: bool,
+    /// Zuletzt in die Textur übernommene Kameraframenummer: nur ein **neues**
+    /// Bild wird kopiert, nicht jedes Anzeigeframe (1,2 MB je Kopie).
+    vorschau_nummer: u64,
+    /// Wann zuletzt ein neues Kamerabild ankam; daraus folgt „Kamera aus“.
+    vorschau_bildzeit: Option<Instant>,
+    /// Das analysierte Standbild als RGBA — für die Rückkehr aus der
+    /// Live-Vorschau, ohne die Analyse-RGB neu umzurechnen.
+    standbild_rgba: Option<(usize, usize, Vec<u8>)>,
     /// Das analysierte Standbild als RGB8 (die Kamera liefert RGBA).
     bild: Option<(usize, usize, Vec<u8>)>,
     /// Gefundene Blätter in Wegrichtung (erst y, dann x).
@@ -152,12 +269,36 @@ pub struct LaubPanel {
     pan: egui::Vec2,
     /// Laufendes Video-Prüfen („Video laden …“), sonst `None`.
     videolauf: Option<Videolauf>,
+    /// Laufendes Kamera-Sammeln („Sammeln 10 s“), sonst `None`.
+    sammeln: Option<Sammellauf>,
+    /// Zeitpunkt des letzten `ui`-Aufrufs: bleibt der Tab länger als eine
+    /// Sekunde weg, gilt ein laufendes Sammeln als abgebrochen (die JamApp
+    /// ruft `ui` nur für den sichtbaren Tab; ein globaler Schritt wie beim
+    /// Video steht hier nicht zur Verfügung).
+    sammeln_letzte_ui: Instant,
+    /// Abstände je Gruppe (2/4/8) — jede Gruppe wird ein Takt/Pattern.
+    gruppe_groesse: usize,
+    /// Gewählte Gruppe für „Anhören“ (0-basiert, auf die Gruppen geklemmt).
+    gruppe_auswahl: usize,
+    /// Länge der Taktgruppe in Takten (1/2/4/8).
+    taktgruppe_len: usize,
+    /// Gruppenindex je Takt der Taktgruppe (0-basiert); wird geklemmt, damit
+    /// ein Wechsel der Gruppengröße die Folge nicht ungültig macht.
+    taktfolge: Vec<usize>,
+    /// Gruppenzahl, für die die Taktfolge zuletzt aufgefüllt wurde. Solange
+    /// noch kein Bild erkannt ist (0), sind die Takte Platzhalter; kommen die
+    /// ersten Gruppen, werden sie reihum belegt statt alle auf G1 zu bleiben.
+    taktfolge_gruppen: usize,
     /// „Anhören“ läuft: die berechneten Schritte klingen in Schleife, ohne ins
     /// Pattern zu schreiben.
     anhoeren_laeuft: bool,
     /// Stopp-Flag des Anhören-Threads.
     anhoeren_stopp: Option<Arc<AtomicBool>>,
     anhoeren_thread: Option<std::thread::JoinHandle<()>>,
+    /// Gerade gespielter Rasterschritt (0…Raster−1) für den Marker im Bild;
+    /// Stop setzt 0. Ein Atom statt eines Mutex: die Zeichenfunktion liest je
+    /// Frame, der Thread schreibt je Note.
+    spiel_position: Arc<AtomicU16>,
     /// Herzschlag der Oberfläche: der Anhören-Thread stoppt, wenn der Laub-Tab
     /// verlassen wird (dann ruft niemand mehr `ui` auf).
     anhoeren_herz: Arc<Mutex<Instant>>,
@@ -185,6 +326,12 @@ impl LaubPanel {
         Self {
             texture: None,
             textur_offen: None,
+            anzeige_masse: (0, 0),
+            textur_live: false,
+            vorschau_live: true,
+            vorschau_nummer: 0,
+            vorschau_bildzeit: None,
+            standbild_rgba: None,
             bild: None,
             blaetter: Vec::new(),
             abstaende: Vec::new(),
@@ -201,9 +348,17 @@ impl LaubPanel {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             videolauf: None,
+            sammeln: None,
+            sammeln_letzte_ui: Instant::now(),
+            gruppe_groesse: GRUPPEN_VORGABE,
+            gruppe_auswahl: 0,
+            taktgruppe_len: TAKTGRUPPE_VORGABE,
+            taktfolge: Vec::new(),
+            taktfolge_gruppen: 0,
             anhoeren_laeuft: false,
             anhoeren_stopp: None,
             anhoeren_thread: None,
+            spiel_position: Arc::new(AtomicU16::new(0)),
             anhoeren_herz: Arc::new(Mutex::new(Instant::now())),
             status: "Kamera an + „Foto aufnehmen“, „Bild laden …“ oder „Video laden …“."
                 .to_string(),
@@ -222,6 +377,7 @@ impl LaubPanel {
     /// Kamera-Framepuffer gelegt — so sehen Bild-Tab und Laub-Tab dasselbe
     /// Standbild.
     pub fn laden(&mut self, pfad: &str) {
+        self.sammeln_stoppen(false);
         if let Ok(app) = crate::current_app() {
             camera::stop(&app);
             crate::video::stop(&app);
@@ -252,6 +408,7 @@ impl LaubPanel {
     /// Analyse läuft über die nächsten Anzeigeframes.
     pub fn video_laden(&mut self, pfad: &str) {
         self.video_stoppen();
+        self.sammeln_stoppen(false);
         if let Ok(app) = crate::current_app() {
             camera::stop(&app);
         }
@@ -265,14 +422,18 @@ impl LaubPanel {
                     pfad: pfad.to_string(),
                     start: std::time::Instant::now(),
                     letzte_nummer: camera::stand().0,
+                    letzte_bildzeit: Instant::now(),
+                    letzte_pruefung: None,
                     geprueft: 0,
                     bester: None,
                 });
                 self.status = format!(
-                    "Video läuft: {name} — bis zu {VIDEO_FRAMES_MAX} Bilder werden geprüft …"
+                    "Video läuft: {name} — höchstens alle {VIDEO_ABTAST_MS} ms ein Bild, \
+                     bis zu {VIDEO_FRAMES_MAX} insgesamt …"
                 );
                 log::info!(
-                    "laub: Video startet: {pfad} ({VIDEO_FPS} fps, bis zu {VIDEO_FRAMES_MAX} Bilder)"
+                    "laub: Video startet: {pfad} ({VIDEO_FPS} fps, Abtastung alle \
+                     {VIDEO_ABTAST_MS} ms, bis zu {VIDEO_FRAMES_MAX} Bilder, Frist {VIDEO_FRIST_S:.0} s)"
                 );
             }
             Err(e) => {
@@ -305,22 +466,40 @@ impl LaubPanel {
         }
     }
 
-    /// Ein Schritt des Video-Prüfens: **ein** neues Bild ansehen, Blätter
-    /// zählen, das beste behalten; nach [`VIDEO_FRAMES_MAX`] Bildern (oder
-    /// wenn gar nichts kommt bzw. [`VIDEO_FRIST_S`] abgelaufen ist)
-    /// abschließen. Die JamApp ruft das je Anzeigeframe auf — auch außerhalb
-    /// des Laub-Tabs, damit der Dekoder nicht im Hintergrund weiterläuft.
+    /// Ein Schritt des Video-Prüfens: **höchstens eines alle
+    /// [`VIDEO_ABTAST_MS`] Wanduhr** ansehen, Blätter zählen, das beste
+    /// behalten. So verteilen sich die Proben über die ganze Videodauer statt
+    /// nur über die ersten zwei Sekunden; nach [`VIDEO_FRAMES_MAX`] Bildern,
+    /// [`VIDEO_FRIST_S`] Sekunden oder [`VIDEO_ENDE_OHNE_BILD_S`] ohne neues
+    /// Dekodierbild wird abgeschlossen. Die JamApp ruft das je Anzeigeframe
+    /// auf — auch außerhalb des Laub-Tabs, damit der Dekoder nicht im
+    /// Hintergrund weiterläuft.
+    ///
+    /// Warum Wanduhr und nicht `stichproben_zeiten` aus dem Kern: die
+    /// Java-Brücke (`crate::video`) liefert keine Videodauer, und der Dekoder
+    /// läuft in Schleife. Die 400-ms-Drosselung braucht beides nicht und
+    /// tastet ein Echtzeit-Video trotzdem gleichmäßig ab (15 Dekodier-fps
+    /// genügen für 2,5 Proben je Sekunde).
     pub fn video_schritt(&mut self, ctx: &egui::Context) {
         let Some(mut lauf) = self.videolauf.take() else {
             return;
         };
         let (nummer, _, _) = camera::stand();
-        if nummer != lauf.letzte_nummer {
+        let neues_bild = nummer != lauf.letzte_nummer;
+        if neues_bild {
+            lauf.letzte_nummer = nummer;
+            lauf.letzte_bildzeit = Instant::now();
+        }
+        let faellig = lauf
+            .letzte_pruefung
+            .map(|zeit| zeit.elapsed() >= Duration::from_millis(VIDEO_ABTAST_MS))
+            .unwrap_or(true);
+        if neues_bild && faellig {
             if let Some((w, h, rgba)) = camera::letztes_bild() {
-                // Nach dem Lesen noch einmal fragen: kommt während der
-                // Auswertung ein neues Bild, wird es übersprungen statt
-                // doppelt gezählt.
-                lauf.letzte_nummer = camera::stand().0.max(nummer);
+                // Auch ein erfolgloses Vorbereiten (kaputte Maße) zählt als
+                // Abtastung: sonst würde dasselbe Bild im nächsten Frame
+                // erneut verarbeitet.
+                lauf.letzte_pruefung = Some(Instant::now());
                 if let Some((bw, bh, brgba, blaetter)) = self.videobild_pruefen(w, h, rgba) {
                     lauf.geprueft += 1;
                     let besser = lauf
@@ -337,19 +516,27 @@ impl LaubPanel {
                             blaetter,
                         });
                     }
+                    let sekunden = lauf.start.elapsed().as_secs_f32();
+                    let bisher = lauf
+                        .bester
+                        .as_ref()
+                        .map(|b| b.blaetter)
+                        .unwrap_or(blaetter);
                     self.status = format!(
-                        "Video prüft Bild {}/{} … ({blaetter} Blätter)",
-                        lauf.geprueft, VIDEO_FRAMES_MAX
+                        "Bild {} · {:.1} s geprüft · {} Blätter (bestes {})",
+                        lauf.geprueft, sekunden, blaetter, bisher
                     );
                 }
             }
         }
-        if video_fertig(lauf.geprueft, lauf.start.elapsed().as_secs_f64()) {
+        let sekunden = lauf.start.elapsed().as_secs_f64();
+        let ohne_bild = lauf.letzte_bildzeit.elapsed().as_secs_f64();
+        if video_fertig(lauf.geprueft, sekunden, ohne_bild) {
             self.video_beenden(lauf, ctx);
         } else {
             self.videolauf = Some(lauf);
             // Ohne Nutzereingabe zeichnet egui nicht neu — der nächste Schritt
-            // braucht aber einen neuen Durchlauf.
+            // braucht aber einen neuen Durchlauf (Abtastung 400 ms).
             ctx.request_repaint_after(std::time::Duration::from_millis(40));
         }
     }
@@ -378,16 +565,18 @@ impl LaubPanel {
         // Kamera-Framepuffer, damit der Bild-Tab dasselbe Standbild sieht.
         camera::ruhebild_setzen(best.w, best.h, best.rgba.clone());
         self.bild_uebernehmen(best.w, best.h, best.rgba);
+        let sekunden = lauf.start.elapsed().as_secs_f32();
         self.status = format!(
-            "Video geladen, bester Frame {}/{} ({} Blätter)",
-            best.index, lauf.geprueft, best.blaetter
+            "Video geladen: bester Frame {} · {:.1} s geprüft · {} Blätter ({} Bilder)",
+            best.index, sekunden, best.blaetter, lauf.geprueft
         );
         log::info!(
-            "laub: Video geladen: {} ({}x{}, {} Frames geprueft, bester Frame {}, {} Blaetter)",
+            "laub: Video geladen: {} ({}x{}, {} Bilder ueber {:.1} s, bester Frame {}, {} Blaetter)",
             lauf.pfad,
             best.w,
             best.h,
             lauf.geprueft,
+            sekunden,
             best.index,
             best.blaetter
         );
@@ -437,6 +626,134 @@ impl LaubPanel {
         }
     }
 
+    /// „Sammeln 10 s“: alle [`SAMMELN_ABSTAND_MS`] ein Kamerabild auswerten
+    /// (ohne es anzuzeigen), das mit den meisten Blättern gewinnt. Warum nicht
+    /// wie das Foto nur ein Bild: Laub bewegt sich im Wind und die Kamera
+    /// leicht — über zehn Sekunden ist mit Sicherheit ein Bild dabei, auf dem
+    /// die Blätter frei liegen.
+    fn sammeln_starten(&mut self) {
+        if self.sammeln.is_some() {
+            return;
+        }
+        // Ein laufendes Video würde denselben Framepuffer füllen: erst
+        // stoppen, sonst sammelt die Kamera Videobilder ein.
+        self.video_stoppen();
+        self.sammeln = Some(Sammellauf {
+            start: Instant::now(),
+            letzte_nummer: camera::stand().0,
+            letzte_probe: None,
+            geprueft: 0,
+            bester: None,
+        });
+        self.sammeln_letzte_ui = Instant::now();
+        self.status = format!(
+            "Sammeln 0/{SAMMELN_PROBEN} … (alle {SAMMELN_ABSTAND_MS} ms ein Bild, \
+             {SAMMELN_DAUER_S:.0} s)"
+        );
+        log::info!(
+            "laub: Sammeln startet ({SAMMELN_PROBEN} Bilder ueber {SAMMELN_DAUER_S:.0} s, \
+             alle {SAMMELN_ABSTAND_MS} ms)"
+        );
+    }
+
+    /// Ein Schritt des Kamera-Sammelns. Wird aus [`LaubPanel::ui`] gerufen und
+    /// hört deshalb beim Tab-Wechsel auf (siehe `sammeln_letzte_ui`).
+    fn sammeln_schritt(&mut self) {
+        let Some(mut lauf) = self.sammeln.take() else {
+            return;
+        };
+        let (nummer, _, _) = camera::stand();
+        let faellig = lauf
+            .letzte_probe
+            .map(|zeit| zeit.elapsed() >= Duration::from_millis(SAMMELN_ABSTAND_MS))
+            .unwrap_or(true);
+        if nummer != lauf.letzte_nummer && faellig {
+            if let Some((w, h, rgba)) = camera::letztes_bild() {
+                lauf.letzte_nummer = nummer;
+                lauf.letzte_probe = Some(Instant::now());
+                if let Some((bw, bh, brgba, blaetter)) = self.videobild_pruefen(w, h, rgba) {
+                    lauf.geprueft += 1;
+                    let besser = lauf
+                        .bester
+                        .as_ref()
+                        .map(|b| blaetter > b.blaetter)
+                        .unwrap_or(true);
+                    if besser {
+                        lauf.bester = Some(BestesBild {
+                            index: lauf.geprueft,
+                            w: bw,
+                            h: bh,
+                            rgba: brgba,
+                            blaetter,
+                        });
+                    }
+                    let bisher = lauf
+                        .bester
+                        .as_ref()
+                        .map(|b| b.blaetter)
+                        .unwrap_or(blaetter);
+                    self.status = format!(
+                        "Sammeln {}/{} … ({} Blätter, bestes {})",
+                        lauf.geprueft, SAMMELN_PROBEN, blaetter, bisher
+                    );
+                }
+            }
+        }
+        let sekunden = lauf.start.elapsed().as_secs_f32();
+        // Erst nach vollen zehn Sekunden abschließen (die letzte Probe fällt
+        // bei 9,5 s); steht die Kamera, endet das Sammeln nach 11 s mit dem,
+        // was da ist, statt ewig zu warten.
+        let fertig = (lauf.geprueft >= SAMMELN_PROBEN && sekunden >= SAMMELN_DAUER_S)
+            || sekunden >= SAMMELN_DAUER_S + 1.0;
+        if fertig {
+            self.sammeln_beenden(lauf);
+        } else {
+            self.sammeln = Some(lauf);
+        }
+    }
+
+    /// Sammeln abschließen: das beste Bild durch dieselbe Kette wie Foto und
+    /// Video schicken (Hintergrund, Blätter, Abstände, Textur).
+    fn sammeln_beenden(&mut self, lauf: Sammellauf) {
+        let sekunden = lauf.start.elapsed().as_secs_f32();
+        match lauf.bester {
+            Some(best) => {
+                camera::ruhebild_setzen(best.w, best.h, best.rgba.clone());
+                self.bild_uebernehmen(best.w, best.h, best.rgba);
+                self.status = format!(
+                    "Sammeln fertig: bestes von {} Bildern, {} Blätter ({:.1} s)",
+                    lauf.geprueft, best.blaetter, sekunden
+                );
+                log::info!(
+                    "laub: Sammeln: {} Bilder ueber {:.1} s, bestes mit {} Blaettern",
+                    lauf.geprueft,
+                    sekunden,
+                    best.blaetter
+                );
+            }
+            None => {
+                self.status = "Sammeln: kein Kamerabild — erst „Kamera an“.".to_string();
+                log::info!(
+                    "laub: Sammeln ohne Bilder ({:.1} s) — Kamera pruefen",
+                    sekunden
+                );
+            }
+        }
+    }
+
+    /// „Sammeln abbrechen“ bzw. Tab-Wechsel: verwerfen, ohne das Bild zu
+    /// übernehmen.
+    fn sammeln_stoppen(&mut self, loggen: bool) -> bool {
+        let war_an = self.sammeln.take().is_some();
+        if war_an {
+            self.status = "Sammeln abgebrochen".to_string();
+            if loggen {
+                log::info!("laub: Sammeln abgebrochen");
+            }
+        }
+        war_an
+    }
+
     /// Ein RGBA-Standbild übernehmen: RGB8 für die Erkennung ablegen, die
     /// Textur beim nächsten `ui` hochladen, Hintergrund (falls automatisch)
     /// und Blätter neu rechnen.
@@ -446,8 +763,12 @@ impl LaubPanel {
             return;
         }
         let rgb = rgb_aus_rgba(&rgba);
+        self.standbild_rgba = Some((w, h, rgba.clone()));
         self.bild = Some((w, h, rgb));
         self.textur_offen = Some((w, h, rgba));
+        // Ein übernommenes Bild ist ein Standbild: Die Live-Vorschau würde es
+        // sonst beim nächsten Kameraframe sofort wieder überschreiben.
+        self.vorschau_setzen(false);
         if self.auto_hintergrund {
             self.auto_hintergrund_waehlen();
         }
@@ -519,29 +840,69 @@ impl LaubPanel {
 
     /// Die Abstände in der Einheit des Modus: relativ die Pixel (nur die
     /// Verhältnisse zählen), absolut Meter (Pixel geteilt durch den Maßstab).
-    fn eingabe_abstaende(&self) -> Vec<f32> {
+    fn eingabe_abstaenden(&self, abstaende: &[f32]) -> Vec<f32> {
         match self.modus() {
-            Abstandsmodus::Relativ => self.abstaende.clone(),
-            Abstandsmodus::Absolut { .. } => self
-                .abstaende
+            Abstandsmodus::Relativ => abstaende.to_vec(),
+            Abstandsmodus::Absolut { .. } => abstaende
                 .iter()
                 .map(|px| px / self.px_pro_meter.max(1.0))
                 .collect(),
         }
     }
 
+    /// Die erkannten Abstände in Gruppen von [`LaubPanel::gruppe_groesse`]
+    /// Abständen, samt Startindex in [`LaubPanel::abstaende`]. Zwei
+    /// aufeinanderfolgende Abstände gehören zu zwei aufeinanderfolgenden
+    /// Blättern — der Startindex ist deshalb zugleich der Index des **ersten
+    /// Blattes** der Gruppe in [`LaubPanel::blaetter`]; nur so bleibt die
+    /// Blattfarbe je Schritt richtig.
+    fn gruppen(&self) -> Vec<(usize, Vec<f32>)> {
+        let mut start = 0usize;
+        jamcore::laub::gruppiere_abstaende(&self.abstaende, self.gruppe_groesse)
+            .into_iter()
+            .map(|gruppe| {
+                let index = start;
+                start += gruppe.len();
+                (index, gruppe)
+            })
+            .collect()
+    }
+
+    /// Die Zahl der Schritte je Gruppe (für die Anzeige „G1: 4 Schritte …“) —
+    /// dieselbe Kernrechnung, die auch beim Rendern läuft.
+    fn gruppen_schritte(&self) -> Vec<usize> {
+        let Some(g) = genre(GENRES[self.genre.min(GENRES.len() - 1)]) else {
+            return Vec::new();
+        };
+        let modus = self.modus();
+        self.gruppen()
+            .iter()
+            .map(|(_, abstaende)| {
+                let eingabe = self.eingabe_abstaenden(abstaende);
+                schritte_aus_abstaenden_bpm(&eingabe, self.raster, modus, &g, self.bpm).len()
+            })
+            .collect()
+    }
+
     /// Die berechneten Schritte **eines Takts** samt Farbe je Schritt —
-    /// dieselbe Kette für „als Rhythmus rendern“ und „Anhören“, aber ohne
-    /// Schreiben ins Pattern. `Err` trägt den Statustext für den Nutzer.
-    fn takt_berechnen(&self) -> Result<Vec<(u32, u8)>, String> {
+    /// dieselbe Kette für „als Rhythmus rendern“, „Anhören“ und die Gruppen,
+    /// aber ohne Schreiben ins Pattern. `Err` trägt den Statustext für den
+    /// Nutzer. `abstaende` ist ein Ausschnitt aus [`LaubPanel::abstaende`]
+    /// (bei einer Gruppe), `blatt_start` der Index des zugehörigen ersten
+    /// Blattes.
+    fn takt_aus_abstaenden(
+        &self,
+        abstaende: &[f32],
+        blatt_start: usize,
+    ) -> Result<Vec<(u32, u8)>, String> {
         let Some(g) = genre(GENRES[self.genre.min(GENRES.len() - 1)]) else {
             return Err("Unbekanntes Genre".to_string());
         };
-        if self.abstaende.is_empty() {
+        if abstaende.is_empty() {
             return Err("Keine Abstände — erst Blätter erkennen.".to_string());
         }
         let modus = self.modus();
-        let eingabe = self.eingabe_abstaende();
+        let eingabe = self.eingabe_abstaenden(abstaende);
         let schritte = schritte_aus_abstaenden_bpm(&eingabe, self.raster, modus, &g, self.bpm);
         log::info!(
             "laub: Genre {}, Raster {}, {} -> {} Schritte",
@@ -553,8 +914,9 @@ impl LaubPanel {
         if schritte.is_empty() {
             return Err("Keine Schritte — Abstände, Genre und Raster prüfen.".to_string());
         }
+        let blaetter = self.blaetter.get(blatt_start..).unwrap_or(&[]);
         let farben = farben_je_schritt(
-            &self.blaetter,
+            blaetter,
             &eingabe,
             self.raster,
             modus,
@@ -576,6 +938,120 @@ impl LaubPanel {
             .collect())
     }
 
+    /// Der ganze Weg als ein Takt (bisheriges Verhalten).
+    fn takt_berechnen(&self) -> Result<Vec<(u32, u8)>, String> {
+        self.takt_aus_abstaenden(&self.abstaende, 0)
+    }
+
+    /// Eine Gruppe als ein Takt (für Anhören und „Gruppen → Patterns“).
+    fn gruppe_berechnen(&self, index: usize) -> Result<Vec<(u32, u8)>, String> {
+        let gruppen = self.gruppen();
+        let Some((start, abstaende)) = gruppen.get(index) else {
+            return Err("Keine Gruppe — erst Blätter erkennen.".to_string());
+        };
+        self.takt_aus_abstaenden(abstaende, *start)
+    }
+
+    /// Die Taktfolge auf die vorhandenen Gruppen klemmen und auf die gewählte
+    /// Länge bringen.
+    ///
+    /// Neue Takte beginnen reihum mit der nächsten Gruppe (`G1, G2, …`), damit
+    /// eine frische Taktgruppe nicht viermal denselben Takt spielt; vorhandene
+    /// Takte bleiben beim Verlängern stehen. Wird die Gruppenzahl kleiner
+    /// (andere Gruppengröße), werden zu große Indizes geklemmt statt verworfen.
+    fn taktfolge_anpassen(&mut self) {
+        let anzahl = self.gruppen().len();
+        self.taktgruppe_len = self.taktgruppe_len.clamp(1, GRUPPEN_MAX);
+        self.taktfolge.truncate(self.taktgruppe_len);
+        while self.taktfolge.len() < self.taktgruppe_len {
+            let i = self.taktfolge.len();
+            self.taktfolge.push(if anzahl > 0 { i % anzahl } else { 0 });
+        }
+        // Vor dem ersten erkannten Bild gibt es keine Gruppen; die Takte sind
+        // dann Platzhalter (0). Sobald Gruppen da sind, reihum belegen —
+        // sonst bliebe die Folge bei „viermal G1“ stehen.
+        if self.taktfolge_gruppen == 0 && anzahl > 0 {
+            for (i, index) in self.taktfolge.iter_mut().enumerate() {
+                *index = i % anzahl;
+            }
+        }
+        self.taktfolge_gruppen = anzahl;
+        for index in &mut self.taktfolge {
+            *index = if anzahl > 0 {
+                (*index).min(anzahl - 1)
+            } else {
+                0
+            };
+        }
+    }
+
+    /// Die Gruppenindizes der Taktgruppe (0-basiert, geklemmt). Leer, solange
+    /// es keine Gruppen gibt.
+    fn taktgruppe_indizes(&self) -> Vec<usize> {
+        let anzahl = self.gruppen().len();
+        if anzahl == 0 {
+            return Vec::new();
+        }
+        self.taktfolge
+            .iter()
+            .take(self.taktgruppe_len)
+            .map(|index| (*index).min(anzahl - 1))
+            .collect()
+    }
+
+    /// Die Takte der Taktgruppe in Folge-Reihenfolge (`(Schritt, Farbe)` je
+    /// Takt). `T1: G2` heißt: Takt 1 spielt die Abstände von Gruppe 2; Gruppen
+    /// dürfen sich wiederholen. Die Abbildung der Indizes macht der Kern
+    /// ([`jamcore::laub::taktfolge_gruppen`]), damit Klemmen und Leerfälle dort
+    /// getestet sind.
+    fn taktgruppe_takte(&self) -> Result<Vec<Vec<(u32, u8)>>, String> {
+        let gruppen = self.gruppen();
+        if gruppen.is_empty() {
+            return Err("Keine Abstände — erst Blätter erkennen.".to_string());
+        }
+        let indizes = self.taktgruppe_indizes();
+        if indizes.is_empty() {
+            return Err("Keine Taktgruppe — Länge wählen.".to_string());
+        }
+        let abstaende: Vec<Vec<f32>> = gruppen.iter().map(|(_, d)| d.clone()).collect();
+        let gewaehlt = jamcore::laub::taktfolge_gruppen(&abstaende, &indizes);
+        gewaehlt
+            .iter()
+            .zip(indizes.iter())
+            .map(|(abstaende, index)| self.takt_aus_abstaenden(abstaende, gruppen[*index].0))
+            .collect()
+    }
+
+    /// „Taktgruppe → Patterns“: die Taktfolge hintereinander in das aktuelle
+    /// Pattern schreiben (Takt 1 ab Zeile 0, Takt 2 ab Zeile `feinheit`, …).
+    /// Passt sie nicht in einen Slot, geht es im nächsten weiter (Ring 8) —
+    /// die Aufteilung macht das Rhythmus-Panel
+    /// ([`crate::rhythm::RhythmPanel::laub_taktgruppe_setzen`]).
+    fn taktgruppe_zu_patterns(&mut self, rhythm: &mut crate::rhythm::RhythmPanel) {
+        let takte = match self.taktgruppe_takte() {
+            Ok(takte) => takte,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let ziele = rhythm.laub_taktgruppe_setzen(&takte, self.raster);
+        let noten: usize = ziele.iter().map(|(_, n)| *n).sum();
+        let mut slots: Vec<usize> = Vec::new();
+        for (slot, _) in &ziele {
+            if !slots.contains(slot) {
+                slots.push(*slot);
+            }
+        }
+        let slot_text: Vec<String> = slots.iter().map(|slot| (slot + 1).to_string()).collect();
+        self.status = format!(
+            "Taktgruppe -> Patterns: {} Takte, {noten} Noten (Slots {})",
+            takte.len(),
+            slot_text.join(", ")
+        );
+        log::info!("laub: {}", self.status);
+    }
+
     /// „als Rhythmus rendern“: die Schrittnummern des Kerns ins aktuelle
     /// Rhythmus-Raster schreiben (Farbe je Schritt → Instrument).
     fn rendern(&mut self, rhythm: &mut crate::rhythm::RhythmPanel) {
@@ -586,11 +1062,55 @@ impl LaubPanel {
                 return;
             }
         };
+        let kanaele = kanaele_aus_takt(&takt);
         let noten = rhythm.laub_setzen(&takt, self.raster);
-        self.status = format!("ins Raster geschrieben ({noten} Noten)");
+        self.status = format!("ins Raster geschrieben ({noten} Noten auf {kanaele} Kanaelen)");
         log::info!(
-            "laub: ins Raster geschrieben ({noten} Noten, {} Schritte je Takt)",
+            "laub: ins Raster geschrieben ({noten} Noten auf {kanaele} Kanaelen, \
+             {} Schritte je Takt)",
             takt.len()
+        );
+    }
+
+    /// „Gruppen → Patterns“: jede Gruppe wird ein Takt in einem eigenen
+    /// Pattern-Slot (Gruppe 1 in den aktuellen, dann der Reihe nach weiter,
+    /// nach Slot 8 zurück auf Slot 1). Die Noten verteilen sich wie beim
+    /// Rendern auf die Farbkanäle.
+    fn gruppen_zu_patterns(&mut self, rhythm: &mut crate::rhythm::RhythmPanel) {
+        let gruppen = self.gruppen();
+        if gruppen.is_empty() {
+            self.status = "Keine Abstände — erst Blätter erkennen.".to_string();
+            return;
+        }
+        let mut takte = Vec::new();
+        for index in 0..gruppen.len().min(GRUPPEN_MAX) {
+            match self.gruppe_berechnen(index) {
+                Ok(takt) => takte.push(takt),
+                Err(e) => {
+                    self.status = format!("G{}: {e}", index + 1);
+                    return;
+                }
+            }
+        }
+        let kanaele = takte
+            .iter()
+            .flat_map(|takt| takt.iter())
+            .map(|(_, instrument)| (*instrument).min(63))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        let ziele = rhythm.laub_gruppen_setzen(&takte, self.raster);
+        let teile: Vec<String> = ziele
+            .iter()
+            .enumerate()
+            .map(|(i, (slot, noten))| format!("G{} {noten} Noten (Slot {})", i + 1, slot + 1))
+            .collect();
+        self.status = format!(
+            "Gruppen -> Patterns: {} — auf {kanaele} Kanaelen",
+            teile.join(", ")
+        );
+        log::info!(
+            "laub: Gruppen -> Patterns: {} — auf {kanaele} Kanaelen",
+            teile.join(", ")
         );
     }
 
@@ -602,7 +1122,10 @@ impl LaubPanel {
         if self.anhoeren_laeuft {
             return;
         }
-        let takt = match self.takt_berechnen() {
+        // Immer die gewählte Gruppe hören: bei weniger Abständen als die
+        // Gruppengröße ist Gruppe 1 der ganze Weg (wie bisher).
+        let gruppe = self.gruppe_auswahl.min(self.gruppen().len().saturating_sub(1));
+        let takt = match self.gruppe_berechnen(gruppe) {
             Ok(takt) => takt,
             Err(e) => {
                 self.status = e;
@@ -613,11 +1136,21 @@ impl LaubPanel {
         let bpm = rhythm.bpm().max(20.0);
         let (_, welle, _) = rhythm.klang_zustand();
         // Nur die Noten eines Takts (Startzeile 0, Länge ein Takt): die
-        // Schleife wiederholt den Takt, genau wie das Pattern.
-        let noten = jamcore::laub::raster_auf_zeilen(&takt, self.raster, feinheit, feinheit, 0);
+        // Schleife wiederholt den Takt, genau wie das Pattern. `anhoer_noten`
+        // behält zusätzlich den Rasterschritt — daraus kommt der Marker im
+        // Bild, den die Zeilen allein nicht mehr hergeben (mehrere Schritte
+        // können auf derselben Zeile liegen).
+        let noten = anhoer_noten(&takt, self.raster, feinheit);
         if noten.is_empty() {
             self.status = "Anhören: keine Noten im Takt.".to_string();
             return;
+        }
+        // Gehört wird zum analysierten Standbild: In der Live-Vorschau wären
+        // die markierten Blätter nicht zu sehen, denn sie gehören zum
+        // Standbild. Das Standbild wird dafür wieder angezeigt.
+        if self.vorschau_live && self.standbild_rgba.is_some() {
+            self.vorschau_setzen(false);
+            self.textur_offen = self.standbild_rgba.clone();
         }
         let anzahl = takt.len();
         let stopp = Arc::new(AtomicBool::new(false));
@@ -626,6 +1159,9 @@ impl LaubPanel {
             *herz = Instant::now();
         }
         let stopp_c = Arc::clone(&stopp);
+        let position = Arc::clone(&self.spiel_position);
+        position.store(0, Ordering::Relaxed);
+        let position_c = Arc::clone(&position);
         let ergebnis = std::thread::Builder::new()
             .name("jam-laub-anhoeren".to_string())
             .spawn(move || {
@@ -633,11 +1169,13 @@ impl LaubPanel {
                 let taktzeit = schrittzeit * feinheit as f32;
                 'aussen: loop {
                     let start = Instant::now();
-                    for (zeile, farbe) in &noten {
+                    for (zeile, farbe, schritt) in &noten {
                         let ziel = *zeile as f32 * schrittzeit;
                         if !warte_bis(&stopp_c, &herz, start, ziel) {
                             break 'aussen;
                         }
+                        // Marker im Bild: der Schritt, der jetzt klingt.
+                        position_c.store((*schritt).min(u16::MAX as u32) as u16, Ordering::Relaxed);
                         crate::klang::spielen_welle(crate::rhythm::laub_pitch(*farbe), welle);
                     }
                     if !warte_bis(&stopp_c, &herz, start, taktzeit) {
@@ -651,11 +1189,13 @@ impl LaubPanel {
                 self.anhoeren_stopp = Some(stopp);
                 self.anhoeren_laeuft = true;
                 self.status = format!(
-                    "Anhören ({} Schritte, 1/{feinheit}, {bpm:.0} BPM)",
+                    "Anhören G{} ({} Schritte, 1/{feinheit}, {bpm:.0} BPM)",
+                    gruppe + 1,
                     anzahl
                 );
                 log::info!(
-                    "laub: Anhören ({anzahl} Schritte, 1/{feinheit}, {bpm:.0} BPM)"
+                    "laub: Anhören G{} ({anzahl} Schritte, 1/{feinheit}, {bpm:.0} BPM)",
+                    gruppe + 1
                 );
             }
             Err(e) => self.status = format!("Anhören-Thread: {e}"),
@@ -665,6 +1205,9 @@ impl LaubPanel {
     /// Anhören stoppen (Flag setzen, Thread einsammeln).
     fn anhoeren_stoppen(&mut self, loggen: bool) {
         let war_an = self.anhoeren_laeuft;
+        // Marker im Bild auf 0: Ohne Anhören gibt es keinen „gerade
+        // gespielten“ Schritt.
+        self.spiel_position.store(0, Ordering::Relaxed);
         if let Some(stopp) = self.anhoeren_stopp.take() {
             stopp.store(true, Ordering::Relaxed);
         }
@@ -705,6 +1248,75 @@ impl LaubPanel {
                     Some(ctx.load_texture("laubbild", bild, egui::TextureOptions::LINEAR))
             }
         }
+        self.anzeige_masse = (w, h);
+    }
+
+    /// Vorschau-Modus umschalten: live (neueste Kamerabilder) oder Standbild.
+    ///
+    /// Beim Zurückschalten auf live wird die Framenummer zurückgesetzt, damit
+    /// das aktuelle Kamerabild sofort in die Textur kommt; auf „Standbild“
+    /// liegt das eingefrorene Bild schon in [`LaubPanel::standbild_rgba`].
+    fn vorschau_setzen(&mut self, live: bool) {
+        if self.vorschau_live == live {
+            return;
+        }
+        self.vorschau_live = live;
+        self.vorschau_nummer = 0;
+        if live {
+            log::info!("laub: Vorschau live");
+            self.status = "Vorschau live".to_string();
+        } else {
+            log::info!("laub: Standbild");
+            self.status = "Standbild".to_string();
+        }
+    }
+
+    /// Das analysierte Standbild in die Textur legen (Rückkehr aus der
+    /// Vorschau, z. B. wenn die Kamera aus ist).
+    fn standbild_zeigen(&mut self, ctx: &egui::Context) {
+        self.textur_live = false;
+        let Some((w, h, rgba)) = self.standbild_rgba.clone() else {
+            return;
+        };
+        self.textur_setzen(ctx, w, h, &rgba);
+    }
+
+    /// Die Live-Vorschau fortschreiben.
+    ///
+    /// Kopiert wird nur bei **neuer** Framenummer: `camera::letztes_bild`
+    /// klont das ganze Bild (bei 640×480 rund 1,2 MB), und die Kamera liefert
+    /// ~30 Bilder je Sekunde. Kommt über [`VORSCHAU_STILL_MS`] kein neues Bild
+    /// mehr, gilt die Kamera als aus und das Standbild kehrt zurück — so
+    /// verhält sich der Tab auch, wenn „Kamera aus“ in einem anderen Tab
+    /// gedrückt wurde.
+    fn vorschau_aktualisieren(&mut self, ctx: &egui::Context) {
+        let (nummer, _, _) = camera::stand();
+        let neu = nummer != 0 && nummer != self.vorschau_nummer;
+        if neu {
+            self.vorschau_bildzeit = Some(Instant::now());
+        }
+        if !self.vorschau_live {
+            return;
+        }
+        if neu {
+            if let Some((w, h, rgba)) = camera::letztes_bild() {
+                self.textur_setzen(ctx, w, h, &rgba);
+                self.textur_live = true;
+                self.vorschau_nummer = nummer;
+            }
+        }
+        let still = self
+            .vorschau_bildzeit
+            .map(|zeit| zeit.elapsed() >= Duration::from_millis(VORSCHAU_STILL_MS))
+            .unwrap_or(true);
+        if self.textur_live && still {
+            // Vorschau bleibt eingeschaltet: startet die Kamera erneut (etwa
+            // im Bild-Tab), kommt das nächste Bild von selbst wieder an.
+            self.standbild_zeigen(ctx);
+        }
+        if self.textur_live {
+            ctx.request_repaint_after(Duration::from_millis(VORSCHAU_MS));
+        }
     }
 
     /// Der Tab: Kamera-Zeile, Bild mit Markern, Erkennung und Steuerung.
@@ -718,15 +1330,35 @@ impl LaubPanel {
             *herz = Instant::now();
         }
         self.anhoeren_aufraeumen();
+        // Ein laufendes Sammeln überlebt den Tab-Wechsel nicht: `ui` wird nur
+        // für den sichtbaren Tab gerufen, eine Lücke von über einer Sekunde
+        // heißt also „Tab war weg“ (oder die App pausiert).
+        if self.sammeln.is_some()
+            && self.sammeln_letzte_ui.elapsed() > Duration::from_secs(1)
+        {
+            self.sammeln_stoppen(false);
+            self.status = "Sammeln abgebrochen (Tab gewechselt)".to_string();
+            log::info!("laub: Sammeln abgebrochen (Tab gewechselt)");
+        }
+        self.sammeln_letzte_ui = Instant::now();
+        self.sammeln_schritt();
+        if self.sammeln.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         if self.anhoeren_laeuft {
             // Ohne Anzeige-Frames käme kein Herzschlag mehr — den Tab also
             // während des Hörens wachhalten.
             ui.ctx().request_repaint_after(Duration::from_millis(100));
         }
+        let aktion = self.kopfzeile(ui);
+        // Erst nach der Kopfzeile hochladen: „Foto aufnehmen“ legt dort ein
+        // neues Standbild in `textur_offen`, und die Vorschau darunter darf es
+        // nicht mit einem alten Livebild überholen.
         if let Some((w, h, rgba)) = self.textur_offen.take() {
             self.textur_setzen(ui.ctx(), w, h, &rgba);
+            self.textur_live = false;
         }
-        let aktion = self.kopfzeile(ui);
+        self.vorschau_aktualisieren(ui.ctx());
         self.bild_zeichnen(ui);
         self.steuerung(ui, rhythm);
         aktion
@@ -743,12 +1375,39 @@ impl LaubPanel {
                     Err(_) => Err("keine Activity".to_string()),
                 };
                 self.status = match ergebnis {
-                    Ok(()) => "Kamera startet …".to_string(),
+                    Ok(()) => {
+                        self.vorschau_setzen(true);
+                        "Kamera startet …".to_string()
+                    }
                     Err(e) => format!("Kamera: {e}"),
                 };
             }
             if ui.button("Foto aufnehmen").clicked() {
+                self.sammeln_stoppen(false);
                 self.foto_aufnehmen();
+            }
+            // „Live“ holt die Vorschau zurück, ohne ein neues Foto zu machen:
+            // Das Foto bleibt als Analysebild erhalten, nur die Anzeige folgt
+            // wieder der Kamera.
+            if ui
+                .add_enabled(!self.vorschau_live, egui::Button::new("Live"))
+                .clicked()
+            {
+                self.vorschau_setzen(true);
+            }
+            if ui
+                .button(if self.sammeln.is_some() {
+                    "Sammeln abbrechen"
+                } else {
+                    "Sammeln 10 s"
+                })
+                .clicked()
+            {
+                if self.sammeln.is_some() {
+                    self.sammeln_stoppen(true);
+                } else {
+                    self.sammeln_starten();
+                }
             }
             if ui.button("Bild laden …").clicked() {
                 aktion = Aktion::BrowserBild;
@@ -770,6 +1429,19 @@ impl LaubPanel {
                         .color(Color32::GRAY),
                 );
             }
+            ui.label(
+                RichText::new(if self.vorschau_live {
+                    "Vorschau: live"
+                } else {
+                    "Vorschau: Standbild"
+                })
+                .small()
+                .color(if self.vorschau_live {
+                    Color32::from_rgb(120, 220, 120)
+                } else {
+                    Color32::GRAY
+                }),
+            );
         });
         // Zoom: Regler + „ganzes Bild“ (Ziehen im Bild verschiebt).
         ui.horizontal_wrapped(|ui| {
@@ -792,8 +1464,11 @@ impl LaubPanel {
         aktion
     }
 
-    /// Das Standbild mit den Blättern: Kreise in Wegrichtung nummeriert, der
-    /// Weg als Linie; ein Tipp ins Bild wählt die Hintergrundfarbe.
+    /// Das Bild mit den Blättern: Kreise in Wegrichtung nummeriert, der Weg als
+    /// Linie; ein Tipp ins Bild wählt die Hintergrundfarbe.
+    ///
+    /// In der Live-Vorschau bleibt die Analyse-Ebene weg: Die Blätter gehören
+    /// zum eingefrorenen Bild und lägen über einem anderen Kamerabild falsch.
     fn bild_zeichnen(&mut self, ui: &mut egui::Ui) {
         let Some(texture) = self.texture.clone() else {
             ui.colored_label(
@@ -803,16 +1478,17 @@ impl LaubPanel {
             );
             return;
         };
-        let Some((w, h, _)) = self.bild.as_ref() else {
+        let (w, h) = self.anzeige_masse;
+        if w == 0 || h == 0 {
             return;
-        };
-        let (w, h) = (*w, *h);
+        }
+        let (w, h) = (w as f32, h as f32);
         let platz = ui.available_width().max(80.0);
         let flaeche = ui.available_height().max(120.0);
-        let basis = (platz / w as f32).min(flaeche / h as f32);
+        let basis = (platz / w).min(flaeche / h);
         let skala = basis * self.zoom;
-        let bild_b = (w as f32 * skala).max(1.0);
-        let bild_h = (h as f32 * skala).max(1.0);
+        let bild_b = (w * skala).max(1.0);
+        let bild_h = (h * skala).max(1.0);
         let sicht = bild_h.min(flaeche);
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(platz, sicht), egui::Sense::click_and_drag());
@@ -828,78 +1504,205 @@ impl LaubPanel {
             rect.center() + self.pan,
             egui::vec2(bild_b, bild_h),
         );
+        // Marker nur über dem Standbild: In der Live-Vorschau zeigen die
+        // Blattpositionen des Standbilds auf ein anderes Bild.
+        let still = !self.textur_live;
+        let spiel = if still {
+            self.spielende_blaetter()
+        } else {
+            None
+        };
+        let spiel_position = self.spiel_position.load(Ordering::Relaxed) as u32;
         {
             let painter = ui.painter().with_clip_rect(rect);
             painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 12, 14));
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             painter.image(texture.id(), bild_rect, uv, Color32::WHITE);
 
-            // Blätter: Kreis (Radius aus der Fläche) mit Nummer in Wegrichtung;
-            // die Linie zwischen den Mittelpunkten ist der Weg.
-            let gelb = Color32::from_rgb(255, 215, 60);
-            let punkt = |b: &Blatt| {
-                egui::pos2(
-                    bild_rect.min.x + b.x * skala,
-                    bild_rect.min.y + b.y * skala,
-                )
-            };
-            if self.blaetter.len() >= 2 {
-                let punkte: Vec<egui::Pos2> = self.blaetter.iter().map(punkt).collect();
-                painter.add(egui::Shape::line(
-                    punkte,
-                    Stroke::new(
-                        1.5,
-                        Color32::from_rgba_unmultiplied(255, 215, 60, 140),
-                    ),
-                ));
+            if still {
+                // Blätter: Kreis (Radius aus der Fläche) mit Nummer in
+                // Wegrichtung; die Linie zwischen den Mittelpunkten ist der
+                // Weg. Der gerade gehörte Schritt bekommt einen weißen Ring.
+                let gelb = Color32::from_rgb(255, 215, 60);
+                let punkt = |b: &Blatt| {
+                    egui::pos2(
+                        bild_rect.min.x + b.x * skala,
+                        bild_rect.min.y + b.y * skala,
+                    )
+                };
+                if self.blaetter.len() >= 2 {
+                    let punkte: Vec<egui::Pos2> = self.blaetter.iter().map(punkt).collect();
+                    painter.add(egui::Shape::line(
+                        punkte,
+                        Stroke::new(
+                            1.5,
+                            Color32::from_rgba_unmultiplied(255, 215, 60, 140),
+                        ),
+                    ));
+                }
+                for (i, b) in self.blaetter.iter().enumerate() {
+                    let p = punkt(b);
+                    let r = ((b.flaeche as f32 / std::f32::consts::PI).sqrt() * skala)
+                        .clamp(6.0, 40.0);
+                    let spielt = spiel
+                        .as_ref()
+                        .and_then(|(start, positionen)| {
+                            i.checked_sub(*start)
+                                .and_then(|k| positionen.get(k))
+                                .map(|position| *position == spiel_position)
+                        })
+                        .unwrap_or(false);
+                    let (farbe, dicke) = if spielt {
+                        (Color32::WHITE, 3.0)
+                    } else {
+                        (gelb, 2.0)
+                    };
+                    // Weiß auf hellem Himmel wäre unsichtbar: ein dunkler
+                    // Rand macht den Marker überall lesbar.
+                    if spielt {
+                        painter.circle_stroke(
+                            p,
+                            r + 1.0,
+                            Stroke::new(4.0, Color32::from_black_alpha(150)),
+                        );
+                    }
+                    painter.circle_stroke(p, r, Stroke::new(dicke, farbe));
+                    if spielt {
+                        painter.text(
+                            p + egui::vec2(r + 7.0, -3.0),
+                            Align2::LEFT_BOTTOM,
+                            format!("{}", i + 1),
+                            FontId::proportional(13.0),
+                            Color32::from_black_alpha(200),
+                        );
+                    }
+                    painter.text(
+                        p + egui::vec2(r + 6.0, -4.0),
+                        Align2::LEFT_BOTTOM,
+                        format!("{}", i + 1),
+                        FontId::proportional(13.0),
+                        farbe,
+                    );
+                }
             }
-            for (i, b) in self.blaetter.iter().enumerate() {
-                let p = punkt(b);
-                let r = ((b.flaeche as f32 / std::f32::consts::PI).sqrt() * skala)
-                    .clamp(6.0, 40.0);
-                painter.circle_stroke(p, r, Stroke::new(2.0, gelb));
-                painter.text(
-                    p + egui::vec2(r + 6.0, -4.0),
-                    Align2::LEFT_BOTTOM,
-                    format!("{}", i + 1),
-                    FontId::proportional(13.0),
-                    gelb,
-                );
-            }
+        }
+
+        // Schrittleiste unter dem Bild: Raster 0…N−1 mit Marker am gerade
+        // gespielten Schritt.
+        if self.anhoeren_laeuft {
+            self.schrittleiste(ui, platz);
         }
 
         // Tipp ins Bild: die Farbe an der Stelle wird der Hintergrund (wie die
         // Farbwahl im Bild-Tab), danach neu erkennen. Ziehen verschiebt nur
-        // (Zoom), deshalb zählt hier der reine Klick.
-        if response.clicked() {
+        // (Zoom), deshalb zählt hier der reine Klick. In der Live-Vorschau
+        // gäbe es keine Analysefarbe — dort also nicht.
+        if still && response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-            if rect.contains(pos) {
-                let x = ((pos.x - bild_rect.min.x) / skala).floor();
-                let y = ((pos.y - bild_rect.min.y) / skala).floor();
-                if x >= 0.0 && y >= 0.0 {
-                    if let Some(farbe) = self.farbe_an(x as usize, y as usize) {
-                        if self.hintergrund != farbe {
-                            self.hintergrund = farbe;
-                            self.auto_hintergrund = false;
-                            log::info!(
-                                "laub: Hintergrund RGB({}, {}, {}) getippt",
-                                farbe.0,
-                                farbe.1,
-                                farbe.2
-                            );
-                            self.erkennen(true);
+                if rect.contains(pos) {
+                    let x = ((pos.x - bild_rect.min.x) / skala).floor();
+                    let y = ((pos.y - bild_rect.min.y) / skala).floor();
+                    if x >= 0.0 && y >= 0.0 {
+                        if let Some(farbe) = self.farbe_an(x as usize, y as usize) {
+                            if self.hintergrund != farbe {
+                                self.hintergrund = farbe;
+                                self.auto_hintergrund = false;
+                                log::info!(
+                                    "laub: Hintergrund RGB({}, {}, {}) getippt",
+                                    farbe.0,
+                                    farbe.1,
+                                    farbe.2
+                                );
+                                self.erkennen(true);
+                            }
                         }
                     }
                 }
             }
-            }
         }
+    }
+
+    /// Kleine Schrittleiste unter dem Bild: Raster 0…N−1, senkrechter Marker
+    /// am gerade gespielten Schritt. Nur während des Anhörens — sonst hätte
+    /// sie keine Bedeutung und würde nur Platz kosten.
+    fn schrittleiste(&self, ui: &mut egui::Ui, breite: f32) {
+        if self.raster == 0 {
+            return;
+        }
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(breite, 18.0), egui::Sense::hover());
+        let painter = ui.painter();
+        painter.rect_filled(rect.shrink(1.0), 3.0, Color32::from_rgb(24, 24, 30));
+        // Viertelmarken als Orientierung (0, 1/4, …).
+        for i in 0..=4 {
+            let x = rect.min.x + 2.0 + (rect.width() - 4.0) * i as f32 / 4.0;
+            painter.line_segment(
+                [
+                    egui::pos2(x, rect.max.y - 5.0),
+                    egui::pos2(x, rect.max.y - 1.0),
+                ],
+                Stroke::new(1.0, Color32::from_gray(90)),
+            );
+        }
+        let position = self
+            .spiel_position
+            .load(Ordering::Relaxed)
+            .min(self.raster.saturating_sub(1));
+        let x = rect.min.x + 2.0 + (rect.width() - 4.0) * position as f32 / self.raster as f32;
+        painter.line_segment(
+            [
+                egui::pos2(x, rect.min.y + 1.0),
+                egui::pos2(x, rect.max.y - 1.0),
+            ],
+            Stroke::new(2.0, Color32::WHITE),
+        );
+        painter.text(
+            egui::pos2(rect.min.x + 4.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            "0",
+            FontId::proportional(9.0),
+            Color32::from_gray(120),
+        );
+        painter.text(
+            egui::pos2(rect.max.x - 4.0, rect.center().y),
+            Align2::RIGHT_CENTER,
+            format!("{}", self.raster - 1),
+            FontId::proportional(9.0),
+            Color32::from_gray(120),
+        );
+    }
+
+    /// Die Blätter der gerade gehörten Gruppe samt Rasterposition:
+    /// `(erstes Blatt, Positionen)`, wobei `Positionen[k]` zu Blatt
+    /// `erstes + k` gehört (eine Gruppe aus n Abständen hat n+1 Blätter —
+    /// das erste Blatt vor dem ersten Abstand kommt dazu).
+    ///
+    /// Warum dieselbe Spiegelrechnung wie beim Färben: Der Kern liefert nur
+    /// die Menge der Schritte; welche Blätter auf einem Schritt liegen, folgt
+    /// aus ihren Positionen im Takt.
+    fn spielende_blaetter(&self) -> Option<(usize, Vec<u32>)> {
+        if !self.anhoeren_laeuft {
+            return None;
+        }
+        let gruppen = self.gruppen();
+        if gruppen.is_empty() {
+            return None;
+        }
+        let index = self.gruppe_auswahl.min(gruppen.len() - 1);
+        let (start, abstaende) = &gruppen[index];
+        let g = genre(GENRES[self.genre.min(GENRES.len() - 1)])?;
+        let eingabe = self.eingabe_abstaenden(abstaende);
+        let positionen = spiegel_positionen(&eingabe, self.raster, self.modus(), &g, self.bpm);
+        Some((*start, positionen))
     }
 
     /// Erkennung (Hintergrund, Toleranz, Abstände), Steuerung (Genre, Raster,
     /// Modus, BPM) und „als Rhythmus rendern“.
     fn steuerung(&mut self, ui: &mut egui::Ui, rhythm: &mut crate::rhythm::RhythmPanel) {
         ui.separator();
+        // Die Taktfolge an die aktuelle Gruppenzahl und -länge anpassen: Die
+        // Gruppen können sich durch die Gruppengröße ändern, die Folge bleibt
+        // dabei gültig (Indizes werden geklemmt, neue Takte aufgefüllt).
+        self.taktfolge_anpassen();
         ui.horizontal_wrapped(|ui| {
             ui.label("Hintergrund");
             let (r, g, b) = self.hintergrund;
@@ -936,6 +1739,93 @@ impl LaubPanel {
                     .small()
                     .color(Color32::GRAY),
             );
+        }
+        // Gruppen: je N Abstände ein Takt. Das teilt einen langen Weg auf
+        // mehrere Patterns auf, statt einen immer dichteren Einzeltakt zu
+        // bauen.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Gruppen");
+            for wert in [2usize, 4, 8] {
+                if ui
+                    .selectable_label(self.gruppe_groesse == wert, wert.to_string())
+                    .clicked()
+                {
+                    self.gruppe_groesse = wert;
+                    self.gruppe_auswahl = self
+                        .gruppe_auswahl
+                        .min(self.gruppen().len().saturating_sub(1));
+                    self.taktfolge_anpassen();
+                    log::info!("laub: Gruppengroesse {wert} Abstaende");
+                }
+            }
+            ui.label("Abstände");
+        });
+        if !self.abstaende.is_empty() {
+            let schritte = self.gruppen_schritte();
+            let text = schritte
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    if i == 0 {
+                        format!("G1: {n} Schritte")
+                    } else {
+                        format!("G{}: {n}", i + 1)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+            ui.label(RichText::new(text).small().color(Color32::GRAY));
+        }
+        // Taktgruppe: eine Folge von Takten (z. B. G1 G2 G1 G3). Ein Takt ist
+        // eine Gruppe aus der Zeile darüber; die Folge ordnet sie den
+        // Taktpositionen zu. Die Knöpfe bleiben bedienbar, damit sich die
+        // Folge nachträglich umsortieren lässt — ein Tipp schaltet zur
+        // nächsten Gruppe weiter (G1→G2→…→Gmax→G1).
+        if !self.abstaende.is_empty() {
+            let anzahl = self.gruppen().len();
+            let schritte = self.gruppen_schritte();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Taktgruppe");
+                for wert in TAKTGRUPPE_WAHL {
+                    if ui
+                        .selectable_label(self.taktgruppe_len == wert, wert.to_string())
+                        .clicked()
+                    {
+                        self.taktgruppe_len = wert;
+                        self.taktfolge_anpassen();
+                        log::info!("laub: Taktgruppe {wert} Takte");
+                    }
+                }
+                ui.label("Takte");
+            });
+            if anzahl > 0 {
+                ui.horizontal_wrapped(|ui| {
+                    for i in 0..self.taktfolge.len().min(self.taktgruppe_len) {
+                        let index = self.taktfolge[i].min(anzahl - 1);
+                        let n = schritte.get(index).copied().unwrap_or(0);
+                        if ui
+                            .button(format!("T{}: G{} ({n} Schritte)", i + 1, index + 1))
+                            .clicked()
+                        {
+                            let naechste = (index + 1) % anzahl;
+                            self.taktfolge[i] = naechste;
+                            log::info!("laub: Takt {} -> G{}", i + 1, naechste + 1);
+                        }
+                    }
+                });
+                // Die Taktfolge hintereinander in das aktuelle Pattern: Takt 1
+                // ab Zeile 0, Takt 2 ab Zeile `feinheit`; was nicht mehr
+                // hineinpasst, geht im nächsten Slot weiter (Ring 8).
+                if ui
+                    .add_enabled(
+                        !self.taktfolge.is_empty(),
+                        egui::Button::new("Taktgruppe -> Patterns"),
+                    )
+                    .clicked()
+                {
+                    self.taktgruppe_zu_patterns(rhythm);
+                }
+            }
         }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
@@ -1010,6 +1900,30 @@ impl LaubPanel {
                 log::info!("laub: 2 Patterns = {zwei}");
             }
         });
+        // Gruppen-Umschalter direkt über den Aktionen: „Anhören“ spielt die
+        // gewählte Gruppe, damit man vor dem Schreiben hört, was in den Slot
+        // kommt. Höchstens acht — mehr Pattern-Slots gibt es nicht.
+        let gruppen_anzahl = self.gruppen().len().min(GRUPPEN_MAX);
+        if gruppen_anzahl > 1 {
+            self.gruppe_auswahl = self.gruppe_auswahl.min(gruppen_anzahl - 1);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Anhören:");
+                for i in 0..gruppen_anzahl {
+                    if ui
+                        .selectable_label(self.gruppe_auswahl == i, format!("G{}", i + 1))
+                        .clicked()
+                    {
+                        self.gruppe_auswahl = i;
+                        // Läuft schon eine Vorschau, auf die neue Gruppe
+                        // umschalten statt die alte weiterklingen zu lassen.
+                        if self.anhoeren_laeuft {
+                            self.anhoeren_stoppen(false);
+                            self.anhoeren_starten(rhythm);
+                        }
+                    }
+                }
+            });
+        }
         // Eigene Zeile für die beiden Aktionen: nebeneinander passen sie mit
         // dem BPM-Text und der Checkbox auf schmalen Geräten nicht mehr.
         ui.horizontal_wrapped(|ui| {
@@ -1021,6 +1935,19 @@ impl LaubPanel {
                 .clicked()
             {
                 self.rendern(rhythm);
+            }
+            // Jede Gruppe ein Takt in einem eigenen Pattern-Slot: aus einem
+            // langen Weg werden mehrere kurze Patterns statt eines dichten.
+            // ASCII-Pfeil, weil die egui-Standardschrift „→“ als leeres
+            // Kästchen zeichnet (im Gerätetest gesehen).
+            if ui
+                .add_enabled(
+                    !self.abstaende.is_empty(),
+                    egui::Button::new("Gruppen -> Patterns"),
+                )
+                .clicked()
+            {
+                self.gruppen_zu_patterns(rhythm);
             }
             // Live hören, ohne ins Pattern zu schreiben — so lässt sich vor
             // dem Rendern entscheiden, ob der Rhythmus passt.
@@ -1047,6 +1974,41 @@ impl LaubPanel {
             ui.label(&self.status);
         }
     }
+}
+
+/// Zahl der verschiedenen Farbkanäle im Takt — die Note trägt ihren Kanal als
+/// `instrument.min(63)` (Farbklasse 0…3 → Kanal 1–4 im Tracker). Für Status
+/// und Log („auf 3 Kanaelen“).
+fn kanaele_aus_takt(takt: &[(u32, u8)]) -> usize {
+    let mut kanaele: Vec<u8> = takt.iter().map(|(_, farbe)| (*farbe).min(63)).collect();
+    kanaele.sort_unstable();
+    kanaele.dedup();
+    kanaele.len()
+}
+
+/// Noten eines Takts fürs Anhören: `(Pattern-Zeile, Farbe, Rasterschritt)`.
+///
+/// Dieselbe Abbildung wie `jamcore::laub::raster_auf_zeilen` (erste Note je
+/// Zeile gewinnt, nach Zeile sortiert), aber der Rasterschritt bleibt
+/// erhalten: Nur so kann die Anzeige die Blätter genau dieses Schritts
+/// markieren. Bei feinem Raster fallen mehrere Schritte auf eine Zeile — dann
+/// klingt und markiert der erste, wie beim Schreiben ins Pattern.
+fn anhoer_noten(takt: &[(u32, u8)], raster: u16, feinheit: u16) -> Vec<(u16, u8, u32)> {
+    if raster == 0 || feinheit == 0 {
+        return Vec::new();
+    }
+    let mut zeilen: BTreeMap<u16, (u8, u32)> = BTreeMap::new();
+    for (schritt, farbe) in takt {
+        let zeile = (*schritt as u64 * feinheit as u64 / raster as u64) as u16;
+        if zeile >= feinheit {
+            continue;
+        }
+        zeilen.entry(zeile).or_insert((*farbe, *schritt));
+    }
+    zeilen
+        .into_iter()
+        .map(|(zeile, (farbe, schritt))| (zeile, farbe, schritt))
+        .collect()
 }
 
 /// Wartet bis `ziel_s` Sekunden nach `start`; `false`, wenn gestoppt wurde
@@ -1079,12 +2041,14 @@ fn warte_bis(
 
 /// Ist das Video-Prüfen fertig? Nach [`VIDEO_FRAMES_MAX`] Bildern; ohne ein
 /// einziges Bild nach [`VIDEO_START_FRIST_S`] Sekunden (hängender Dekoder);
-/// sonst spätestens nach [`VIDEO_FRIST_S`] Sekunden (Notbremse — das beste
-/// bisherige Bild wird dann trotzdem übernommen).
-fn video_fertig(geprueft: usize, sekunden: f64) -> bool {
+/// nach [`VIDEO_ENDE_OHNE_BILD_S`] ohne neues Dekodierbild (Dateiende oder
+/// hängender Dekoder); sonst spätestens nach [`VIDEO_FRIST_S`] Sekunden
+/// (Notbremse — das beste bisherige Bild wird dann trotzdem übernommen).
+fn video_fertig(geprueft: usize, sekunden: f64, ohne_bild_s: f64) -> bool {
     geprueft >= VIDEO_FRAMES_MAX
         || (geprueft == 0 && sekunden >= VIDEO_START_FRIST_S as f64)
-        || sekunden >= VIDEO_FRIST_S as f64
+        || (geprueft > 0 && ohne_bild_s >= VIDEO_ENDE_OHNE_BILD_S)
+        || sekunden >= VIDEO_FRIST_S
 }
 
 /// Häufigste Farbe eines RGB8-Bildes: grobes Histogramm (jeder 4. Punkt, je
@@ -1465,13 +2429,15 @@ mod tests {
     }
 
     #[test]
-    fn video_fertig_nach_bildern_oder_frist() {
-        assert!(!video_fertig(0, 0.0), "frisch gestartet");
-        assert!(!video_fertig(29, 39.0), "kurz vor dem letzten Bild");
-        assert!(video_fertig(30, 6.0), "30 Bilder reichen");
-        assert!(video_fertig(0, 10.0), "kein Bild: hängender Dekoder");
-        assert!(!video_fertig(1, 10.0), "ein Bild: weiter prüfen");
-        assert!(video_fertig(1, 40.0), "Notbremse greift");
+    fn video_fertig_nach_bildern_frist_oder_stillstand() {
+        assert!(!video_fertig(0, 0.0, 0.0), "frisch gestartet");
+        assert!(!video_fertig(79, 44.0, 0.0), "kurz vor der Obergrenze");
+        assert!(video_fertig(80, 6.0, 0.0), "80 Bilder reichen");
+        assert!(video_fertig(0, 10.0, 10.0), "kein Bild: hängender Dekoder");
+        assert!(!video_fertig(1, 10.0, 0.0), "ein Bild: weiter prüfen");
+        assert!(video_fertig(1, 10.0, 1.5), "kein neues Bild mehr");
+        assert!(!video_fertig(1, 10.0, 1.4), "noch nicht lange genug still");
+        assert!(video_fertig(1, 46.0, 0.0), "Notbremse greift");
     }
 
     /// Ein Videobild wird wie ein Foto vorbereitet: verkleinert und mit der
@@ -1490,6 +2456,40 @@ mod tests {
             panel.videobild_pruefen(4, 4, vec![0; 8]).is_none(),
             "falsche Länge"
         );
+    }
+
+    #[test]
+    fn gruppen_teilen_den_weg_und_kennen_ihr_erstes_blatt() {
+        let mut panel = LaubPanel::new();
+        panel.abstaende = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        panel.gruppe_groesse = 2;
+        let gruppen = panel.gruppen();
+        assert_eq!(gruppen.len(), 3, "2 + 2 + 1 Abstände");
+        assert_eq!(gruppen[0], (0, vec![1.0, 2.0]));
+        assert_eq!(gruppen[1], (2, vec![3.0, 4.0]), "Blattstart = Abstände davor");
+        assert_eq!(gruppen[2], (4, vec![5.0]));
+        panel.gruppe_groesse = 8;
+        assert_eq!(panel.gruppen().len(), 1, "weniger Abstände als die Gruppe");
+    }
+
+    #[test]
+    fn gruppen_takte_behalten_die_blattfarbe() {
+        let mut panel = LaubPanel::new();
+        panel.abstaende = vec![1.0];
+        panel.gruppe_groesse = 1;
+        panel.blaetter = vec![
+            blatt(0.0, 0.0, 200, 40, 30),  // rot -> 0
+            blatt(1.0, 1.0, 230, 200, 50), // gelb -> 1
+        ];
+        assert_eq!(panel.gruppe_berechnen(0).unwrap(), vec![(0, 0)], "G1 rot");
+        assert_eq!(panel.gruppe_berechnen(1).unwrap(), vec![(0, 1)], "G2 gelb");
+    }
+
+    #[test]
+    fn kanaele_zaehlen_die_farbklassen() {
+        assert_eq!(kanaele_aus_takt(&[(0, 0), (4, 0)]), 1);
+        assert_eq!(kanaele_aus_takt(&[(0, 0), (4, 2), (8, 1)]), 3);
+        assert_eq!(kanaele_aus_takt(&[]), 0);
     }
 
     #[test]
@@ -1515,5 +2515,71 @@ mod tests {
         assert_eq!(farben.get(&0), Some(&0), "rot");
         assert_eq!(farben.get(&24), Some(&1), "gelb");
         assert_eq!(farben.get(&48), Some(&3), "grün");
+    }
+
+    #[test]
+    fn taktfolge_passt_sich_der_gruppenzahl_an() {
+        let mut panel = LaubPanel::new();
+        panel.abstaende = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        panel.gruppe_groesse = 2; // drei Gruppen
+        panel.taktgruppe_len = 4;
+        panel.taktfolge_anpassen();
+        assert_eq!(panel.taktfolge, vec![0, 1, 2, 0], "neue Takte reihum");
+        panel.taktfolge[1] = 2;
+        panel.taktgruppe_len = 2;
+        panel.taktfolge_anpassen();
+        assert_eq!(panel.taktfolge, vec![0, 2], "beim Kürzen bleibt der Anfang");
+        panel.gruppe_groesse = 8; // eine Gruppe
+        panel.taktfolge_anpassen();
+        assert_eq!(
+            panel.taktfolge,
+            vec![0, 0],
+            "zu große Indizes werden auf die letzte Gruppe geklemmt"
+        );
+        assert_eq!(panel.taktgruppe_indizes(), vec![0, 0]);
+    }
+
+    #[test]
+    fn taktfolge_fuellt_nach_dem_ersten_bild_reihum() {
+        // Vor dem ersten Bild gibt es keine Gruppen: Die Takte sind
+        // Platzhalter. Kommen die Gruppen, darf daraus nicht viermal G1
+        // werden — die Folge wird reihum belegt.
+        let mut panel = LaubPanel::new();
+        panel.taktgruppe_len = 4;
+        panel.taktfolge_anpassen();
+        assert_eq!(panel.taktfolge, vec![0, 0, 0, 0], "noch kein Bild");
+        panel.abstaende = vec![1.0; 8];
+        panel.gruppe_groesse = 2; // vier Gruppen
+        panel.taktfolge_anpassen();
+        assert_eq!(panel.taktfolge, vec![0, 1, 2, 3], "G1 G2 G3 G4");
+    }
+
+    #[test]
+    fn taktgruppe_wiederholt_gruppen_in_folge() {
+        let mut panel = LaubPanel::new();
+        panel.abstaende = vec![1.0, 1.0, 1.0, 1.0];
+        panel.gruppe_groesse = 2; // zwei Gruppen
+        panel.taktgruppe_len = 3;
+        panel.taktfolge = vec![1, 0, 1];
+        assert_eq!(panel.taktgruppe_indizes(), vec![1, 0, 1], "G2 G1 G2");
+        let takte = panel.taktgruppe_takte().expect("drei Takte");
+        assert_eq!(takte.len(), 3, "je Takt ein Eintrag");
+        assert_eq!(takte[0], takte[2], "dieselbe Gruppe, derselbe Takt");
+        // Ohne Abstände gibt es keine Taktgruppe (Meldung statt Panik).
+        panel.abstaende.clear();
+        assert!(panel.taktgruppe_takte().is_err());
+    }
+
+    #[test]
+    fn anhoer_noten_behalten_den_rasterschritt() {
+        // Raster 128 auf 16 Zeilen: 0…7 liegen auf Zeile 0 (der erste
+        // gewinnt), 64 wird Zeile 8, 127 Zeile 15.
+        let takt = [(0, 0), (4, 1), (64, 2), (127, 3)];
+        assert_eq!(
+            anhoer_noten(&takt, 128, 16),
+            vec![(0, 0, 0), (8, 2, 64), (15, 3, 127)]
+        );
+        assert!(anhoer_noten(&takt, 0, 16).is_empty(), "Raster 0");
+        assert!(anhoer_noten(&takt, 128, 0).is_empty(), "Feinheit 0");
     }
 }

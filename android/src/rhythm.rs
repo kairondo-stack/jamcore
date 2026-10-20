@@ -70,6 +70,22 @@ fn raster_note(step: u16, instrument: u8, pitch: i32) -> Note {
     }
 }
 
+/// Laub-Note: Farbe = Instrument (0…3), **Kanal = Farbe** (intern 0…3, im
+/// Tracker also 1–4). Warum nicht wie die Pads alles auf Kanal 0: getrennte
+/// Spalten im Tracker, polyphone Wiedergabe ohne gegenseitiges Überschreiben
+/// und später getrennte `.it`-Kanäle je Farbe. Nur der Laub-Weg macht das;
+/// Pads und die übrigen Werkzeuge bleiben auf Kanal 0.
+fn laub_note(step: u16, farbe: u8) -> Note {
+    let farbe = farbe.min(3);
+    Note {
+        step,
+        instrument: farbe,
+        pitch: laub_pitch(farbe),
+        glide: false,
+        channel: farbe.min(63),
+    }
+}
+
 /// Zahl der verschiedenen Kanäle in einer Notenliste — für Status und Log der
 /// Wiedergabe („N Noten auf M Kanälen“). Die Noten stehen als
 /// `(Schritt, Tonhöhe, Instrument, Kanal)`, wie sie der Render-Thread spielt.
@@ -78,6 +94,33 @@ fn kanaele_anzahl(noten: &[(u16, i32, u8, u8)]) -> usize {
     kanaele.sort_unstable();
     kanaele.dedup();
     kanaele.len()
+}
+
+/// Dauer eines Notenwerts in Schritten des aktuellen Rasters (mindestens 1).
+/// Ein Schritt ist `feinheit/4` einer Viertel; die Notenlänge kommt aus
+/// [`jamcore::klang::Notenwert::ms`], damit Raster, Tongenerator und
+/// Kanalvergabe dieselbe Zeit meinen (1/16 bei Feinheit 16 = 1 Schritt).
+fn dauer_schritte(notenwert: jamcore::klang::Notenwert, feinheit: u16, bpm: f32) -> u32 {
+    let bpm = bpm.clamp(20.0, 300.0);
+    let schritt_ms = 60_000.0 * 4.0 / (bpm * f32::from(feinheit.max(1)));
+    ((notenwert.ms(bpm) as f32 / schritt_ms).round() as u32).max(1)
+}
+
+/// Kanäle je Note (gleiche Reihenfolge wie `noten`): Sample = Instrument,
+/// Start = Schritt, Dauer = Tonlänge des eingestellten Notenwerts. Die
+/// Audioausgabe bleibt polyphon; die Kanäle sind die Ordnung im Tracker und
+/// stehen im Log/Status. Regeln: `jamcore::kanal::verteile_mit`.
+fn kanaele_je_note(noten: &[Note], feinheit: u16, bpm: f32, sample_zuerst: bool) -> Vec<u8> {
+    let dauer = dauer_schritte(crate::klang::einstellungen().notenwert, feinheit, bpm);
+    let kandidaten: Vec<jamcore::kanal::Kandidat> = noten
+        .iter()
+        .map(|n| jamcore::kanal::Kandidat {
+            start: u32::from(n.step),
+            sample: n.instrument,
+            dauer,
+        })
+        .collect();
+    jamcore::kanal::verteile_mit(&kandidaten, KANAELE, sample_zuerst)
 }
 
 /// Note ueber das Modul spielen — mit der Zuordnung aus dem Instrument-Tab.
@@ -168,6 +211,14 @@ pub struct RhythmPanel {
     /// Zeile, die die Tracker-Ansicht als Nächstes in den Blick holen soll
     /// („Schritt ±“); wird von der Ansicht verbraucht.
     tracker_scroll: Option<u16>,
+    /// Beim Abspielen automatisch zur laufenden Zeile scrollen (Standard an).
+    tracker_folgen: bool,
+    /// Zuletzt gesehener Spielschritt — nur bei Änderung wird gescrollt.
+    tracker_letzter_spiel: u16,
+    /// Reihenfolge der Kanalvergabe („Sample zuerst“ ist die Vorgabe): bei
+    /// „frei zuerst“ gewinnt der niedrigste freie Kanal vor dem gleichen
+    /// Sample. Wirkt beim Verteilen und in der Wiedergabe (Log/Status).
+    kanal_sample_zuerst: bool,
 }
 
 impl Default for RhythmPanel {
@@ -227,6 +278,9 @@ impl RhythmPanel {
             tracker_schritt: 0,
             tracker_kanal: 0,
             tracker_scroll: None,
+            tracker_folgen: true,
+            tracker_letzter_spiel: 0,
+            kanal_sample_zuerst: true,
         }
     }
 
@@ -405,7 +459,8 @@ impl RhythmPanel {
     /// Schrittnummern kommen aus `jamcore::laub::schritte_aus_abstaenden`
     /// (0..Raster), das Instrument aus der Blattfarbe (Farbklasse 0…3 →
     /// Instrument 0…3; bei der Klangquelle „Slices" sind das die ersten vier
-    /// Slices).
+    /// Slices). Die Note bekommt dieselbe Farbklasse auch als **Kanal**
+    /// ([`laub_note`]): 0…3 → Tracker-Kanal 1–4.
     ///
     /// **Zeitraster:** Ein Takt belegt [`RhythmPanel::feinheit`] Zeilen (16 =
     /// 1/16, 32 = 1/32, 64 = 1/64), nicht mehr eine Zeile je Rasterzelle —
@@ -438,17 +493,14 @@ impl RhythmPanel {
             for (zeile, instrument) in
                 jamcore::laub::raster_auf_zeilen(takt, raster, feinheit, laenge, start)
             {
-                let farbe = instrument.min(3);
                 let (ziel_slot, ziel_zeile) = if zwei && zeile >= haelfte {
                     (naechster, zeile - haelfte)
                 } else {
                     (slot, zeile)
                 };
-                self.slots[ziel_slot].insert(raster_note(
-                    ziel_zeile,
-                    farbe,
-                    laub_pitch(farbe),
-                ));
+                // Farbe → Instrument **und** Kanal: jede Farbklasse bekommt
+                // ihre Tracker-Spalte (0…3 → Kanal 1–4), siehe `laub_note`.
+                self.slots[ziel_slot].insert(laub_note(ziel_zeile, instrument));
                 if ziel_slot == slot {
                     erste += 1;
                 } else {
@@ -464,6 +516,89 @@ impl RhythmPanel {
             );
         }
         erste + zweite
+    }
+
+    /// Schreibt je Gruppe einen Takt ins jeweilige Pattern (Slot `start + i`,
+    /// 0…7; nach Slot 8 geht es bei Slot 0 weiter). Rückgabe: `(Slot, Noten)`
+    /// je Gruppe — der Slot **0-basiert**, wie die Slots im Panel; die Anzeige
+    /// zählt 1-basiert.
+    ///
+    /// Jeder Ziel-Slot wird vorher geleert und auf die aktuelle Patternlänge
+    /// gesetzt. Geschrieben wird **ein** Takt ab Zeile 0, nicht wie bei
+    /// [`RhythmPanel::laub_setzen`] über die ganze Länge wiederholt: die
+    /// Gruppen sind gedacht als mehrere kurze Patterns, die der Nutzer einzeln
+    /// hört und weiterverarbeitet. Noten bekommen wie beim Laub-Rendern ihre
+    /// Farbklasse als Kanal (siehe [`laub_note`]).
+    pub fn laub_gruppen_setzen(
+        &mut self,
+        gruppen: &[Vec<(u32, u8)>],
+        raster: u16,
+    ) -> Vec<(usize, usize)> {
+        let laenge = self.pattern().steps_per_cycle().max(1);
+        let feinheit = self.feinheit.max(1);
+        let start = self.slot.min(self.slots.len().saturating_sub(1));
+        let mut raus = Vec::with_capacity(gruppen.len());
+        for (i, takt) in gruppen.iter().take(self.slots.len()).enumerate() {
+            let slot = (start + i) % self.slots.len();
+            self.slots[slot].set_steps_per_cycle(laenge);
+            self.slots[slot].clear();
+            for (zeile, farbe) in jamcore::laub::raster_auf_zeilen(takt, raster, feinheit, laenge, 0)
+            {
+                self.slots[slot].insert(laub_note(zeile, farbe));
+            }
+            raus.push((slot, self.slots[slot].notes().len()));
+        }
+        raus
+    }
+
+    /// Laub-Taktgruppe: jeder Takt ist `feinheit` Zeilen lang und folgt
+    /// direkt auf den vorigen (Nutzer: „Takt besteht aus verschiedenen
+    /// Abständen, Gruppen zu Taktgruppen zuordnen“). Passt die Folge nicht
+    /// mehr in ein Pattern, geht es im **nächsten Slot** weiter (Ring 8);
+    /// ein Takt wird nie über die Pattern-Grenze zerschnitten.
+    /// Rückgabe: (Slot, Noten) je benutztem Slot, in Schreibreihenfolge.
+    pub fn laub_taktgruppe_setzen(
+        &mut self,
+        takte: &[Vec<(u32, u8)>],
+        raster: u16,
+    ) -> Vec<(usize, usize)> {
+        let laenge = self.pattern().steps_per_cycle().max(1);
+        let feinheit = self.feinheit.max(1).min(laenge);
+        let anzahl = self.slots.len();
+        let start = self.slot.min(anzahl - 1);
+        if takte.is_empty() || laenge == 0 {
+            return Vec::new();
+        }
+        let mut raus: Vec<(usize, usize)> = Vec::new();
+        let mut slot_index = start;
+        let mut versatz: u16 = 0;
+        for takt in takte {
+            // Kein Takt über die Pattern-Grenze: dann beginnt der nächste
+            // Takt im nächsten Slot (Ring).
+            if versatz + feinheit > laenge {
+                slot_index += 1;
+                versatz = 0;
+            }
+            let slot = slot_index % anzahl;
+            if !raus.iter().any(|(s, _)| *s == slot) {
+                self.slots[slot].set_steps_per_cycle(laenge);
+                self.slots[slot].clear();
+                raus.push((slot, 0));
+            }
+            for (zeile, farbe) in
+                jamcore::laub::raster_auf_zeilen(takt, raster, feinheit, laenge, versatz)
+            {
+                self.slots[slot].insert(laub_note(zeile, farbe));
+            }
+            let idx = raus.iter().position(|(s, _)| *s == slot).unwrap_or(0);
+            raus[idx].1 = self.slots[slot].notes().len();
+            versatz += feinheit;
+            if versatz >= laenge {
+                slot_index += 1;
+                versatz = 0;
+            }
+        }
+        raus
     }
 
     /// Sinus-Interpolation wie `D`+`3` im Desktop-Recorder: zwischen den
@@ -566,22 +701,31 @@ impl RhythmPanel {
         if self.render_laeuft {
             return;
         }
-        let noten: Vec<(u16, i32, u8, u8)> = self
-            .pattern()
-            .notes()
-            .iter()
-            .map(|n| (n.step, n.pitch, n.instrument, n.channel))
-            .collect();
+        let noten_roh: Vec<Note> = self.pattern().notes().to_vec();
         // Die Laenge des Zyklus fuer den Render-Thread: die gemeinsame
         // Patternlaenge (frueher fest 16).
         let schritte = self.pattern().steps_per_cycle().max(1);
-        if noten.is_empty() {
+        if noten_roh.is_empty() {
             self.status = "Raster ist leer - nichts zu rendern.".to_string();
             return;
         }
+        // Kanaele nach `jamcore::kanal::verteile`: gleiches Sample bleibt im
+        // Kanal, ein freier Kanal geht der Uebernahme vor. Die Audioausgabe
+        // bleibt polyphon; die Kanaele stehen im Log/Status und in der
+        // Tracker-Spalte der Noten.
+        let sample_zuerst = self.kanal_sample_zuerst;
+        let zuordnung = kanaele_je_note(
+            &noten_roh,
+            self.feinheit,
+            self.render_bpm,
+            sample_zuerst,
+        );
+        let noten: Vec<(u16, i32, u8, u8)> = noten_roh
+            .iter()
+            .zip(&zuordnung)
+            .map(|(n, kanal)| (n.step, n.pitch, n.instrument, *kanal))
+            .collect();
         let anzahl = noten.len();
-        // Polyphon: alle Kanaele klingen — mehrere Noten auf demselben Schritt
-        // (verschiedene Kanaele) werden alle gespielt, nicht nur die erste.
         let kanaele = kanaele_anzahl(&noten);
         let (host, port) = self.target.clone();
         let bpm = self.render_bpm.max(20.0);
@@ -607,7 +751,14 @@ impl RhythmPanel {
                 }
                 let mut i: u16 = 0;
                 let mut klang_gemeldet = false;
-                info!("tracker: Wiedergabe {anzahl} Noten auf {kanaele} Kanälen (polyphon)");
+                info!(
+                    "tracker: Wiedergabe {anzahl} Noten auf {kanaele} Kanälen (polyphon, {})",
+                    if sample_zuerst {
+                        "Sample zuerst"
+                    } else {
+                        "frei zuerst"
+                    }
+                );
                 while !stopp_c.load(Ordering::Relaxed) {
                     let start = Instant::now();
                     // Alle Noten dieses Schritts klingen — auch mehrere auf
@@ -679,16 +830,24 @@ impl RhythmPanel {
         if self.render_laeuft {
             self.rendern_stoppen();
         }
-        let mut noten: Vec<(u16, i32, u8, u8)> = self
-            .pattern()
-            .notes()
-            .iter()
-            .map(|n| (n.step, n.pitch, n.instrument, n.channel))
-            .collect();
-        if noten.is_empty() {
+        let noten_roh: Vec<Note> = self.pattern().notes().to_vec();
+        if noten_roh.is_empty() {
             self.status = "Slot ist leer.".to_string();
             return;
         }
+        // Kanäle wie beim Rendern vergeben (Sample bleibt im Kanal, freier
+        // Kanal vor Übernahme); die Ausgabe selbst bleibt polyphon.
+        let zuordnung = kanaele_je_note(
+            &noten_roh,
+            self.feinheit,
+            self.render_bpm,
+            self.kanal_sample_zuerst,
+        );
+        let mut noten: Vec<(u16, i32, u8, u8)> = noten_roh
+            .iter()
+            .zip(&zuordnung)
+            .map(|(n, kanal)| (n.step, n.pitch, n.instrument, *kanal))
+            .collect();
         // Nach (Schritt, Kanal) sortieren: die Noten eines Schritts aus allen
         // Kanälen werden nacheinander **alle** gespielt (polyphon).
         noten.sort_by_key(|(s, _, _, kanal)| (*s, *kanal));
@@ -754,6 +913,65 @@ impl RhythmPanel {
             }
             Err(e) => self.status = format!("Slot-Thread: {e}"),
         }
+    }
+
+    /// „Kanäle verteilen“: die vorhandenen Noten des aktuellen Patterns
+    /// nachträglich neu ordnen — Schritte und Tonhöhen bleiben, nur der Kanal
+    /// ändert sich. Sample = Instrument, Dauer = Tonlänge des Notenwerts; die
+    /// Regeln stehen in `jamcore::kanal`. Die Audioausgabe ist davon
+    /// unabhängig (polyphon); der Tracker zeigt danach je Sample möglichst
+    /// eine Spalte, und ein Kanal bleibt bei seinem Sample.
+    fn kanaele_verteilen(&mut self) {
+        let noten: Vec<Note> = self.pattern().notes().to_vec();
+        if noten.is_empty() {
+            self.status = "Keine Noten — nichts zu verteilen.".to_string();
+            return;
+        }
+        let zuordnung = kanaele_je_note(
+            &noten,
+            self.feinheit,
+            self.render_bpm,
+            self.kanal_sample_zuerst,
+        );
+        // Kennzahlen für Status/Log: verschiedene Samples und belegte Kanäle.
+        let mut samples: Vec<u8> = noten.iter().map(|n| n.instrument).collect();
+        samples.sort_unstable();
+        samples.dedup();
+        let mut kanaele: Vec<u8> = zuordnung.clone();
+        kanaele.sort_unstable();
+        kanaele.dedup();
+        // Notenliste neu aufbauen statt `Pattern::insert` zu benutzen:
+        // `insert` räumt den **ganzen** Schritt (auch andere Kanäle) und würde
+        // Akkorde zerlegen. `tracker::setzen` trifft nur die Zelle
+        // (Schritt + Kanal), die Notenreihenfolge bleibt (step, pitch).
+        let slot = self.slot;
+        self.slots[slot].clear();
+        for (note, kanal) in noten.iter().zip(&zuordnung) {
+            setzen(
+                &mut self.slots[slot],
+                Note {
+                    channel: *kanal,
+                    ..*note
+                },
+            );
+        }
+        let reihenfolge = if self.kanal_sample_zuerst {
+            "Sample zuerst"
+        } else {
+            "frei zuerst"
+        };
+        self.status = format!(
+            "Kanäle verteilt ({} Noten, {} Samples, {} Kanäle, {reihenfolge})",
+            noten.len(),
+            samples.len(),
+            kanaele.len()
+        );
+        info!(
+            "rhythm: Kanaele verteilt ({} Noten, {} Samples, {} Kanaele)",
+            noten.len(),
+            samples.len(),
+            kanaele.len()
+        );
     }
 
     fn rendern_stoppen(&mut self) {
@@ -1140,6 +1358,17 @@ impl RhythmPanel {
             );
             if ui.button("Zelle löschen").clicked() {
                 self.tracker_loeschen();
+            }
+            if ui
+                .selectable_label(self.tracker_folgen, "Scrollen")
+                .on_hover_text("Beim Abspielen zur laufenden Zeile scrollen")
+                .clicked()
+            {
+                self.tracker_folgen = !self.tracker_folgen;
+                info!(
+                    "tracker: Scrollen {}",
+                    if self.tracker_folgen { "an" } else { "aus" }
+                );
             }
         });
         ui.horizontal_wrapped(|ui| {
@@ -1563,6 +1792,35 @@ impl RhythmPanel {
                 }
             }
         });
+        // Kanalvergabe (Nutzerwunsch 2026-10-20): das Sample soll im Kanal
+        // bleiben und nicht bei jeder Note wechseln. Die Reihenfolge der
+        // Regeln ist wählbar; sie wirkt beim Verteilen und in der Wiedergabe
+        // (Log/Status), nicht auf die polyphone Audioausgabe.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Kanäle");
+            if ui
+                .selectable_label(self.kanal_sample_zuerst, "Sample zuerst")
+                .clicked()
+            {
+                self.kanal_sample_zuerst = true;
+                self.status = "Kanalvergabe: Sample zuerst".to_string();
+            }
+            if ui
+                .selectable_label(!self.kanal_sample_zuerst, "frei zuerst")
+                .clicked()
+            {
+                self.kanal_sample_zuerst = false;
+                self.status = "Kanalvergabe: frei zuerst".to_string();
+            }
+            if ui.button("Kanäle verteilen").clicked() {
+                self.kanaele_verteilen();
+            }
+            ui.label(
+                RichText::new("Noten des Patterns auf Tracker-Kanäle verteilen")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
         // Tongenerator: Stimmen und Tonlaenge (Nutzerentscheidung 2026-10-14).
         // Gilt fuer alle lokalen Klaenge (Rhythmus, Bild-Scan, Rendern).
         ui.horizontal(|ui| {
@@ -1770,6 +2028,12 @@ impl RhythmPanel {
                 .tracker_schritt
                 .min(self.pattern().steps_per_cycle().saturating_sub(1));
             self.tracker_werkzeuge(ui);
+            // Beim Abspielen zur laufenden Zeile scrollen (an/aus) — nur beim
+            // Schrittwechsel, sonst ließe sich nicht mehr selbst scrollen.
+            if self.tracker_folgen && self.current_step != self.tracker_letzter_spiel {
+                self.tracker_letzter_spiel = self.current_step;
+                self.tracker_scroll = Some(self.current_step);
+            }
             let zustand = TrackerZustand {
                 schritt: self.tracker_schritt,
                 kanal: self.tracker_kanal,

@@ -562,6 +562,68 @@ pub fn raster_auf_zeilen(
     raus
 }
 
+/// Teilt die Abstandsliste in Gruppen von je `pro_gruppe` Abständen; die
+/// letzte Gruppe darf kürzer sein. `pro_gruppe == 0` legt alles in **eine**
+/// Gruppe, eine leere Eingabe ergibt eine leere Liste.
+///
+/// Die App verteilt einen langen Weg damit auf mehrere Patterns: jede Gruppe
+/// ist ein Takt, und ohne Gruppierung (0) bleibt der ganze Weg ein Takt. Die
+/// Reihenfolge der Abstände bleibt erhalten, damit die Wegrichtung stimmt.
+pub fn gruppiere_abstaende(abstaende: &[f32], pro_gruppe: usize) -> Vec<Vec<f32>> {
+    if abstaende.is_empty() {
+        return Vec::new();
+    }
+    // `chunks(0)` würde panicken; 0 heißt hier „eine Gruppe“.
+    let groesse = if pro_gruppe == 0 {
+        abstaende.len()
+    } else {
+        pro_gruppe
+    };
+    abstaende
+        .chunks(groesse)
+        .map(|gruppe| gruppe.to_vec())
+        .collect()
+}
+
+/// Bildet eine Taktfolge auf Gruppen ab: `folge[i]` ist der Index der Gruppe,
+/// die Takt `i + 1` spielt. Eine Taktgruppe ist damit z. B. `G1 G2 G1 G3`
+/// (`folge = [0, 1, 0, 2]`) — dieselbe Gruppe darf mehrfach vorkommen.
+///
+/// Warum klemmen statt verwerfen: Die Taktfolge wird in der App gepflegt,
+/// während der Nutzer die Gruppengröße ändert; ein Index hinter dem Ende ist
+/// dann kein Fehler, sondern meint die letzte vorhandene Gruppe. So bleibt
+/// jede Taktposition bedienbar und die Folge behält ihre Länge. Ohne Gruppen
+/// oder ohne Folge gibt es keine Takte (leeres Ergebnis).
+pub fn taktfolge_gruppen(gruppen: &[Vec<f32>], folge: &[usize]) -> Vec<Vec<f32>> {
+    let Some(letzte) = gruppen.len().checked_sub(1) else {
+        return Vec::new();
+    };
+    folge
+        .iter()
+        .map(|index| gruppen[(*index).min(letzte)].clone())
+        .collect()
+}
+
+/// Gleichmäßig über die ganze Videodauer verteilte Zeitpunkte für
+/// Bild-Stichproben: `anzahl` Abschnitte, je ein Zeitpunkt in der **Mitte**,
+/// also `(i + 0.5) / anzahl * dauer_s`.
+///
+/// Die App prüft beim Video damit nicht mehr nur die ersten Bilder, sondern
+/// den ganzen Film (bei einer Fahrt mit Blättern ab Sekunde 5 sähe man sonst
+/// nur Weg). Die Mitte des Abschnitts statt seines Anfangs meidet die Ränder:
+/// ein Bild bei exakt 0 oder `dauer_s` liegt oft außerhalb des dekodierbaren
+/// Bereichs. `anzahl == 0`, eine Dauer ≤ 0 oder ein nicht endlicher Wert
+/// ergeben eine leere Liste; der Aufrufer prüft dann nichts.
+pub fn stichproben_zeiten(dauer_s: f32, anzahl: usize) -> Vec<f32> {
+    if anzahl == 0 || !dauer_s.is_finite() || dauer_s <= 0.0 {
+        return Vec::new();
+    }
+    let n = anzahl as f32;
+    (0..anzahl)
+        .map(|i| (i as f32 + 0.5) / n * dauer_s)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1135,105 @@ mod tests {
         assert!(
             raster_auf_zeilen(&takt, 128, 16, 0, 0).is_empty(),
             "Laenge 0"
+        );
+    }
+
+    #[test]
+    fn abstaende_in_gruppen() {
+        let d = [1.0, 2.0, 3.0, 4.0, 5.0];
+        // 5 Abstände in 2er-Gruppen: 2 + 2 + 1, die letzte darf kürzer sein.
+        assert_eq!(
+            gruppiere_abstaende(&d, 2),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0], vec![5.0]],
+            "5 Abstände, 2er-Gruppen"
+        );
+        // Geht die Einteilung auf, gibt es keine leere Restgruppe.
+        assert_eq!(
+            gruppiere_abstaende(&d[..4], 2),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]]
+        );
+        // Weniger Abstände als die Gruppengröße: eine einzige Gruppe.
+        assert_eq!(
+            gruppiere_abstaende(&d, 9),
+            vec![vec![1.0, 2.0, 3.0, 4.0, 5.0]]
+        );
+        // 0 ist die Vorgabe „nicht gruppieren“: alles in eine Gruppe.
+        assert_eq!(
+            gruppiere_abstaende(&d, 0),
+            vec![vec![1.0, 2.0, 3.0, 4.0, 5.0]]
+        );
+        // Leer bleibt leer, auch bei Gruppengröße 0.
+        assert!(gruppiere_abstaende(&[], 2).is_empty());
+        assert!(gruppiere_abstaende(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn taktfolge_waehlt_gruppen() {
+        let gruppen = vec![vec![1.0, 2.0], vec![3.0], vec![4.0, 5.0, 6.0]];
+        assert_eq!(
+            taktfolge_gruppen(&gruppen, &[0, 2, 0, 1]),
+            vec![
+                gruppen[0].clone(),
+                gruppen[2].clone(),
+                gruppen[0].clone(),
+                gruppen[1].clone()
+            ],
+            "Folge G1 G3 G1 G2"
+        );
+        assert_eq!(gruppen.len(), 3, "die Eingabe bleibt unberührt");
+    }
+
+    #[test]
+    fn taktfolge_klemmt_zu_grosse_indizes() {
+        let gruppen = vec![vec![1.0], vec![2.0]];
+        assert_eq!(
+            taktfolge_gruppen(&gruppen, &[5, 1, 99]),
+            vec![vec![2.0], vec![2.0], vec![2.0]],
+            "zu große Indizes werden auf die letzte Gruppe geklemmt"
+        );
+    }
+
+    #[test]
+    fn taktfolge_ohne_gruppen_oder_folge_ist_leer() {
+        assert!(taktfolge_gruppen(&[], &[0, 1]).is_empty(), "keine Gruppen");
+        let gruppen = vec![vec![1.0]];
+        assert!(
+            taktfolge_gruppen(&gruppen, &[]).is_empty(),
+            "leere Folge"
+        );
+    }
+
+    #[test]
+    fn stichproben_ueber_die_videodauer() {
+        let t = stichproben_zeiten(10.0, 30);
+        assert_eq!(t.len(), 30, "eine Stichprobe je Abschnitt");
+        // Mitte des ersten Abschnitts: 0,5 / 30 * 10 s ≈ 0,1667 s.
+        assert!(nah(t[0], 0.1667), "erste Stichprobe: {}", t[0]);
+        // Mitte des letzten Abschnitts: 29,5 / 30 * 10 s ≈ 9,8333 s.
+        assert!(nah(t[29], 9.8333), "letzte Stichprobe: {}", t[29]);
+        assert!(
+            t.windows(2).all(|w| w[0] < w[1]),
+            "streng aufsteigend: {t:?}"
+        );
+        assert!(
+            t.iter().all(|zeit| *zeit > 0.0 && *zeit < 10.0),
+            "alle im Video, nicht auf dem Rand: {t:?}"
+        );
+        // Eine einzelne Stichprobe ist die Mitte des ganzen Videos.
+        let mitte = stichproben_zeiten(10.0, 1);
+        assert_eq!(mitte.len(), 1);
+        assert!(nah(mitte[0], 5.0), "Mitte: {}", mitte[0]);
+    }
+
+    #[test]
+    fn stichproben_kaputte_werte_sind_leer() {
+        assert!(stichproben_zeiten(10.0, 0).is_empty(), "keine Stichproben");
+        assert!(stichproben_zeiten(0.0, 30).is_empty(), "Dauer 0");
+        assert!(stichproben_zeiten(-4.0, 30).is_empty(), "negative Dauer");
+        assert!(stichproben_zeiten(f32::NAN, 30).is_empty(), "NaN");
+        assert!(
+            stichproben_zeiten(f32::INFINITY, 30).is_empty(),
+            "unendlich"
         );
     }
 }
