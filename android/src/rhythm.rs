@@ -1643,7 +1643,7 @@ impl RhythmPanel {
             });
             // Anzeige-Buendelung: lange Patterns in weniger Zellen, ohne die
             // Patternlaenge zu aendern (Nutzerentscheidung 2026-10-14).
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Bündelung");
                 for wert in [1u16, 2, 4, 8, 16, 32] {
                     if ui
