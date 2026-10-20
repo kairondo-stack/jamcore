@@ -516,6 +516,52 @@ pub fn schritte_aus_abstaenden_bpm(
     raus
 }
 
+/// Bildet die Schritte **eines Takts** (`0..raster`) auf Pattern-Zeilen ab.
+///
+/// `zeilen_pro_takt` ist die Auflösung des Zielpatterns (16 = eine Zeile je
+/// 16tel, 32 = 32tel, 64 = 64tel), `laenge` dessen Länge und `start` die erste
+/// Zeile, an die der Takt geschrieben wird (für Wiederholungen und das zweite
+/// Pattern). Eine Zeile ist `start + schritt * zeilen_pro_takt / raster`,
+/// ganzzahlig abgerundet; Zeilen ab `laenge` fallen weg.
+///
+/// Mehrere Schritte können auf derselben Zeile landen (feineres Raster als das
+/// Pattern): dann gewinnt der **erste** Eintrag der Eingabe — so bleibt die
+/// Farbe des Blattes erhalten, das den Schritt zuerst belegt. Das Ergebnis ist
+/// nach Zeile sortiert und ohne doppelte Zeilen.
+///
+/// Ohne Raster oder ohne Zeilen je Takt gibt es keine Abbildung (leeres
+/// Ergebnis).
+pub fn raster_auf_zeilen(
+    takt: &[(u32, u8)],
+    raster: u16,
+    zeilen_pro_takt: u16,
+    laenge: u16,
+    start: u16,
+) -> Vec<(u16, u8)> {
+    if raster == 0 || zeilen_pro_takt == 0 || laenge == 0 {
+        return Vec::new();
+    }
+    // Belegt-Maske: so gewinnt der erste Eintrag der Eingabe, auch wenn die
+    // Liste unsortiert ist (ein sortiertes Dedup würde den falschen behalten).
+    let mut belegt = vec![false; laenge as usize];
+    let mut raus = Vec::with_capacity(takt.len());
+    for (schritt, instrument) in takt {
+        // u64 statt u16: Schritt * Zeilen kann bei großen Rastern überlaufen.
+        let zeile = start as u64 + (*schritt as u64 * zeilen_pro_takt as u64) / raster as u64;
+        if zeile >= laenge as u64 {
+            continue;
+        }
+        let zeile = zeile as u16;
+        if belegt[zeile as usize] {
+            continue;
+        }
+        belegt[zeile as usize] = true;
+        raus.push((zeile, *instrument));
+    }
+    raus.sort_unstable_by_key(|(zeile, _)| *zeile);
+    raus
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,5 +998,81 @@ mod tests {
             &techno,
         );
         assert_eq!(s, vec![0, 24, 48, 72]);
+    }
+
+    #[test]
+    fn raster_128_auf_16_zeilen() {
+        // Ein Takt mit 128 Rasterzellen belegt bei 1/16 genau 16 Zeilen:
+        // 0→0, Viertel (32) → 4, Halbe (64) → 8, letzte Zelle → 15.
+        let takt = [(0, 0), (24, 1), (32, 2), (64, 3), (127, 0)];
+        assert_eq!(
+            raster_auf_zeilen(&takt, 128, 16, 16, 0),
+            vec![(0, 0), (3, 1), (4, 2), (8, 3), (15, 0)]
+        );
+    }
+
+    #[test]
+    fn raster_96_auf_32_zeilen() {
+        // 96er-Raster auf ein 32er-Pattern: die Achtel (12) wird Zeile 4,
+        // die Viertel (24) Zeile 8, die letzte Zelle (95) Zeile 31.
+        let takt = [(0, 0), (12, 1), (24, 2), (48, 3), (95, 0)];
+        assert_eq!(
+            raster_auf_zeilen(&takt, 96, 32, 32, 0),
+            vec![(0, 0), (4, 1), (8, 2), (16, 3), (31, 0)]
+        );
+    }
+
+    #[test]
+    fn raster_256_auf_64_zeilen() {
+        // 256er-Raster auf ein 64er-Pattern: Viertel 64 → 16, letzte Zelle
+        // 255 → 63 (abgerundet, nicht 64).
+        let takt = [(0, 0), (64, 1), (128, 2), (255, 3)];
+        assert_eq!(
+            raster_auf_zeilen(&takt, 256, 64, 64, 0),
+            vec![(0, 0), (16, 1), (32, 2), (63, 3)]
+        );
+    }
+
+    #[test]
+    fn start_versatz_und_laenge_schneiden_ab() {
+        // `start` ist die erste Zeile im Zielpattern (Wiederholung des Takts);
+        // was hinter `laenge` liegt, fällt weg.
+        let takt = [(0, 0), (31, 1), (32, 2), (63, 3), (64, 0)];
+        assert_eq!(
+            raster_auf_zeilen(&takt, 128, 16, 12, 8),
+            vec![(8, 0), (11, 1)],
+            "0→8, 31→11; ab Zeile 12 (32→12) wird verworfen"
+        );
+        // Start schon hinter dem Ende: nichts.
+        assert!(raster_auf_zeilen(&takt, 128, 16, 16, 20).is_empty());
+    }
+
+    #[test]
+    fn gleiche_zeile_erste_note_gewinnt() {
+        // 128er-Raster, 16 Zeilen: 0…7 liegen alle auf Zeile 0. Der erste
+        // Eintrag in Eingabereihenfolge gewinnt, auch wenn die Liste
+        // unsortiert ist; die Ausgabe ist nach Zeile sortiert.
+        let takt = [(7, 3), (0, 1), (8, 2), (15, 0)];
+        assert_eq!(
+            raster_auf_zeilen(&takt, 128, 16, 32, 0),
+            vec![(0, 3), (1, 2)],
+            "7 und 0 → Zeile 0 (erster: Instrument 3); 8 und 15 → Zeile 1"
+        );
+        // Für Zeile 1 gewinnt 8 (Instrument 2), 15 wird verworfen.
+    }
+
+    #[test]
+    fn raster_auf_zeilen_leer_und_null() {
+        assert!(raster_auf_zeilen(&[], 128, 16, 128, 0).is_empty());
+        let takt = [(0, 0), (64, 1)];
+        assert!(raster_auf_zeilen(&takt, 0, 16, 128, 0).is_empty(), "Raster 0");
+        assert!(
+            raster_auf_zeilen(&takt, 128, 0, 128, 0).is_empty(),
+            "0 Zeilen je Takt"
+        );
+        assert!(
+            raster_auf_zeilen(&takt, 128, 16, 0, 0).is_empty(),
+            "Laenge 0"
+        );
     }
 }

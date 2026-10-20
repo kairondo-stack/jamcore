@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Grid, RichText, Sense};
 use jamcore::euclid;
-use jamcore::grid::{note_name, Note, Pattern, MAX_STEPS_PER_CYCLE, STEPS_PER_CYCLE as STEP_COUNT};
+use jamcore::grid::{note_name, Note, Pattern, MAX_STEPS_PER_CYCLE};
 use jamcore::osc::{OscOut, Renoise, DEFAULT_BASE_PORT};
 use jamcore::tracker::{klemme_kanal, loeschen, setzen, zelle_text, KANAELE};
 use jamcore::transformation;
@@ -37,6 +37,20 @@ const DEFAULT_BPM: f32 = 128.0;
 /// Tonzeile, auf die das Euklid-Muster schreibt: die erste Rasterzeile
 /// (36, Kick/Bass). Die anderen Zeilen bleiben fürs Antippen frei.
 const EUCLID_PITCH: i32 = ROWS[0];
+
+/// Tonhöhen-Offset je Laub-Farbe (rot/gelb/braun/grün): Grundton, kleine
+/// Terz, Quinte, Oktave. Warum: die Farbe ist nur die Instrumentnummer
+/// (0…3), und bei einer Klangquelle mit einem einzigen Sample klänge sonst
+/// jede Note gleich. Vier Tonstufen lassen den Laub-Rhythmus melodisch
+/// wirken, ohne die Farbzuordnung (Instrument) zu verändern.
+const LAUB_STUFEN: [i32; 4] = [0, 3, 7, 12];
+
+/// Tonhöhe einer Laub-Farbe auf der Schlagzeug-Zeile: [`EUCLID_PITCH`] plus
+/// Terz/Quinte/Oktave. Dieselbe Abbildung nutzen Pattern und Anhören, damit
+/// die Vorschau klingt wie das gerenderte Material.
+pub fn laub_pitch(farbe: u8) -> i32 {
+    EUCLID_PITCH + LAUB_STUFEN[(farbe as usize).min(LAUB_STUFEN.len() - 1)]
+}
 
 /// „125 ms“ zur Tonlaenge — die ms haengen am aktuellen BPM.
 fn ms_text(e: crate::klang::Einstellungen) -> String {
@@ -114,6 +128,11 @@ pub struct RhythmPanel {
     presenter: bool,
     /// Instrumentnummer fuer neue Noten (Renoise-Instrument).
     instrument: u8,
+    /// Feinheit der Uhr: Pattern-Zeilen je Takt (16 = 1/16, 32 = 1/32,
+    /// 64 = 1/64). Bestimmt Taktzeit, Raster und Laub-Rendern.
+    feinheit: u16,
+    /// Laub-Rendern auf zwei Patterns verteilen (erste Hälfte / Rest).
+    zwei_patterns: bool,
     /// Anzeige-Buendelung: so viele Schritte fasst eine Rasterzelle zusammen
     /// (1 = ein Schritt; 2, 4, 8, 16, 32 fuer lange Patterns).
     buendel: u16,
@@ -159,8 +178,14 @@ impl Default for RhythmPanel {
 
 impl RhythmPanel {
     pub fn new() -> Self {
+        // Start mit 128 Zeilen statt der Kern-Vorgabe 512: der Laub-Render
+        // (ein Takt je 16 Zeilen) passt damit in ein übersichtliches Pattern.
+        let mut slots = vec![Pattern::new(); 8];
+        for pattern in &mut slots {
+            pattern.set_steps_per_cycle(128);
+        }
         Self {
-            slots: vec![Pattern::new(); 8],
+            slots,
             slot: 0,
             target: ("127.0.0.1".to_string(), 7003),
             velocity: 100,
@@ -179,6 +204,8 @@ impl RhythmPanel {
             aufnahme: false,
             presenter: false,
             instrument: 0,
+            feinheit: 16,
+            zwei_patterns: false,
             buendel: 1,
             skala: 0,
             grundton: 60,
@@ -188,7 +215,7 @@ impl RhythmPanel {
             interp_faktor: 1.0,
             interp_kurve: 3,
             bereich_von: 0,
-            bereich_bis: STEP_COUNT - 1,
+            bereich_bis: 127,
             klangquelle: Klangquelle::Modul,
             welle: jamcore::klang::Welle::Sinus,
             modul_quelle: None,
@@ -279,6 +306,27 @@ impl RhythmPanel {
         self.bpm
     }
 
+    /// Uhr-Tempo für das Anhören im Laub-Tab (dieselbe Eigenuhr).
+    pub fn bpm(&self) -> f32 {
+        self.bpm
+    }
+
+    /// Feinheit der Uhr: Pattern-Zeilen je Takt (16, 32 oder 64). Das
+    /// Laub-Anhören spielt damit im selben Zeitraster wie das Pattern.
+    pub fn feinheit(&self) -> u16 {
+        self.feinheit
+    }
+
+    /// Laub-Rendern auf zwei Patterns verteilen?
+    pub fn zwei_patterns(&self) -> bool {
+        self.zwei_patterns
+    }
+
+    /// „2 Patterns“ aus dem Laub-Tab setzen.
+    pub fn set_zwei_patterns(&mut self, an: bool) {
+        self.zwei_patterns = an;
+    }
+
     /// Die Eigenuhr von aussen stellen (App-Tempo).
     pub fn set_eigenuhr(&mut self, bpm: f32) {
         self.bpm = bpm.clamp(40.0, 220.0);
@@ -351,8 +399,7 @@ impl RhythmPanel {
     }
 
     /// Den Laub-Rhythmus (Laub-Tab) ins aktuelle Raster schreiben — wie das
-    /// Euklid-Muster: erst `clear`, dann je Schritt eine Note auf der
-    /// Schlagzeug-Zeile [`EUCLID_PITCH`].
+    /// Euklid-Muster: erst `clear`, dann je Schritt eine Note.
     ///
     /// `takt` ist je Schritt `(Schrittnummer im Takt, Instrument)`: die
     /// Schrittnummern kommen aus `jamcore::laub::schritte_aus_abstaenden`
@@ -360,32 +407,63 @@ impl RhythmPanel {
     /// Instrument 0…3; bei der Klangquelle „Slices" sind das die ersten vier
     /// Slices).
     ///
-    /// Das Muster steht in Schritten **eines Takts** (Raster 96/128/192/256).
-    /// Das Pattern behält seine Länge: ist es länger als der Takt, wird das
-    /// Muster je Takt wiederholt (wie das Euklid-Muster); ist es kürzer, wird
-    /// der Takt in die Patternlänge skaliert (sonst fielen Schritte hinter dem
-    /// Patternende weg). Rückgabe: Zahl der Noten im Raster.
+    /// **Zeitraster:** Ein Takt belegt [`RhythmPanel::feinheit`] Zeilen (16 =
+    /// 1/16, 32 = 1/32, 64 = 1/64), nicht mehr eine Zeile je Rasterzelle —
+    /// sonst wäre ein 128er-Raster acht Takte lang (der „nur jede vierte
+    /// Zeile“-Klang). Die Abbildung macht `jamcore::laub::raster_auf_zeilen`;
+    /// der Takt wird alle `feinheit` Zeilen bis zur Patternlänge wiederholt.
+    ///
+    /// **2 Patterns:** Ist [`RhythmPanel::zwei_patterns`] an, geht die erste
+    /// Hälfte der Zeilen in den aktuellen Slot und der Rest in den nächsten
+    /// (Slot+1, bei 8 → 0). Der zweite Slot wird vorher geleert. Rückgabe:
+    /// Gesamtzahl der Noten beider Slots.
     pub fn laub_setzen(&mut self, takt: &[(u32, u8)], raster: u16) -> usize {
-        let len = self.pattern().steps_per_cycle().max(1) as u32;
-        let raster = raster.max(1) as u32;
-        self.pattern_mut().clear();
-        for (schritt, instrument) in takt {
-            if len >= raster {
-                // Takt-Muster über die Patternlänge wiederholen.
-                let mut ziel = *schritt as u32 % raster;
-                while ziel < len {
-                    self.pattern_mut()
-                        .insert(raster_note(ziel as u16, *instrument, EUCLID_PITCH));
-                    ziel += raster;
+        let laenge = self.pattern().steps_per_cycle().max(1);
+        let feinheit = self.feinheit.max(1);
+        let zwei = self.zwei_patterns;
+        let slot = self.slot.min(self.slots.len().saturating_sub(1));
+        let naechster = (slot + 1) % self.slots.len();
+        let haelfte = if zwei { laenge / 2 } else { laenge };
+        self.slots[slot].clear();
+        if zwei {
+            // Beide Slots gleich lang: eine alte kürzere Länge im Nachbarslot
+            // würde die zweite Hälfte sonst umbrechen statt aufnehmen.
+            self.slots[naechster].set_steps_per_cycle(laenge);
+            self.slots[naechster].clear();
+        }
+        let (mut erste, mut zweite) = (0usize, 0usize);
+        // Takt für Takt an die Zeile `start` schreiben; bei „2 Patterns“ wird
+        // jede Note an der Halbmarke in den nächsten Slot umgehängt.
+        for start in (0..laenge).step_by(feinheit as usize) {
+            for (zeile, instrument) in
+                jamcore::laub::raster_auf_zeilen(takt, raster, feinheit, laenge, start)
+            {
+                let farbe = instrument.min(3);
+                let (ziel_slot, ziel_zeile) = if zwei && zeile >= haelfte {
+                    (naechster, zeile - haelfte)
+                } else {
+                    (slot, zeile)
+                };
+                self.slots[ziel_slot].insert(raster_note(
+                    ziel_zeile,
+                    farbe,
+                    laub_pitch(farbe),
+                ));
+                if ziel_slot == slot {
+                    erste += 1;
+                } else {
+                    zweite += 1;
                 }
-            } else {
-                // Kürzer als ein Takt: den Takt hineinskalieren.
-                let ziel = ((*schritt as u32 * len + raster / 2) / raster).min(len - 1);
-                self.pattern_mut()
-                    .insert(raster_note(ziel as u16, *instrument, EUCLID_PITCH));
             }
         }
-        self.pattern().notes().len()
+        if zwei {
+            info!(
+                "laub: 2 Patterns: {erste} + {zweite} Noten (Slots {}, {})",
+                slot + 1,
+                naechster + 1
+            );
+        }
+        erste + zweite
     }
 
     /// Sinus-Interpolation wie `D`+`3` im Desktop-Recorder: zwischen den
@@ -481,8 +559,9 @@ impl RhythmPanel {
 
     /// Eigene Uhr, wenn der Follow-Modus aus ist.
     /// "Rendern" wie die Taste o im Desktop-Recorder: spielt das Raster in
-    /// Schleife im 16tel-Takt, sendet je Note `note_on` per OSC und lässt sie
-    /// lokal klingen. Optional startet/stoppt es den Renoise-Transport.
+    /// Schleife im Raster der eingestellten Feinheit (1/16, 1/32, 1/64), sendet
+    /// je Note `note_on` per OSC und lässt sie lokal klingen. Optional
+    /// startet/stoppt es den Renoise-Transport.
     fn rendern_starten(&mut self) {
         if self.render_laeuft {
             return;
@@ -509,6 +588,9 @@ impl RhythmPanel {
         let transport = self.transport_mit;
         let klangquelle = self.klangquelle;
         let welle = self.welle;
+        // Feinheit: 16 Zeilen je Takt = 16tel, 32 = 32tel, 64 = 64tel. Die
+        // Zeilendauer ist 60/bpm / (feinheit/4) — bei 1/16 wie bisher 16tel.
+        let feinheit = self.feinheit.max(1);
         let modul = self.modul_quelle.clone();
         let stopp = Arc::new(AtomicBool::new(false));
         let schritt = Arc::new(AtomicU16::new(0));
@@ -564,8 +646,8 @@ impl RhythmPanel {
                     }
                     schritt_c.store(i, Ordering::Relaxed);
                     i = (i + 1) % schritte;
-                    // 16tel bei bpm: 60/bpm/4 Sekunden je Schritt.
-                    let ziel = (60_000.0 / bpm / 4.0) as u64;
+                    // Zeilendauer bei bpm: 60/bpm / (feinheit/4) Sekunden.
+                    let ziel = (60_000.0 * 4.0 / (bpm * feinheit as f32)) as u64;
                     let rest = ziel.saturating_sub(start.elapsed().as_millis() as u64);
                     std::thread::sleep(Duration::from_millis(rest));
                 }
@@ -590,9 +672,9 @@ impl RhythmPanel {
         }
     }
 
-    /// Spielt den aktuellen Slot **einmal** ab, auf die nächste 16tel des
-    /// eigenen Rasters quantisiert (Desktop: `H` → `play4`). Läuft parallel,
-    /// damit die Oberfläche bedienbar bleibt.
+    /// Spielt den aktuellen Slot **einmal** ab, auf die nächste Rasterzeile
+    /// (1/16, 1/32 oder 1/64) der eigenen Uhr quantisiert (Desktop: `H` →
+    /// `play4`). Läuft parallel, damit die Oberfläche bedienbar bleibt.
     fn slot_spielen(&mut self) {
         if self.render_laeuft {
             self.rendern_stoppen();
@@ -616,13 +698,14 @@ impl RhythmPanel {
         let klangquelle = self.klangquelle;
         let welle = self.welle;
         let modul = self.modul_quelle.clone();
-        let schrittzeit = 60.0 / bpm / 4.0;
+        // Eine Zeile ist 1/feinheit eines Takts (1/16, 1/32 oder 1/64).
+        let schrittzeit = 60.0 / bpm / (self.feinheit.max(1) as f32 / 4.0);
         let anzahl = noten.len();
         let kanaele = kanaele_anzahl(&noten);
         let ergebnis = std::thread::Builder::new()
             .name("jam-slot".to_string())
             .spawn(move || {
-                // Auf die naechste 16tel des eigenen Rasters warten.
+                // Auf die naechste Rasterzeile des eigenen Rasters warten.
                 let verstrichen = basis.elapsed().as_secs_f32();
                 let warten = schrittzeit - (verstrichen % schrittzeit);
                 if warten > 0.0 && warten < schrittzeit {
@@ -698,8 +781,9 @@ impl RhythmPanel {
         let elapsed = self.clock.elapsed().as_secs_f32();
         let beats = elapsed * self.bpm.max(20.0) / 60.0;
         // Modulo vor dem Cast: ein `as u16` wuerde nach zwei Stunden
-        // sattigieren und die Uhr einfrieren.
-        let steps = (beats * 4.0).max(0.0);
+        // sattigieren und die Uhr einfrieren. Zeilen je Takt 16/32/64
+        // (feinheit/4 Schritte je Schlag).
+        let steps = (beats * (self.feinheit.max(1) as f32 / 4.0)).max(0.0);
         self.current_step = if steps.is_finite() {
             (steps as i64 % schritte as i64) as u16
         } else {
@@ -1301,9 +1385,9 @@ impl RhythmPanel {
                 self.interpolieren();
             }
             ui.separator();
-            // Patternlaenge 1..128. Das Raster darunter, das Abspielen und der
+            // Patternlaenge. Das Raster darunter, das Abspielen und der
             // Maske-Tab (dessen Zeitabstaende) lesen dieselbe Zahl.
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("Laenge");
                 let mut laenge = self.pattern().steps_per_cycle() as i32;
                 if ui
@@ -1313,9 +1397,19 @@ impl RhythmPanel {
                     self.pattern_mut().set_steps_per_cycle(laenge as u16);
                     self.status = format!("Patternlaenge: {laenge} Schritte");
                 }
-                if ui.button("16").clicked() {
-                    self.pattern_mut().set_steps_per_cycle(16);
-                    self.status = "Patternlaenge: 16 Schritte".to_string();
+                // Schnellwahl für lange Laub-Renderings: 128 (Vorgabe) und
+                // Vielfache davon; der aktuelle Wert bleibt hervorgehoben.
+                for wert in [64u16, 128, 192, 256, 384, 512] {
+                    if ui
+                        .selectable_label(
+                            self.pattern().steps_per_cycle() == wert,
+                            wert.to_string(),
+                        )
+                        .clicked()
+                    {
+                        self.pattern_mut().set_steps_per_cycle(wert);
+                        self.status = format!("Patternlaenge: {wert} Schritte");
+                    }
                 }
             });
             // Anzeige-Buendelung: lange Patterns in weniger Zellen, ohne die
@@ -1526,6 +1620,19 @@ impl RhythmPanel {
                 .text("BPM")
                 .show_value(true),
         );
+        // Feinheit der Uhr: 16 Zeilen je Takt = 1/16, 32 = 1/32, 64 = 1/64.
+        // Sie bestimmt das Zeitraster von Uhr, Rendern und Laub-Rendern;
+        // bestehende Noten bleiben liegen (nur ihre Zeit wird feiner).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Feinheit");
+            for (wert, text) in [(16u16, "1/16"), (32, "1/32"), (64, "1/64")] {
+                if ui.selectable_label(self.feinheit == wert, text).clicked() {
+                    self.feinheit = wert;
+                    self.status = format!("Feinheit {text}: {wert} Zeilen je Takt");
+                    info!("rhythm: Feinheit {text} ({wert} Zeilen je Takt)");
+                }
+            }
+        });
         ui.horizontal(|ui| {
             if ui.button("Follow").clicked() {
                 self.follow = !self.follow;

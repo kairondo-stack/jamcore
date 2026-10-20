@@ -1,7 +1,8 @@
 //! Laub-Tab (Plan `docs/plans/2026-10-18-laub-rhythmus.md`, Step 3):
 //! Foto aufnehmen, Bild **oder Video** laden → Blätter finden → Abstände
 //! anzeigen → Genre, Raster und Modus wählen → „als Rhythmus rendern“ schreibt
-//! die Schrittnummern ins Rhythmus-Raster.
+//! die Schrittnummern ins Rhythmus-Raster; „Anhören“ spielt dieselben Schritte
+//! vorher in Schleife, ohne das Pattern zu verändern.
 //!
 //! Das Rechnen liegt im Kern (`jamcore::laub`, Step 1+2); hier stehen
 //! Aufnahme, Anzeige, Bedienung und der Weg ins Raster
@@ -36,6 +37,9 @@
 //! das erste Blatt, das dort ankommt.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Stroke};
 use jamcore::laub::{
@@ -148,6 +152,15 @@ pub struct LaubPanel {
     pan: egui::Vec2,
     /// Laufendes Video-Prüfen („Video laden …“), sonst `None`.
     videolauf: Option<Videolauf>,
+    /// „Anhören“ läuft: die berechneten Schritte klingen in Schleife, ohne ins
+    /// Pattern zu schreiben.
+    anhoeren_laeuft: bool,
+    /// Stopp-Flag des Anhören-Threads.
+    anhoeren_stopp: Option<Arc<AtomicBool>>,
+    anhoeren_thread: Option<std::thread::JoinHandle<()>>,
+    /// Herzschlag der Oberfläche: der Anhören-Thread stoppt, wenn der Laub-Tab
+    /// verlassen wird (dann ruft niemand mehr `ui` auf).
+    anhoeren_herz: Arc<Mutex<Instant>>,
     /// Zeile unter der Steuerung („ins Raster geschrieben …“).
     status: String,
     /// Zeile der Erkennung („13 Blätter, Median-Abstand 47 px“).
@@ -157,6 +170,13 @@ pub struct LaubPanel {
 impl Default for LaubPanel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for LaubPanel {
+    fn drop(&mut self) {
+        // Beim Verlassen der App darf der Anhören-Thread nicht weiterklingen.
+        self.anhoeren_stoppen(false);
     }
 }
 
@@ -181,6 +201,10 @@ impl LaubPanel {
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             videolauf: None,
+            anhoeren_laeuft: false,
+            anhoeren_stopp: None,
+            anhoeren_thread: None,
+            anhoeren_herz: Arc::new(Mutex::new(Instant::now())),
             status: "Kamera an + „Foto aufnehmen“, „Bild laden …“ oder „Video laden …“."
                 .to_string(),
             erkennung: String::new(),
@@ -506,31 +530,28 @@ impl LaubPanel {
         }
     }
 
-    /// „als Rhythmus rendern“: die Schrittnummern des Kerns ins aktuelle
-    /// Rhythmus-Raster schreiben (Farbe je Schritt → Instrument).
-    fn rendern(&mut self, rhythm: &mut crate::rhythm::RhythmPanel) {
+    /// Die berechneten Schritte **eines Takts** samt Farbe je Schritt —
+    /// dieselbe Kette für „als Rhythmus rendern“ und „Anhören“, aber ohne
+    /// Schreiben ins Pattern. `Err` trägt den Statustext für den Nutzer.
+    fn takt_berechnen(&self) -> Result<Vec<(u32, u8)>, String> {
         let Some(g) = genre(GENRES[self.genre.min(GENRES.len() - 1)]) else {
-            self.status = "Unbekanntes Genre".to_string();
-            return;
+            return Err("Unbekanntes Genre".to_string());
         };
         if self.abstaende.is_empty() {
-            self.status = "Keine Abstände — erst Blätter erkennen.".to_string();
-            return;
+            return Err("Keine Abstände — erst Blätter erkennen.".to_string());
         }
         let modus = self.modus();
         let eingabe = self.eingabe_abstaende();
         let schritte = schritte_aus_abstaenden_bpm(&eingabe, self.raster, modus, &g, self.bpm);
-        let modus_text = if self.relativ { "relativ" } else { "absolut" };
         log::info!(
             "laub: Genre {}, Raster {}, {} -> {} Schritte",
             g.name,
             self.raster,
-            modus_text,
+            if self.relativ { "relativ" } else { "absolut" },
             schritte.len()
         );
         if schritte.is_empty() {
-            self.status = "Keine Schritte — Abstände, Genre und Raster prüfen.".to_string();
-            return;
+            return Err("Keine Schritte — Abstände, Genre und Raster prüfen.".to_string());
         }
         let farben = farben_je_schritt(
             &self.blaetter,
@@ -541,7 +562,7 @@ impl LaubPanel {
             self.bpm,
             &schritte,
         );
-        let takt: Vec<(u32, u8)> = schritte
+        Ok(schritte
             .iter()
             .map(|s| {
                 (
@@ -552,13 +573,126 @@ impl LaubPanel {
                         .unwrap_or(jamcore::laub::FARBE_ROT),
                 )
             })
-            .collect();
+            .collect())
+    }
+
+    /// „als Rhythmus rendern“: die Schrittnummern des Kerns ins aktuelle
+    /// Rhythmus-Raster schreiben (Farbe je Schritt → Instrument).
+    fn rendern(&mut self, rhythm: &mut crate::rhythm::RhythmPanel) {
+        let takt = match self.takt_berechnen() {
+            Ok(takt) => takt,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
         let noten = rhythm.laub_setzen(&takt, self.raster);
         self.status = format!("ins Raster geschrieben ({noten} Noten)");
         log::info!(
             "laub: ins Raster geschrieben ({noten} Noten, {} Schritte je Takt)",
-            schritte.len()
+            takt.len()
         );
+    }
+
+    /// „Anhören“: dieselbe Kette wie [`LaubPanel::rendern`], aber nur hören —
+    /// es wird **nichts** ins Pattern geschrieben. Gespielt wird eine Zeile je
+    /// `60/bpm/(feinheit/4)` Sekunden (also im Raster des Rhythmus-Tabs), in
+    /// Schleife bis „Stop“, Tab-Wechsel oder Drop.
+    fn anhoeren_starten(&mut self, rhythm: &crate::rhythm::RhythmPanel) {
+        if self.anhoeren_laeuft {
+            return;
+        }
+        let takt = match self.takt_berechnen() {
+            Ok(takt) => takt,
+            Err(e) => {
+                self.status = e;
+                return;
+            }
+        };
+        let feinheit = rhythm.feinheit().max(1);
+        let bpm = rhythm.bpm().max(20.0);
+        let (_, welle, _) = rhythm.klang_zustand();
+        // Nur die Noten eines Takts (Startzeile 0, Länge ein Takt): die
+        // Schleife wiederholt den Takt, genau wie das Pattern.
+        let noten = jamcore::laub::raster_auf_zeilen(&takt, self.raster, feinheit, feinheit, 0);
+        if noten.is_empty() {
+            self.status = "Anhören: keine Noten im Takt.".to_string();
+            return;
+        }
+        let anzahl = takt.len();
+        let stopp = Arc::new(AtomicBool::new(false));
+        let herz = Arc::clone(&self.anhoeren_herz);
+        if let Ok(mut herz) = herz.lock() {
+            *herz = Instant::now();
+        }
+        let stopp_c = Arc::clone(&stopp);
+        let ergebnis = std::thread::Builder::new()
+            .name("jam-laub-anhoeren".to_string())
+            .spawn(move || {
+                let schrittzeit = 60.0 / bpm / (feinheit as f32 / 4.0);
+                let taktzeit = schrittzeit * feinheit as f32;
+                'aussen: loop {
+                    let start = Instant::now();
+                    for (zeile, farbe) in &noten {
+                        let ziel = *zeile as f32 * schrittzeit;
+                        if !warte_bis(&stopp_c, &herz, start, ziel) {
+                            break 'aussen;
+                        }
+                        crate::klang::spielen_welle(crate::rhythm::laub_pitch(*farbe), welle);
+                    }
+                    if !warte_bis(&stopp_c, &herz, start, taktzeit) {
+                        break 'aussen;
+                    }
+                }
+            });
+        match ergebnis {
+            Ok(thread) => {
+                self.anhoeren_thread = Some(thread);
+                self.anhoeren_stopp = Some(stopp);
+                self.anhoeren_laeuft = true;
+                self.status = format!(
+                    "Anhören ({} Schritte, 1/{feinheit}, {bpm:.0} BPM)",
+                    anzahl
+                );
+                log::info!(
+                    "laub: Anhören ({anzahl} Schritte, 1/{feinheit}, {bpm:.0} BPM)"
+                );
+            }
+            Err(e) => self.status = format!("Anhören-Thread: {e}"),
+        }
+    }
+
+    /// Anhören stoppen (Flag setzen, Thread einsammeln).
+    fn anhoeren_stoppen(&mut self, loggen: bool) {
+        let war_an = self.anhoeren_laeuft;
+        if let Some(stopp) = self.anhoeren_stopp.take() {
+            stopp.store(true, Ordering::Relaxed);
+        }
+        if let Some(thread) = self.anhoeren_thread.take() {
+            let _ = thread.join();
+        }
+        self.anhoeren_laeuft = false;
+        if war_an {
+            self.status = "Anhören gestoppt".to_string();
+            if loggen {
+                log::info!("laub: Anhören gestoppt");
+            }
+        }
+    }
+
+    /// Vom Anhören-Thread selbst beendet (Tab-Wechsel): aufräumen und melden.
+    fn anhoeren_aufraeumen(&mut self) {
+        if !self.anhoeren_laeuft {
+            return;
+        }
+        if self
+            .anhoeren_thread
+            .as_ref()
+            .map(|thread| thread.is_finished())
+            .unwrap_or(false)
+        {
+            self.anhoeren_stoppen(true);
+        }
     }
 
     /// Die Textur auf ein fertiges RGBA-Bild setzen.
@@ -578,6 +712,17 @@ impl LaubPanel {
     /// Das Video-Prüfen ruft die JamApp je Frame ([`LaubPanel::video_schritt`],
     /// auch außerhalb des Tabs) — hier kommt nur der fertige Zustand an.
     pub fn ui(&mut self, ui: &mut egui::Ui, rhythm: &mut crate::rhythm::RhythmPanel) -> Aktion {
+        // Herzschlag für den Anhören-Thread: bleibt `ui` aus (Tab-Wechsel),
+        // stoppt er sich selbst; ein fertiger Thread wird hier eingesammelt.
+        if let Ok(mut herz) = self.anhoeren_herz.lock() {
+            *herz = Instant::now();
+        }
+        self.anhoeren_aufraeumen();
+        if self.anhoeren_laeuft {
+            // Ohne Anzeige-Frames käme kein Herzschlag mehr — den Tab also
+            // während des Hörens wachhalten.
+            ui.ctx().request_repaint_after(Duration::from_millis(100));
+        }
         if let Some((w, h, rgba)) = self.textur_offen.take() {
             self.textur_setzen(ui.ctx(), w, h, &rgba);
         }
@@ -851,6 +996,23 @@ impl LaubPanel {
         });
         ui.horizontal_wrapped(|ui| {
             ui.label(format!("BPM {:.0} (App-Tempo)", self.bpm));
+            // „2 Patterns“: Laub-Rendern auf zwei Slots verteilen. Der Schalter
+            // liegt hier direkt neben dem Rendern, weil er nur diesen Weg
+            // betrifft (Euklid/Rampe schreiben weiter in einen Slot).
+            let mut zwei = rhythm.zwei_patterns();
+            if ui.checkbox(&mut zwei, "2 Patterns").changed() {
+                rhythm.set_zwei_patterns(zwei);
+                self.status = if zwei {
+                    "Laub-Rendern: 2 Patterns (erste Hälfte, Rest)".to_string()
+                } else {
+                    "Laub-Rendern: 1 Pattern".to_string()
+                };
+                log::info!("laub: 2 Patterns = {zwei}");
+            }
+        });
+        // Eigene Zeile für die beiden Aktionen: nebeneinander passen sie mit
+        // dem BPM-Text und der Checkbox auf schmalen Geräten nicht mehr.
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     !self.abstaende.is_empty(),
@@ -860,10 +1022,58 @@ impl LaubPanel {
             {
                 self.rendern(rhythm);
             }
+            // Live hören, ohne ins Pattern zu schreiben — so lässt sich vor
+            // dem Rendern entscheiden, ob der Rhythmus passt.
+            let anhoeren_text = if self.anhoeren_laeuft {
+                "Stop"
+            } else {
+                "Anhören"
+            };
+            if ui
+                .add_enabled(
+                    !self.abstaende.is_empty() || self.anhoeren_laeuft,
+                    egui::Button::new(anhoeren_text),
+                )
+                .clicked()
+            {
+                if self.anhoeren_laeuft {
+                    self.anhoeren_stoppen(true);
+                } else {
+                    self.anhoeren_starten(rhythm);
+                }
+            }
         });
         if !self.status.is_empty() {
             ui.label(&self.status);
         }
+    }
+}
+
+/// Wartet bis `ziel_s` Sekunden nach `start`; `false`, wenn gestoppt wurde
+/// oder der Laub-Tab verlassen ist (Herzschlag älter als 500 ms).
+///
+/// In kleinen Schritten, damit „Stop“ und Tab-Wechsel nicht erst am Ende eines
+/// Takts wirken.
+fn warte_bis(
+    stopp: &AtomicBool,
+    herz: &Mutex<Instant>,
+    start: Instant,
+    ziel_s: f32,
+) -> bool {
+    loop {
+        if stopp.load(Ordering::Relaxed) {
+            return false;
+        }
+        if let Ok(herz) = herz.lock() {
+            if herz.elapsed().as_millis() > 500 {
+                return false;
+            }
+        }
+        let rest = ziel_s - start.elapsed().as_secs_f32();
+        if rest <= 0.0 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_secs_f32(rest.min(0.02)));
     }
 }
 
