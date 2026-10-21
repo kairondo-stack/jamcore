@@ -17,6 +17,7 @@
 //!   benutzt (Instrument-Quelle „Slices").
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -67,6 +68,172 @@ fn raster_slot() -> &'static Mutex<Vec<(Vec<i16>, u32)>> {
 
 fn export_slot() -> &'static Mutex<Option<String>> {
     LETZTER_EXPORT.get_or_init(|| Mutex::new(None))
+}
+
+/// Ein Sample, das im Slicer fuer ein Instrument hinterlegt wurde
+/// („Instr N ← Slice“/„Instr N ← Klang“).
+///
+/// Warum eine eigene Ablage statt direkt in `instr.rs`: der Instrument-Tab
+/// arbeitet parallel in einer anderen Datei; diese kleine API ist der
+/// gemeinsame Nenner. `instr.rs` kann [`sample_fuer_instrument`] lesen und den
+/// Namen anzeigen, der Rhythmus-Tab spielt das Sample ueber
+/// [`instrument_sample_spielen`] — auch ohne Modul.
+#[derive(Clone, Debug)]
+pub struct GetauschtesSample {
+    /// Anzeigename, z. B. `Slice 3 (beat.wav)`.
+    pub name: String,
+    /// Mono-PCM, 16 Bit (gleicher Weg wie die Slices).
+    pub pcm: Vec<i16>,
+    /// Abtastrate der Quelle.
+    pub rate: u32,
+}
+
+static GETAUSCHT: OnceLock<Mutex<Vec<Option<GetauschtesSample>>>> = OnceLock::new();
+
+fn tausch_slot() -> &'static Mutex<Vec<Option<GetauschtesSample>>> {
+    GETAUSCHT.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Ein fertiges PCM-Sample als Sample von Instrument `instrument` hinterlegen
+/// (0-basiert wie `Note::instrument`). Leere Puffer/0 Hz werden verworfen.
+pub fn setze_sample(instrument: usize, name: &str, pcm: Vec<i16>, rate: u32) {
+    if pcm.is_empty() || rate == 0 {
+        info!("slicer: Sample fuer Instr {instrument} verworfen (leer oder 0 Hz)");
+        return;
+    }
+    let sample = GetauschtesSample {
+        name: name.to_string(),
+        pcm,
+        rate,
+    };
+    if let Ok(mut slot) = tausch_slot().lock() {
+        if slot.len() <= instrument {
+            slot.resize_with(instrument + 1, || None);
+        }
+        info!(
+            "slicer: Sample fuer Instr {instrument} gesetzt ({}, {} Samples, {} Hz)",
+            sample.name,
+            sample.pcm.len(),
+            sample.rate
+        );
+        slot[instrument] = Some(sample);
+    }
+}
+
+/// Ein Sample aus einer Datei laden und als Instrument-Sample setzen.
+/// `Ok(Name)` = hinterlegt, `Err` = Datei nicht lesbar.
+///
+/// Fuer Aufrufer, die einen Pfad statt fertigem PCM haben (z. B. den
+/// Instrument-Tab); der Slicer selbst nimmt [`setze_sample`] mit dem Puffer,
+/// den er schon im Speicher hat.
+pub fn setze_sample_pfad(instrument: usize, pfad: &str) -> Result<String, String> {
+    let audio = jamcore::audio::laden(pfad)?;
+    let name = Path::new(pfad)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pfad.to_string());
+    let pcm: Vec<i16> = audio
+        .proben
+        .iter()
+        .map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
+        .collect();
+    setze_sample(instrument, &name, pcm, audio.rate);
+    Ok(name)
+}
+
+/// Das getauschte Sample von Instrument `instrument` (Kopie, damit der
+/// Aufrufer nicht unter dem Mutex klingen muss).
+pub fn sample_fuer_instrument(instrument: usize) -> Option<GetauschtesSample> {
+    tausch_slot()
+        .lock()
+        .ok()
+        .and_then(|s| s.get(instrument).cloned().flatten())
+}
+
+/// Anzeigename des getauschten Samples (`None` = kein Tausch).
+pub fn sample_name(instrument: usize) -> Option<String> {
+    sample_fuer_instrument(instrument).map(|s| s.name)
+}
+
+/// Liegt fuer Instrument `instrument` ein getauschtes Sample vor?
+pub fn hat_getauschtes_sample(instrument: usize) -> bool {
+    sample_fuer_instrument(instrument).is_some()
+}
+
+/// Alle Tausch-Eintraege `(Instrument, Name)` fuer die Anzeige im Slicer.
+pub fn getauschte_liste() -> Vec<(usize, String)> {
+    tausch_slot()
+        .lock()
+        .map(|s| {
+            s.iter()
+                .enumerate()
+                .filter_map(|(i, e)| e.as_ref().map(|e| (i, e.name.clone())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Tausch fuer ein Instrument wieder entfernen. `true`, wenn es einen gab.
+pub fn tausch_loeschen(instrument: usize) -> bool {
+    let entfernt = tausch_slot()
+        .lock()
+        .map(|mut s| s.get_mut(instrument).map(Option::take).is_some())
+        .unwrap_or(false);
+    if entfernt {
+        info!("slicer: Sample fuer Instr {instrument} entfernt");
+    }
+    entfernt
+}
+
+/// Das getauschte Sample von Instrument `instrument` einmal abspielen —
+/// `true`, wenn es eines gibt (sonst faellt der Aufrufer auf Modul/Tongenerator
+/// zurueck). `pitch` verschiebt die Abspielrate wie ein Sample im Modul:
+/// 60 (C-4) = Originaltonhoehe, je Oktave Faktor 2.
+pub fn instrument_sample_spielen(instrument: usize, pitch: i32) -> bool {
+    let Some(sample) = sample_fuer_instrument(instrument) else {
+        return false;
+    };
+    let verstimmung = (pitch.clamp(0, 127) - 60) as f32 / 12.0;
+    let rate = (sample.rate as f32 * 2.0f32.powf(verstimmung))
+        .round()
+        .clamp(2_000.0, 192_000.0) as u32;
+    info!(
+        "slicer: Instr {} spielt getauschtes Sample ({} Hz -> {} Hz, {})",
+        instrument,
+        sample.rate,
+        rate,
+        sample.name
+    );
+    crate::klang::puffer_spielen(sample.pcm, rate, 0.8);
+    true
+}
+
+/// Ziel-Instrument fuer den Knopf „→ Instr N“ im Slicer. Das Rhythmus-Panel
+/// schreibt hier seine aktuelle Instrumentnummer hinein; der Slicer liest und
+/// aendert sie (DragValue). Der Versionszaehler sagt dem Rhythmus-Panel, wann
+/// die Auswahl von hier kam — so bleibt **ein** Wert sichtbar, egal in welchem
+/// Tab er geaendert wurde.
+static ZIEL_INSTRUMENT: AtomicU8 = AtomicU8::new(0);
+static ZIEL_VERSION: AtomicU64 = AtomicU64::new(0);
+
+/// Aktuelles Ziel-Instrument (0-basiert, 0…15).
+pub fn ziel_instrument() -> u8 {
+    ZIEL_INSTRUMENT.load(Ordering::Relaxed)
+}
+
+/// Versionszaehler der Ziel-Auswahl (steigt bei jeder Aenderung).
+pub fn ziel_version() -> u64 {
+    ZIEL_VERSION.load(Ordering::Relaxed)
+}
+
+/// Ziel-Instrument setzen (0…15 geklemmt); nur eine echte Aenderung zaehlt.
+pub fn ziel_instrument_setzen(instrument: u8) {
+    let neu = instrument.min(15);
+    let alt = ZIEL_INSTRUMENT.swap(neu, Ordering::Relaxed);
+    if alt != neu {
+        ZIEL_VERSION.fetch_add(1, Ordering::Relaxed);
+        info!("slicer: Ziel-Instrument {neu}");
+    }
 }
 
 /// Pfad der zuletzt exportierten .it (None, wenn keine). Fragt beim ersten Mal
@@ -504,6 +671,48 @@ impl SlicerPanel {
         );
     }
 
+    /// Den gewählten Slice als Sample von Instrument `instrument` hinterlegen
+    /// („Instr N ← Slice“). Der Rhythmus-Tab zeigt danach `*Slice` an und
+    /// spielt das Sample bei der Klangquelle „Modul“ statt des Modul-Samples —
+    /// der Weg funktioniert also auch ohne geladenes Modul.
+    fn instr_tauschen(&mut self, instrument: usize) {
+        let Some((proben, rate)) = self.audio.as_ref() else {
+            self.status = "Kein Audio geladen — erst öffnen oder aufnehmen.".to_string();
+            return;
+        };
+        let Some(s) = self.schnitte.get(self.auswahl) else {
+            self.status = "Kein Slice gewählt.".to_string();
+            return;
+        };
+        let von = s.von.min(proben.len());
+        let bis = s.bis.min(proben.len()).max(von);
+        if bis <= von {
+            self.status = "Der gewählte Slice ist leer.".to_string();
+            return;
+        }
+        let pcm: Vec<i16> = proben[von..bis]
+            .iter()
+            .map(|v| (v.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect();
+        let anzahl = pcm.len();
+        let rate = *rate;
+        let quelle = self
+            .pfad
+            .as_deref()
+            .map(kurz)
+            .unwrap_or_else(|| "Audio".to_string());
+        let name = format!("Slice {} ({quelle})", self.auswahl + 1);
+        setze_sample(instrument, &name, pcm, rate);
+        self.status = format!(
+            "Slice {} -> Instr {instrument} ({anzahl} Samples, {rate} Hz) — im Rhythmus-Tab hörbar",
+            self.auswahl + 1
+        );
+        info!(
+            "slicer: Slice {} -> Instr {instrument} ({anzahl} Samples, {rate} Hz)",
+            self.auswahl + 1
+        );
+    }
+
     /// Slices als `.it` sichern (Slices als Samples, Pattern leer) — im
     /// App-Ordner `module/`, wo der Player-Tab sucht.
     fn als_it_sichern(&mut self) {
@@ -871,6 +1080,50 @@ impl SlicerPanel {
                 self.als_it_sichern();
             }
         });
+        // Instrument-Sample-Tausch aus dem Slicer: der gewaehlte Slice wird das
+        // Sample von Instrument N. N ist das Ziel-Instrument aus dem
+        // Rhythmus-Tab (dort „Instr ±“); hier laesst es sich ebenfalls stellen.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Sample-Tausch").small());
+            let mut ziel = ziel_instrument() as i32;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut ziel)
+                        .range(0..=15)
+                        .prefix("Instr "),
+                )
+                .changed()
+            {
+                ziel_instrument_setzen(ziel as u8);
+            }
+            if ui
+                .add_enabled(
+                    bereit,
+                    egui::Button::new(format!("→ Instr {}", ziel_instrument())),
+                )
+                .on_hover_text("Gewählten Slice als Sample des Instruments setzen")
+                .clicked()
+            {
+                self.instr_tauschen(ziel_instrument() as usize);
+            }
+            ui.label(
+                RichText::new("ersetzt dort das Modul-Sample (im Rhythmus hörbar)")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
+        let getauscht = getauschte_liste();
+        if !getauscht.is_empty() {
+            let liste: Vec<String> = getauscht
+                .iter()
+                .map(|(instrument, name)| format!("Instr {instrument} ← {name}"))
+                .collect();
+            ui.label(
+                RichText::new(format!("Getauscht: {}", liste.join(" · ")))
+                    .small()
+                    .color(Color32::from_rgb(150, 210, 170)),
+            );
+        }
 
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
         ui.label(
@@ -878,7 +1131,8 @@ impl SlicerPanel {
                 "Wellenform: tippen setzt den Schnitt, ziehen verschiebt ihn, langes Tippen \
                  löscht den Slice. „Als .it sichern“ legt die Slices als Samples in \
                  <App-Ordner>/module/<Name>.it ab (im Player-Tab ladbar); das Rhythmus-Raster \
-                 spielt sie über die Klangquelle „Slices“ (Instr = Slice-Nummer).",
+                 spielt sie über die Klangquelle „Slices“ (Instr = Slice-Nummer). \
+                 „→ Instr N“ macht den gewählten Slice zum Sample von Instrument N.",
             )
             .small()
             .color(Color32::DARK_GRAY),

@@ -60,6 +60,21 @@ pub const FARBE_BRAUN: u8 = 2;
 /// Farbklasse 3: grün.
 pub const FARBE_GRUEN: u8 = 3;
 
+/// Formklasse 0: rund (quadratische Ausdehnung, gut gefüllt).
+pub const FORM_RUND: u8 = 0;
+/// Formklasse 1: länglich (deutlich breiter als hoch oder umgekehrt).
+pub const FORM_LAENGLICH: u8 = 1;
+/// Formklasse 2: gezackt/ausgefranst (füllt die Bounding-Box schlecht).
+pub const FORM_GEZACKT: u8 = 2;
+
+/// Seitenverhältnis ab dem ein Blatt als länglich gilt: 2:1. Ein
+/// Ahornblatt ist eher rundlich, ein Weidenblatt deutlich länger.
+const FORM_VERHAELTNIS_LAENGLICH: f32 = 2.0;
+
+/// Füllgrad der Bounding-Box, ab dem ein Blatt als gezackt gilt: höchstens
+/// 55 %. Ein Kreis füllt 78 %, ein gezacktes Blatt deutlich weniger.
+const FORM_FUELLGRAD_GEZACKT: f32 = 0.55;
+
 /// Vorgabe-Tempo für den absoluten Modus, wenn der Aufrufer keins mitgibt:
 /// 120 BPM. Das ist das Starttempo der übrigen Werkzeuge (Mic-BPM-Tab) und
 /// ein ruhiger Mittelfall für einen Geh-Rhythmus.
@@ -90,6 +105,11 @@ pub struct Blatt {
     pub y: f32,
     /// Anzahl Bildpunkte des Fleckens (mindestens [`MIN_FLAECHE`]).
     pub flaeche: u32,
+    /// Breite der Bounding-Box in Bildpunkten (größte Spalte − kleinste
+    /// Spalte + 1). Daraus kommt die Form ([`formklasse`]).
+    pub breite: u32,
+    /// Höhe der Bounding-Box in Bildpunkten.
+    pub hoehe: u32,
     /// Mittlerer Rotanteil des Fleckens.
     pub r: u8,
     /// Mittlerer Grünanteil des Fleckens.
@@ -97,6 +117,74 @@ pub struct Blatt {
     /// Mittlerer Blauanteil des Fleckens.
     pub b: u8,
 }
+
+/// Filter für die Blatterkennung: Fläche (Blattgröße), Sättigung und
+/// Helligkeit. Die Vorgabe ist **neutral** (nur [`MIN_FLAECHE`]) und liefert
+/// deshalb dieselben Blätter wie [`blaetter`] — die Filter sind eine
+/// freiwillige Verengung für schwierige Bilder (Moos, Kies, Schatten), keine
+/// stille Änderung der bisherigen Erkennung.
+///
+/// Warum überhaupt filtern: Auf einem Weg liegen neben Blättern auch Steine,
+/// Kies und Schatten. Jeder Filter nimmt eine Gruppe möglicher Störer weg;
+/// mehrere Filter zusammen sind die „größere Menge an Ausschlussmöglichkeiten“
+/// aus dem Diktat (2026-10-20), die der Nutzer dann fein einstellt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Blattfilter {
+    /// Kleinste Fläche in Bildpunkten (mindestens [`MIN_FLAECHE`]).
+    pub min_flaeche: u32,
+    /// Größte Fläche in Bildpunkten; `0` heißt **keine** Obergrenze (Vorgabe).
+    pub max_flaeche: u32,
+    /// Kleinste Sättigung (0…1) der Mittelfarbe. Grau/Beige hat fast keine
+    /// Sättigung und fällt damit weg, wenn man nur bunte Blätter will.
+    pub min_saettigung: f32,
+    /// Kleinste Helligkeit 0…255 (größter Farbkanal der Mittelfarbe).
+    pub min_helligkeit: u8,
+    /// Größte Helligkeit 0…255.
+    pub max_helligkeit: u8,
+}
+
+impl Default for Blattfilter {
+    fn default() -> Self {
+        Self {
+            min_flaeche: MIN_FLAECHE,
+            max_flaeche: 0,
+            min_saettigung: 0.0,
+            min_helligkeit: 0,
+            max_helligkeit: 255,
+        }
+    }
+}
+
+impl Blattfilter {
+    /// Ob ein gefundenes Blatt den Filter besteht. Kaputte Einstellungen
+    /// (Sättigung außerhalb 0…1, Helligkeit min > max) werden geklemmt bzw.
+    /// getauscht, statt still alles oder nichts zu liefern.
+    pub fn behaelt(&self, blatt: &Blatt) -> bool {
+        if blatt.flaeche < self.min_flaeche.max(MIN_FLAECHE) {
+            return false;
+        }
+        if self.max_flaeche > 0 && blatt.flaeche > self.max_flaeche {
+            return false;
+        }
+        let (_, s, _) = hsv(blatt.r, blatt.g, blatt.b);
+        if s < self.min_saettigung.clamp(0.0, 1.0) {
+            return false;
+        }
+        let (min, max) = helligkeitsbereich(self.min_helligkeit, self.max_helligkeit);
+        let v = blatt.r.max(blatt.g).max(blatt.b);
+        (min..=max).contains(&v)
+    }
+}
+
+/// Helligkeitsbereich als (min, max), bei verdrehten Werten getauscht.
+fn helligkeitsbereich(min: u8, max: u8) -> (u8, u8) {
+    if min <= max {
+        (min, max)
+    } else {
+        (max, min)
+    }
+}
+
 
 /// Alle Blätter in einem Bild.
 ///
@@ -123,6 +211,32 @@ pub fn blaetter(
     h: i32,
     hintergrund: (u8, u8, u8),
     toleranz: u8,
+) -> Vec<Blatt> {
+    blaetter_mit_filter(
+        frame,
+        w,
+        h,
+        hintergrund,
+        toleranz,
+        &Blattfilter::default(),
+    )
+}
+
+/// Wie [`blaetter`], aber mit einem [`Blattfilter`] (Fläche, Sättigung,
+/// Helligkeit).
+///
+/// Die Blob-Erkennung ist dieselbe; gefiltert wird nach der Mittelfarbe des
+/// fertigen Fleckens. Warum erst danach: Sättigung und Helligkeit sind
+/// Mittelwerte über das ganze Blatt und damit stabiler als das erste Pixel;
+/// die Mindestfläche wird zusätzlich schon beim Zählen angewandt, weil ein
+/// Fleck unter [`MIN_FLAECHE`] nie ein Blatt ist.
+pub fn blaetter_mit_filter(
+    frame: &[u8],
+    w: i32,
+    h: i32,
+    hintergrund: (u8, u8, u8),
+    toleranz: u8,
+    filter: &Blattfilter,
 ) -> Vec<Blatt> {
     if w <= 0 || h <= 0 {
         return Vec::new();
@@ -153,6 +267,10 @@ pub fn blaetter(
         stapel.push(start);
         let (mut flaeche, mut sx, mut sy, mut sr, mut sg, mut sb) =
             (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+        // Bounding-Box: kleinste/größte Spalte und Zeile des Fleckens. Daraus
+        // kommt die Form (Seitenverhältnis, Füllgrad), nicht aus der Fläche.
+        let (mut min_x, mut max_x) = (bw, 0usize);
+        let (mut min_y, mut max_y) = (bh, 0usize);
         while let Some(i) = stapel.pop() {
             let (x, y) = (i % bw, i / bw);
             flaeche += 1;
@@ -161,6 +279,10 @@ pub fn blaetter(
             sr += frame[3 * i] as u64;
             sg += frame[3 * i + 1] as u64;
             sb += frame[3 * i + 2] as u64;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
             // 8er-Nachbarschaft: auch die vier Diagonalen.
             for dy in -1i64..=1 {
                 for dx in -1i64..=1 {
@@ -183,14 +305,19 @@ pub fn blaetter(
             continue;
         }
         let n = flaeche as f32;
-        raus.push(Blatt {
+        let blatt = Blatt {
             x: sx as f32 / n,
             y: sy as f32 / n,
             flaeche: flaeche as u32,
+            breite: (max_x - min_x + 1) as u32,
+            hoehe: (max_y - min_y + 1) as u32,
             r: (sr as f32 / n).round() as u8,
             g: (sg as f32 / n).round() as u8,
             b: (sb as f32 / n).round() as u8,
-        });
+        };
+        if filter.behaelt(&blatt) {
+            raus.push(blatt);
+        }
     }
     raus
 }
@@ -278,6 +405,254 @@ fn hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     }
     let s = if max <= 1e-6 { 0.0 } else { spanne / max };
     (h, s, max)
+}
+
+/// Die vier **Farbmischwerte** eines Blattes: Zugehörigkeit zu rot, gelb,
+/// braun und grün, jeweils 0…1 und zusammen 1 (Reihenfolge wie die
+/// Farbklassen [`FARBE_ROT`], [`FARBE_GELB`], [`FARBE_BRAUN`],
+/// [`FARBE_GRUEN`]).
+///
+/// # Warum Mischwerte statt fester Grenzen
+///
+/// Herbstlaub ist selten ein reines Rot oder Gelb: ein Blatt liegt zwischen
+/// beiden, je nach Licht und Blattadern. [`farbklasse_rgb`] schneidet bei
+/// genau 20° Farbton — ein Blatt bei 19,9° wäre rot, bei 20,1° gelb. Für den
+/// Nutzer sind das **Abstände zwischen den genauen Farbwerten**; gewünscht
+/// sind Abstände zwischen **Farbmischwerten** (Diktat 2026-10-20), damit
+/// kleine Lichtänderungen die Klasse nicht umspringen lassen und mehr
+/// Zwischenfälle beschreibbar sind.
+///
+/// Deshalb hier eine weiche Ähnlichkeit zu vier **Prototypen** im
+/// HSV-Raum (Farbton, Sättigung, Helligkeit):
+///
+/// | Klasse | Farbton | Sättigung | Helligkeit |
+/// |---|---|---|---|
+/// | rot   | 0°   | 0,85 | 0,75 |
+/// | gelb  | 50°  | 0,85 | 0,90 |
+/// | braun | 30°  | 0,50 | 0,35 |
+/// | grün  | 110° | 0,65 | 0,55 |
+///
+/// Der Abstand ist die Summe der quadrierten Unterschiede (Farbton in 60°-
+/// Schritten, Sättigung und Helligkeit in 0,4-Schritten); das Gewicht ist
+/// `1 / (1 + Abstand)`. Kein harter Schnitt: ein Rot-Gelb-Blatt teilt sein
+/// Gewicht auf beide, ein graues Blatt liegt beim Braun-Prototyp (Sättigung
+/// niedrig) und bleibt damit braun, ein sehr dunkles ebenso (Helligkeit
+/// niedrig). Die Normierung auf Summe 1 macht die Werte untereinander
+/// vergleichbar.
+pub fn farbmischwerte(r: u8, g: u8, b: u8) -> [f32; 4] {
+    let (h, s, v) = hsv(r, g, b);
+    // (Farbton, Sättigung, Helligkeit) je Klasse, Reihenfolge wie die
+    // Farbklassen. Braun sitzt bei einem dunklen, mäßig gesättigten Orange —
+    // dort liegt Herbstlaub, das weder rot noch gelb noch grau ist.
+    const PROTOTYPEN: [(f32, f32, f32); 4] = [
+        (0.0, 0.85, 0.75),
+        (50.0, 0.85, 0.90),
+        (30.0, 0.50, 0.35),
+        (110.0, 0.65, 0.55),
+    ];
+    let mut gewichte = [0.0f32; 4];
+    let mut summe = 0.0f32;
+    for (i, (ph, ps, pv)) in PROTOTYPEN.iter().enumerate() {
+        // Farbton als Kreis: 350° und 10° sind 20° auseinander, nicht 340°.
+        let dh = (h - ph).abs().min(360.0 - (h - ph).abs()) / 60.0;
+        let ds = (s - ps) / 0.4;
+        let dv = (v - pv) / 0.4;
+        let abstand = dh * dh + ds * ds + dv * dv;
+        let gewicht = 1.0 / (1.0 + abstand);
+        gewichte[i] = gewicht;
+        summe += gewicht;
+    }
+    if summe > 0.0 {
+        for gewicht in &mut gewichte {
+            *gewicht /= summe;
+        }
+    }
+    gewichte
+}
+
+/// Farbklasse über **Mischwerte** statt exakter RGB-Grenzen: die Klasse mit
+/// dem größten [`farbmischwerte`]-Gewicht, Rückgabe 0…3 wie [`farbklasse`].
+///
+/// Warum das für Gruppen und Instrumente reicht: Die Mischwerte entscheiden
+/// weich (ein Rot-Gelb-Blatt kippt erst bei gleichem Abstand zu beiden, also
+/// bei 25° statt bei 20°), die Klasse bleibt aber eine der vier
+/// Instrumentklassen. Bei Gleichstand gewinnt die frühere Klasse der
+/// Reihenfolge rot, gelb, braun, grün — damit ist das Ergebnis auch bei
+/// exakt gleichen Gewichten eindeutig.
+pub fn farbklasse_mix(r: u8, g: u8, b: u8) -> u8 {
+    let gewichte = farbmischwerte(r, g, b);
+    let mut beste = FARBE_ROT;
+    let mut bester = gewichte[FARBE_ROT as usize];
+    for klasse in [FARBE_GELB, FARBE_BRAUN, FARBE_GRUEN] {
+        if gewichte[klasse as usize] > bester {
+            bester = gewichte[klasse as usize];
+            beste = klasse;
+        }
+    }
+    beste
+}
+
+/// Wie [`farbklasse`], aber über die Mischwerte ([`farbklasse_mix`]).
+pub fn farbklasse_blatt_mix(blatt: &Blatt) -> u8 {
+    farbklasse_mix(blatt.r, blatt.g, blatt.b)
+}
+
+/// Formklasse eines Blattes: 0 rund, 1 länglich, 2 gezackt/ausgefranst (die
+/// Konstanten [`FORM_RUND`], [`FORM_LAENGLICH`], [`FORM_GEZACKT`]).
+///
+/// # Warum Form-Mischwerte
+///
+/// Wie bei der Farbe (Diktat 2026-10-20) soll nicht ein einzelner genauer
+/// Wert die Klasse bestimmen, sondern das **Gemisch** der Ausdehnung. Ein
+/// Blatt ist selten exakt quadratisch; rund ist es, wenn Breite und Höhe
+/// ähnlich sind **und** die Fläche die Bounding-Box gut füllt. Länglich ist
+/// es ab 2:1 Seitenverhältnis (Weide, Esche). Bleibt bei fast quadratischer
+/// Box zu wenig Fläche übrig (höchstens 55 %), ist der Rand gezackt oder
+/// ausgefranst (Eiche, Ahorn) — die Fläche „zerfällt“ in der Box.
+///
+/// Reihenfolge der Prüfung: erst länglich (die Ausdehnung ist die stärkere
+/// Aussage), dann gezackt, sonst rund. Ohne Fläche oder ohne Box gibt es
+/// keine Form; dann ist das Ergebnis der neutrale Wert [`FORM_RUND`], damit
+/// die Anzeige nichts Falsches behauptet.
+pub fn formklasse(blatt: &Blatt) -> u8 {
+    if blatt.flaeche == 0 || blatt.breite == 0 || blatt.hoehe == 0 {
+        return FORM_RUND;
+    }
+    let (kurz, lang) = (
+        blatt.breite.min(blatt.hoehe) as f32,
+        blatt.breite.max(blatt.hoehe) as f32,
+    );
+    let verhaeltnis = lang / kurz;
+    let fuellgrad = blatt.flaeche as f32 / (blatt.breite as f32 * blatt.hoehe as f32);
+    if verhaeltnis >= FORM_VERHAELTNIS_LAENGLICH {
+        FORM_LAENGLICH
+    } else if fuellgrad <= FORM_FUELLGRAD_GEZACKT {
+        FORM_GEZACKT
+    } else {
+        FORM_RUND
+    }
+}
+
+/// Name der Formklasse für die Anzeige („rund“, „länglich“, „gezackt“);
+/// unbekannte Klassen ergeben „?“.
+pub fn formklasse_name(klasse: u8) -> &'static str {
+    match klasse {
+        FORM_RUND => "rund",
+        FORM_LAENGLICH => "länglich",
+        FORM_GEZACKT => "gezackt",
+        _ => "?",
+    }
+}
+
+/// Farbklasse eines Blattes je nach Modus: exakt ([`farbklasse`]) oder über
+/// die Mischwerte ([`farbklasse_blatt_mix`]).
+fn farbklasse_je(blatt: &Blatt, gemischt: bool) -> u8 {
+    if gemischt {
+        farbklasse_blatt_mix(blatt)
+    } else {
+        farbklasse(blatt)
+    }
+}
+
+/// Klassen einer Gruppe nach Häufigkeit: `(Klasse, Anzahl)`, häufigste
+/// zuerst, bei Gleichstand die kleinere Klasse (feste Reihenfolge, damit die
+/// Beschreibung nicht bei jedem Aufruf anders aussieht).
+fn haeufigste(klassen: impl Iterator<Item = u8>, anzahl: usize) -> Vec<(u8, usize)> {
+    let mut zaehler = vec![0usize; anzahl];
+    for klasse in klassen {
+        if let Some(feld) = zaehler.get_mut(klasse as usize) {
+            *feld += 1;
+        }
+    }
+    let mut liste: Vec<(u8, usize)> = zaehler
+        .into_iter()
+        .enumerate()
+        .filter(|(_, n)| *n > 0)
+        .map(|(i, n)| (i as u8, n))
+        .collect();
+    liste.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    liste
+}
+
+/// Beschreibung einer Abstandsgruppe für den Laub-Tab:
+/// `G1: 4 Schritte · rot-gemischt · rund (3 Blätter)`.
+///
+/// `nummer` ist 1-basiert (wie in der Anzeige), `schritte` die Zahl der
+/// Schritte im Takt, `blaetter` die Blätter der Gruppe und `gemischt` der
+/// Farbmodus. Die Farbe ist die häufigste Klasse der Gruppe; kommen mehrere
+/// vor, stehen sie mit `/` getrennt da (häufigste zuerst) — das sind die
+/// „Diversitäten“, nach deren Beschreibung das Diktat fragt. Die Form wird
+/// genauso aus [`formklasse`] gezählt. Ohne Blätter bleibt die Zeile bei
+/// Schritten und „ohne Blätter“.
+pub fn beschreibe_gruppe(nummer: usize, schritte: usize, blaetter: &[Blatt], gemischt: bool) -> String {
+    let mut text = format!("G{nummer}: {schritte} Schritte");
+    if blaetter.is_empty() {
+        text.push_str(" · ohne Blätter");
+        return text;
+    }
+    let farben: Vec<&str> = haeufigste(blaetter.iter().map(|b| farbklasse_je(b, gemischt)), 4)
+        .into_iter()
+        .map(|(klasse, _)| farbklasse_name(klasse))
+        .collect();
+    let formen: Vec<&str> = haeufigste(blaetter.iter().map(formklasse), 3)
+        .into_iter()
+        .map(|(klasse, _)| formklasse_name(klasse))
+        .collect();
+    format!(
+        "{text} · {}-{} · {} ({} Blätter)",
+        farben.join("/"),
+        if gemischt { "gemischt" } else { "exakt" },
+        formen.join("/"),
+        blaetter.len()
+    )
+}
+
+/// Untergruppen einer Gruppe: die Blätter nach **Farb- und Form-Mix** zählen
+/// und anzeigen, z. B.
+/// `G1a: rot/gemischt · rund, 2 · G1b: gelb/gemischt · länglich, 1`.
+///
+/// Warum eigene Untergruppen: Die Gruppen sind Taktabstände; erst die
+/// Aufteilung nach Farbe und Form zeigt, welche „Sorten“ in einem Takt
+/// stecken (Diktat 2026-10-20: „Diversitäten in den Untergruppen“). Sortiert
+/// wird nach Anzahl (häufigste zuerst), dann Farbe, dann Form — dieselbe
+/// Eingabe ergibt dieselbe Beschreibung. Ohne Blätter ist die Zeile leer.
+pub fn beschreibe_untergruppen(nummer: usize, blaetter: &[Blatt], gemischt: bool) -> String {
+    // 4 Farben × 3 Formen: mehr Untergruppen kann es nicht geben.
+    let mut zaehler = [[0usize; 3]; 4];
+    for blatt in blaetter {
+        let farbe = farbklasse_je(blatt, gemischt) as usize;
+        let form = formklasse(blatt) as usize;
+        if let Some(feld) = zaehler.get_mut(farbe).and_then(|zeile| zeile.get_mut(form)) {
+            *feld += 1;
+        }
+    }
+    let mut eintraege: Vec<(u8, u8, usize)> = zaehler
+        .iter()
+        .enumerate()
+        .flat_map(|(farbe, zeile)| {
+            zeile
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| **n > 0)
+                .map(move |(form, n)| (farbe as u8, form as u8, *n))
+        })
+        .collect();
+    eintraege.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)).then(a.1.cmp(&b.1)));
+    let modus = if gemischt { "gemischt" } else { "exakt" };
+    eintraege
+        .iter()
+        .enumerate()
+        .map(|(i, (farbe, form, n))| {
+            // Höchstens 12 Untergruppen (4 × 3), also reichen a…l.
+            let buchstabe = char::from(b'a' + i as u8);
+            format!(
+                "G{nummer}{buchstabe}: {}/{modus} · {}, {n}",
+                farbklasse_name(*farbe),
+                formklasse_name(*form)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Ein Genre: Name und Vokabular typischer Schrittintervalle.
@@ -670,6 +1045,8 @@ mod tests {
             x,
             y,
             flaeche: 9,
+            breite: 3,
+            hoehe: 3,
             r,
             g,
             b,
@@ -865,6 +1242,295 @@ mod tests {
         assert_eq!(farbklasse_name(FARBE_BRAUN), "braun");
         assert_eq!(farbklasse_name(FARBE_GRUEN), "grün");
         assert_eq!(farbklasse_name(9), "?");
+    }
+
+    /// Die Mischfarben-Klassifikation: reine Töne bleiben ihre Klasse,
+    /// Grenzfälle entscheidet der Mischwert (nicht die harte Schwelle).
+    #[test]
+    fn farbklassen_gemischt() {
+        // Reine Töne: dieselben Klassen wie exakt — sonst wäre der Umschalter
+        // eine Überraschung.
+        assert_eq!(farbklasse_mix(200, 40, 30), FARBE_ROT);
+        assert_eq!(farbklasse_mix(230, 200, 50), FARBE_GELB);
+        assert_eq!(farbklasse_mix(60, 150, 50), FARBE_GRUEN);
+        assert_eq!(farbklasse_mix(120, 80, 40), FARBE_BRAUN, "Herbstbraun");
+        // Grau/Beige, sehr dunkel und sehr hell haben keinen Farbton: braun.
+        assert_eq!(farbklasse_mix(180, 175, 170), FARBE_BRAUN, "Grau");
+        assert_eq!(farbklasse_mix(10, 10, 10), FARBE_BRAUN, "sehr dunkel");
+        assert_eq!(farbklasse_mix(255, 255, 255), FARBE_BRAUN, "sehr hell");
+        // Der Grenzfall Rot↔Gelb: (220, 140, 40) ist ein Herbstorange und
+        // liegt dem Gelb näher — beide Verfahren sagen gelb.
+        assert_eq!(farbklasse_rgb(220, 140, 40), FARBE_GELB, "exakt: gelb");
+        assert_eq!(
+            farbklasse_mix(220, 140, 40),
+            FARBE_GELB,
+            "gemischt: gelb (näher an Gelb als an Rot)"
+        );
+        // Und hier der Unterschied: 21° Farbton liegt exakt schon im Gelb,
+        // der Mischwert kippt erst bei 25° (gleicher Abstand zu Rot und Gelb).
+        assert_eq!(farbklasse_rgb(220, 110, 50), FARBE_GELB, "exakt: gelb");
+        assert_eq!(
+            farbklasse_mix(220, 110, 50),
+            FARBE_ROT,
+            "gemischt: noch rot"
+        );
+        // Gleiche Eingabe, gleiche Klasse (keine Streuung durch Zufall).
+        for _ in 0..5 {
+            assert_eq!(farbklasse_mix(220, 110, 50), FARBE_ROT);
+            assert_eq!(farbklasse_mix(120, 80, 40), FARBE_BRAUN);
+        }
+        // Auch über ein Blatt.
+        assert_eq!(
+            farbklasse_blatt_mix(&blatt(0.0, 0.0, 230, 200, 50)),
+            FARBE_GELB
+        );
+    }
+
+    /// Die Mischwerte selbst: vier Gewichte, die sich zu 1 summieren und den
+    /// Grenzfall zwischen zwei Klassen aufteilen.
+    #[test]
+    fn farbmischwerte_teilen_den_grenzfall() {
+        let rein = farbmischwerte(200, 40, 30);
+        assert!(nah(rein.iter().sum::<f32>(), 1.0), "Summe 1: {rein:?}");
+        assert!(
+            rein[FARBE_ROT as usize] > rein[FARBE_GELB as usize],
+            "reines Rot liegt vorn bei rot: {rein:?}"
+        );
+        assert!(
+            rein[FARBE_ROT as usize] > 0.4,
+            "… und deutlich: {rein:?}"
+        );
+        let grenze = farbmischwerte(220, 140, 40);
+        assert!(nah(grenze.iter().sum::<f32>(), 1.0), "Summe 1: {grenze:?}");
+        assert!(
+            grenze[FARBE_GELB as usize] > grenze[FARBE_ROT as usize],
+            "Orange teilt sich zwischen gelb und rot: {grenze:?}"
+        );
+        assert!(
+            grenze[FARBE_ROT as usize] > 0.3,
+            "… mit einem ordentlichen Rotanteil: {grenze:?}"
+        );
+        // Grau hat den größten Braunanteil, keine gesättigte Farbe.
+        let grau = farbmischwerte(180, 175, 170);
+        assert!(nah(grau.iter().sum::<f32>(), 1.0), "Summe 1: {grau:?}");
+        assert!(
+            grau[FARBE_BRAUN as usize] > grau[FARBE_ROT as usize] + 0.1,
+            "Grau ist braun: {grau:?}"
+        );
+    }
+
+    /// Ein Bild mit vier verschieden großen Flecken für die Filtertests:
+    /// 2×2 rot, 3×3 grau, 4×4 gelb, 6×6 grün.
+    fn filterbild() -> (Vec<u8>, usize, usize, (u8, u8, u8)) {
+        let hg = (205, 200, 190);
+        let (w, h) = (40usize, 30usize);
+        let mut f = bild(w, h, hg);
+        fleck(&mut f, w, 2, 2, 4, 4, (200, 40, 30)); // 4 Punkte, Sättigung hoch
+        fleck(&mut f, w, 8, 2, 11, 5, (180, 175, 170)); // 9 Punkte, grau
+        fleck(&mut f, w, 16, 2, 20, 6, (230, 200, 50)); // 16 Punkte, gelb
+        fleck(&mut f, w, 25, 2, 31, 8, (60, 150, 50)); // 36 Punkte, grün
+        (f, w, h, hg)
+    }
+
+    /// Die Filter sind Vorgaben-kompatibel: ohne Einschränkung dasselbe wie
+    /// `blaetter`, mit Fläche, Sättigung und Helligkeit lässt sich ausdünnen.
+    #[test]
+    fn filter_waehlen_blaetter_aus() {
+        let (f, w, h, hg) = filterbild();
+        let alle = blaetter(&f, w as i32, h as i32, hg, 20);
+        assert_eq!(alle.len(), 4, "vier Flecken: {alle:?}");
+        // Die Vorgabe ist neutral: kein Filter, keine Regression.
+        let vorgabe = Blattfilter::default();
+        assert_eq!(
+            blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &vorgabe).len(),
+            4,
+            "Vorgabe filtert nichts weg"
+        );
+        // Mindestfläche: nur die großen Flecken bleiben.
+        let gross = Blattfilter {
+            min_flaeche: 16,
+            ..Blattfilter::default()
+        };
+        let bl = blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &gross);
+        assert_eq!(bl.len(), 2, "16 und 36 Punkte: {bl:?}");
+        assert!(bl.iter().all(|b| b.flaeche >= 16), "{bl:?}");
+        // Höchstfläche: nur die kleinen bleiben (4 und 9).
+        let klein = Blattfilter {
+            max_flaeche: 9,
+            ..Blattfilter::default()
+        };
+        let bl = blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &klein);
+        assert_eq!(bl.len(), 2, "4 und 9 Punkte: {bl:?}");
+        assert!(bl.iter().all(|b| b.flaeche <= 9), "{bl:?}");
+        // Mindest-Sättigung: der graue Flecken fällt weg.
+        let bunt = Blattfilter {
+            min_saettigung: 0.5,
+            ..Blattfilter::default()
+        };
+        let bl = blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &bunt);
+        assert_eq!(bl.len(), 3, "ohne Grau: {bl:?}");
+        assert!(
+            !bl.iter().any(|b| (b.r, b.g, b.b) == (180, 175, 170)),
+            "Grau ist raus: {bl:?}"
+        );
+        // Helligkeitsbereich: nur mittelhelle Blätter (Gelb und Grün sind
+        // heller als 100, Rot ist es auch — Grau liegt dazwischen).
+        let mittel = Blattfilter {
+            min_helligkeit: 150,
+            max_helligkeit: 230,
+            ..Blattfilter::default()
+        };
+        let bl = blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &mittel);
+        assert!(
+            bl.iter().all(|b| (150..=230).contains(&b.r.max(b.g).max(b.b))),
+            "nur im Bereich: {bl:?}"
+        );
+        // Verdrehter Helligkeitsbereich wird getauscht statt alles zu
+        // verwerfen — ein Regler darf nicht in eine leere Anzeige führen.
+        let verdreht = Blattfilter {
+            min_helligkeit: 230,
+            max_helligkeit: 150,
+            ..Blattfilter::default()
+        };
+        let gleich = Blattfilter {
+            min_helligkeit: 150,
+            max_helligkeit: 230,
+            ..Blattfilter::default()
+        };
+        assert_eq!(
+            blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &verdreht).len(),
+            blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &gleich).len()
+        );
+        // Sättigung wird auf 0…1 geklemmt; > 1 filtert alles weg, < 0 nichts.
+        let zu_bunt = Blattfilter {
+            min_saettigung: 7.0,
+            ..Blattfilter::default()
+        };
+        assert!(
+            blaetter_mit_filter(&f, w as i32, h as i32, hg, 20, &zu_bunt).is_empty(),
+            "Sättigung 1 ist das Maximum"
+        );
+    }
+
+    /// Jedes Blatt kennt seine Ausdehnung (Bounding-Box) — daraus kommt die
+    /// Form, nicht aus der bloßen Fläche.
+    #[test]
+    fn blaetter_kennen_ihre_ausdehnung() {
+        let hg = (205, 200, 190);
+        let (w, h) = (20usize, 20usize);
+        let mut f = bild(w, h, hg);
+        fleck(&mut f, w, 3, 2, 6, 6, (200, 40, 30)); // 3 breit, 4 hoch
+        let bl = blaetter(&f, w as i32, h as i32, hg, 20);
+        assert_eq!(bl.len(), 1, "{bl:?}");
+        assert_eq!((bl[0].breite, bl[0].hoehe), (3, 4), "Bounding-Box: {bl:?}");
+        assert_eq!(bl[0].flaeche, 12);
+    }
+
+    /// Formklasse über Seitenverhältnis und Füllgrad: rund, länglich,
+    /// gezackt/ausgefranst.
+    #[test]
+    fn formklassen() {
+        let form = |breite: u32, hoehe: u32, flaeche: u32| Blatt {
+            x: 0.0,
+            y: 0.0,
+            flaeche,
+            breite,
+            hoehe,
+            r: 200,
+            g: 40,
+            b: 30,
+        };
+        // Quadratisch und gut gefüllt ist rund (Kreis ≈ 78 % der Box).
+        assert_eq!(formklasse(&form(10, 10, 100)), FORM_RUND);
+        assert_eq!(formklasse(&form(10, 10, 78)), FORM_RUND);
+        // Deutlich breiter oder höher ist länglich, auch voll gefüllt.
+        assert_eq!(formklasse(&form(20, 4, 80)), FORM_LAENGLICH);
+        assert_eq!(formklasse(&form(4, 20, 80)), FORM_LAENGLICH);
+        // Ein Blatt mit Zacken füllt seine Box schlecht: gezackt.
+        assert_eq!(formklasse(&form(10, 10, 30)), FORM_GEZACKT);
+        // Genau an den Grenzen bleibt es eindeutig.
+        assert_eq!(formklasse(&form(20, 10, 200)), FORM_LAENGLICH, "2:1");
+        assert_eq!(formklasse(&form(10, 10, 55)), FORM_GEZACKT, "55 %");
+        // Ohne Fläche (oder ohne Box) gibt es keine Form: rund als neutraler
+        // Wert, damit die Anzeige nichts Falsches behauptet.
+        assert_eq!(formklasse(&form(10, 10, 0)), FORM_RUND);
+        assert_eq!(formklasse(&form(0, 0, 0)), FORM_RUND);
+        // Namen für die Anzeige.
+        assert_eq!(formklasse_name(FORM_RUND), "rund");
+        assert_eq!(formklasse_name(FORM_LAENGLICH), "länglich");
+        assert_eq!(formklasse_name(FORM_GEZACKT), "gezackt");
+        assert_eq!(formklasse_name(9), "?");
+    }
+
+    /// Die Gruppen-Beschreibung nennt Schritte, Farbe (mit Modus) und Form —
+    /// daraus liest der Nutzer die „Diversitäten“ der Taktabstände ab.
+    #[test]
+    fn gruppenbeschreibung_nennt_schritte_farbe_form() {
+        let rund = |r: u8, g: u8, b: u8| Blatt {
+            x: 0.0,
+            y: 0.0,
+            flaeche: 78,
+            breite: 10,
+            hoehe: 10,
+            r,
+            g,
+            b,
+        };
+        let drei_rot = vec![
+            rund(200, 40, 30),
+            rund(190, 35, 25),
+            rund(210, 45, 35),
+        ];
+        assert_eq!(
+            beschreibe_gruppe(1, 4, &drei_rot, true),
+            "G1: 4 Schritte · rot-gemischt · rund (3 Blätter)"
+        );
+        assert_eq!(
+            beschreibe_gruppe(1, 4, &drei_rot, false),
+            "G1: 4 Schritte · rot-exakt · rund (3 Blätter)"
+        );
+        // Zwei Farben in einer Gruppe: beide stehen da, die häufigere zuerst.
+        let gemischt = vec![
+            rund(200, 40, 30),
+            rund(190, 35, 25),
+            rund(230, 200, 50),
+        ];
+        assert_eq!(
+            beschreibe_gruppe(2, 3, &gemischt, true),
+            "G2: 3 Schritte · rot/gelb-gemischt · rund (3 Blätter)"
+        );
+        // Ohne Blätter bleibt die Zeile ehrlich.
+        assert_eq!(
+            beschreibe_gruppe(3, 2, &[], true),
+            "G3: 2 Schritte · ohne Blätter"
+        );
+    }
+
+    /// Untergruppen zählen die Blätter einer Gruppe nach Farb- und Form-Mix.
+    #[test]
+    fn untergruppen_zaehlen_nach_farbe_und_form() {
+        let blatt_mit = |breite: u32, hoehe: u32, flaeche: u32, r: u8, g: u8, b: u8| Blatt {
+            x: 0.0,
+            y: 0.0,
+            flaeche,
+            breite,
+            hoehe,
+            r,
+            g,
+            b,
+        };
+        let blaetter = vec![
+            blatt_mit(10, 10, 78, 200, 40, 30), // rot, rund
+            blatt_mit(10, 10, 78, 190, 35, 25), // rot, rund
+            blatt_mit(20, 4, 80, 230, 200, 50), // gelb, länglich
+        ];
+        assert_eq!(
+            beschreibe_untergruppen(1, &blaetter, true),
+            "G1a: rot/gemischt · rund, 2 · G1b: gelb/gemischt · länglich, 1"
+        );
+        // Exakt-Modus wird genauso ausgewiesen; ohne Blätter leer.
+        assert!(beschreibe_untergruppen(1, &blaetter, false).contains("rot/exakt"));
+        assert!(beschreibe_untergruppen(1, &[], true).is_empty());
     }
 
     #[test]

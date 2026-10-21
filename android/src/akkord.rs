@@ -9,6 +9,37 @@ use eframe::egui;
 
 use jamcore::akkord::kandidaten;
 
+/// Kleine Akkord-Presets fuer die Echtzeit-Noteneingabe im Rhythmus-Tab
+/// („Akkord als Mini-Presets“). Der Name steht auf dem Knopf, die Intervalle
+/// sind Halbtonschritte ab dem Grundton — dieselbe Schreibweise wie
+/// `jamcore::akkord::TABELLEN` (9/11/13 als 14/17/21).
+///
+/// **Erweitern:** ein Paar `("Name", &[0, …])` anhaengen; `rhythm.rs` zeichnet
+/// alle Eintraege als Knoepfe und setzt sie auf den gewaehlten Tracker-Schritt.
+/// Die Presets liegen fest im Code (kein Dateiformat) — so sind sie ohne
+/// Speicherort und Berechtigungen sofort da. Gespeichert wird nichts weiter:
+/// der Nutzer kann sie hören, bevor er sie ins Pattern schreibt.
+pub const PRESETS: &[(&str, &[i32])] = &[
+    ("Dur", &[0, 4, 7]),
+    ("Moll", &[0, 3, 7]),
+    ("7", &[0, 4, 7, 10]),
+    ("maj7", &[0, 4, 7, 11]),
+    ("m7", &[0, 3, 7, 10]),
+    ("sus4", &[0, 5, 7]),
+    ("sus2", &[0, 2, 7]),
+    ("Power", &[0, 7]),
+];
+
+/// Die Toene eines Presets ab `grundton` (MIDI, auf 0…127 geklemmt).
+/// `preset` ausserhalb der Liste ergibt eine leere Liste (kein Panic).
+pub fn noten(preset: usize, grundton: i32) -> Vec<i32> {
+    let intervalle = PRESETS.get(preset).map(|(_, i)| *i).unwrap_or(&[]);
+    intervalle
+        .iter()
+        .map(|i| (grundton + i).clamp(0, 127))
+        .collect()
+}
+
 /// Notenklasse als Name (C, C#, …; Oktave egal, wie im Renoise-Raster).
 fn klassenname(note: i32) -> String {
     const NAMEN: [&str; 12] = [

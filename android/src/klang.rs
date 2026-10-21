@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -84,7 +84,11 @@ impl KlingenderPuffer {
             pcm,
             pos: 0.0,
             schritt,
-            gain: gain.clamp(0.0, 1.0),
+            // Bis 2.0, weil die Slices-Lautstaerke bis 200 % geht („max vol“):
+            // der Aufrufer-Gain (0.8) mal 2 ergibt 1.6; die Summe wird beim
+            // Mischen auf 16 Bit geklemmt, lauter als Vollaussteuerung geht
+            // also nicht — clipping ist bei 200 % gewollt hoerbar.
+            gain: gain.clamp(0.0, 2.0),
             rest: 1.0,
             abnahme: 0.0,
         }
@@ -176,6 +180,33 @@ pub fn stimmen_aus() {
 
 fn slot() -> &'static Mutex<Einstellungen> {
     EINSTELLUNGEN.get_or_init(|| Mutex::new(Einstellungen::default()))
+}
+
+/// Lautstaerke **aller** Slice-Puffer in Prozent (0…200, Vorgabe 100).
+///
+/// Warum global in `klang` statt im Rhythmus-Panel: der Regler soll einen
+/// Tab-Wechsel ueberleben, und der Render-Thread (eigener Thread, eigene
+/// Kopie der Noten) muss denselben Wert sehen. `puffer_spielen` multipliziert
+/// ihn auf den Gain des Aufrufers — damit gelten Regler und „max vol“ fuer
+/// jede Slice-Wiedergabe (Rhythmus, Render-Thread, Slicer-Vorhoeren).
+static SLICES_LAUTSTAERKE: AtomicU32 = AtomicU32::new(100);
+
+/// Slices-Lautstaerke in Prozent (0…200).
+pub fn slices_lautstaerke() -> u32 {
+    SLICES_LAUTSTAERKE.load(Ordering::Relaxed)
+}
+
+/// Slices-Lautstaerke setzen (0…200 %, geklemmt). `true`, wenn sich der Wert
+/// geaendert hat — nur dann loggt der Aufrufer (der Slider feuert je Frame).
+pub fn slices_lautstaerke_setzen(prozent: f32) -> bool {
+    let neu = prozent.round().clamp(0.0, 200.0) as u32;
+    let alt = SLICES_LAUTSTAERKE.swap(neu, Ordering::Relaxed);
+    if alt != neu {
+        info!("klang: Slices-Lautstaerke {neu} %");
+        true
+    } else {
+        false
+    }
 }
 
 /// Zwei Dauertöne (Lissa-Tab: X- und Y-Stimme der Figur). `None` = aus.
@@ -350,6 +381,9 @@ pub fn puffer_spielen(pcm: Vec<i16>, rate: u32, gain: f32) {
         );
         return;
     }
+    // Slices-Lautstaerke (0…200 %) auf den Aufrufer-Gain: eine Stelle fuer
+    // Rhythmus, Render-Thread und Slicer-Vorhoeren; gedeckelt auf 2.0.
+    let gain = (gain * slices_lautstaerke() as f32 / 100.0).clamp(0.0, 2.0);
     info!("klang: Puffer an ({} Samples, {} Hz)", pcm.len(), rate);
     let mut guard = match spieler_slot().lock() {
         Ok(g) => g,

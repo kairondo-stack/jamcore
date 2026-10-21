@@ -75,6 +75,32 @@
 //! Ergebnis zur Sicherheit mit dem Kern ([`farben_je_schritt`]). Die **erste**
 //! Blattfarbe auf einem Schritt gewinnt — bei einem gefalteten Takt ist das
 //! das erste Blatt, das dort ankommt.
+//!
+//! # Farb- und Form-Mischwerte
+//!
+//! Der Schalter „Farbe: exakt / gemischt“ (Vorgabe **gemischt**, Diktat
+//! 2026-10-20) entscheidet, wie die Instrumentfarbe entsteht: exakt über die
+//! festen HSV-Grenzen des Kerns ([`farbklasse`]) oder über die weichen
+//! Farbmischwerte ([`farbklasse_blatt_mix`], Prototypen im HSV-Raum). Gemischt
+//! ist die Vorgabe, weil Herbstlaub zwischen Rot und Gelb liegt und die harte
+//! Grenze bei 20° Farbton bei jeder Lichtänderung umspringt. Derselbe Schalter
+//! steht in den Gruppen-Beschreibungen (`rot-gemischt` / `rot-exakt`), im
+//! „Anhören“ und beim Rendern (Farbe → Instrument).
+//!
+//! Die **Form** je Blatt kommt aus der Bounding-Box des Fleckens
+//! ([`jamcore::laub::formklasse`]): rund, länglich oder gezackt. Gruppen
+//! beschreibt der Kern ([`beschreibe_gruppe`]) als
+//! `G1: 4 Schritte · rot-gemischt · rund (3 Blätter)`, die Untergruppen nach
+//! Farb- und Form-Mix ([`beschreibe_untergruppen`]) als
+//! `G1a: rot/gemischt · rund, 2 · G1b: gelb/gemischt · länglich, 1`.
+//!
+//! # Filter
+//!
+//! Die Erkennung lässt sich über Fläche (min/max), Mindest-Sättigung und
+//! Helligkeitsbereich verengen ([`jamcore::laub::Blattfilter`]); die Vorgabe
+//! ist neutral, damit die bisherigen Blattzahlen unverändert bleiben. Die
+//! Filter sind die zusätzlichen Ausschlüsse für Steine, Kies und Schatten aus
+//! dem Diktat („größere Menge an Ausschlussmöglichkeiten“).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
@@ -83,7 +109,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Stroke};
 use jamcore::laub::{
-    farbklasse, genre, rasterwahl, schritte_aus_abstaenden_bpm, Abstandsmodus, Blatt, Genre,
+    beschreibe_gruppe, beschreibe_untergruppen, blaetter_mit_filter, farbklasse,
+    farbklasse_blatt_mix, genre, rasterwahl, schritte_aus_abstaenden_bpm, Abstandsmodus, Blatt,
+    Blattfilter, Genre,
 };
 
 use crate::camera;
@@ -250,6 +278,13 @@ pub struct LaubPanel {
     auto_hintergrund: bool,
     /// Größter Kanalabstand, der noch Hintergrund ist.
     toleranz: u8,
+    /// Filter für die Blatterkennung (Fläche, Sättigung, Helligkeit). Die
+    /// Vorgabe ist neutral — ohne Zutun bleiben die bisherigen Blattzahlen.
+    filter: Blattfilter,
+    /// Farbklasse über **Mischwerte** statt exakter Grenzen (Vorgabe an,
+    /// Diktat 2026-10-20: Abstände zwischen Farbmischwerten). Wirkt auf die
+    /// Gruppen-Beschreibung, „Anhören“ und das Rendern (Farbe → Instrument).
+    farbe_gemischt: bool,
     /// Gewähltes Genre (Index in [`GENRES`]).
     genre: usize,
     /// Gewähltes Raster (Schritte je Takt, `rasterwahl`).
@@ -338,6 +373,8 @@ impl LaubPanel {
             hintergrund: (128, 128, 128),
             auto_hintergrund: true,
             toleranz: TOLERANZ_STANDARD,
+            filter: Blattfilter::default(),
+            farbe_gemischt: true,
             genre: 0,
             raster: 128,
             relativ: true,
@@ -607,8 +644,15 @@ impl LaubPanel {
         } else {
             self.hintergrund
         };
-        let n =
-            jamcore::laub::blaetter(&rgb, bw as i32, bh as i32, hintergrund, self.toleranz).len();
+        let n = blaetter_mit_filter(
+            &rgb,
+            bw as i32,
+            bh as i32,
+            hintergrund,
+            self.toleranz,
+            &self.filter,
+        )
+        .len();
         Some((bw, bh, rgba, n))
     }
 
@@ -799,12 +843,13 @@ impl LaubPanel {
             self.erkennung = "Noch kein Bild".to_string();
             return;
         };
-        let mut bl = jamcore::laub::blaetter(
+        let mut bl = blaetter_mit_filter(
             rgb,
             *w as i32,
             *h as i32,
             self.hintergrund,
             self.toleranz,
+            &self.filter,
         );
         jamcore::laub::sortiere_wegrichtung(&mut bl);
         self.abstaende = abstaende_px(&bl);
@@ -813,7 +858,60 @@ impl LaubPanel {
         self.erkennung = anzeige;
         if loggen {
             log::info!("laub: {log_text}");
+            // Die Gruppen mit Beschreibung (Schritte, Farb-/Form-Mix) ins Log:
+            // im Gerätetest ist das die einzige Quelle für die Einordnung der
+            // Taktabstände, ohne Screenshots zu lesen.
+            for (i, text) in self.gruppen_beschreibungen().iter().enumerate() {
+                let unter = self.untergruppen_beschreibung(i);
+                if unter.is_empty() {
+                    log::info!("laub: Gruppen: {text}");
+                } else {
+                    log::info!("laub: Gruppen: {text} [{unter}]");
+                }
+            }
         }
+    }
+
+    /// Beschreibungen der Gruppen (Kern: [`beschreibe_gruppe`]) — eine Zeile je
+    /// Gruppe mit Schrittzahl, Farb-Mix und Form-Mix.
+    fn gruppen_beschreibungen(&self) -> Vec<String> {
+        let gruppen = self.gruppen();
+        let schritte = self.gruppen_schritte();
+        gruppen
+            .iter()
+            .enumerate()
+            .map(|(i, (start, abstaende))| {
+                let anzahl = schritte.get(i).copied().unwrap_or(0);
+                beschreibe_gruppe(
+                    i + 1,
+                    anzahl,
+                    self.gruppe_blaetter(*start, abstaende.len()),
+                    self.farbe_gemischt,
+                )
+            })
+            .collect()
+    }
+
+    /// Die Blätter einer Gruppe: n Abstände verbinden n+1 Blätter. Das letzte
+    /// Blatt teilt sich die Gruppe mit der nächsten — es ist der Anschluss des
+    /// Wegs, deshalb steht es in beiden Beschreibungen.
+    fn gruppe_blaetter(&self, start: usize, abstaende: usize) -> &[Blatt] {
+        let ende = (start + abstaende + 1).min(self.blaetter.len());
+        self.blaetter.get(start..ende).unwrap_or(&[])
+    }
+
+    /// Untergruppen einer Gruppe (Kern: [`beschreibe_untergruppen`]) nach
+    /// Farb- und Form-Mix; leer, wenn es die Gruppe nicht gibt.
+    fn untergruppen_beschreibung(&self, index: usize) -> String {
+        let gruppen = self.gruppen();
+        let Some((start, abstaende)) = gruppen.get(index) else {
+            return String::new();
+        };
+        beschreibe_untergruppen(
+            index + 1,
+            self.gruppe_blaetter(*start, abstaende.len()),
+            self.farbe_gemischt,
+        )
     }
 
     /// Farbe im analysierten Bild (RGB) an der Bildposition.
@@ -923,6 +1021,7 @@ impl LaubPanel {
             &g,
             self.bpm,
             &schritte,
+            self.farbe_gemischt,
         );
         Ok(schritte
             .iter()
@@ -1729,6 +1828,69 @@ impl LaubPanel {
                 self.erkennen(true);
             }
         });
+        // Filter: Blattgröße, Sättigung, Helligkeit. Alles neutral voreingestellt
+        // (Fläche ab MIN_FLAECHE, sonst keine Grenze) — die bisherige Erkennung
+        // bleibt unverändert, die Filter sind die zusätzlichen Ausschlüsse für
+        // Steine, Kies und Schatten (Diktat 2026-10-20).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Filter");
+            let mut geaendert = false;
+            ui.label(RichText::new("Fläche").small().color(Color32::GRAY));
+            geaendert |= ui
+                .add(
+                    egui::DragValue::new(&mut self.filter.min_flaeche)
+                        .range(1..=200_000)
+                        .speed(1.0)
+                        .suffix(" px"),
+                )
+                .changed();
+            ui.label(RichText::new("bis").small().color(Color32::GRAY));
+            geaendert |= ui
+                .add(
+                    egui::DragValue::new(&mut self.filter.max_flaeche)
+                        .range(0..=200_000)
+                        .speed(1.0)
+                        .suffix(" px"),
+                )
+                .changed();
+            ui.label(RichText::new("Sätt. min").small().color(Color32::GRAY));
+            geaendert |= ui
+                .add(
+                    egui::DragValue::new(&mut self.filter.min_saettigung)
+                        .range(0.0..=1.0)
+                        .speed(0.01),
+                )
+                .changed();
+            ui.label(RichText::new("Hell.").small().color(Color32::GRAY));
+            geaendert |= ui
+                .add(
+                    egui::DragValue::new(&mut self.filter.min_helligkeit)
+                        .range(0..=255)
+                        .speed(1.0),
+                )
+                .changed();
+            ui.label(RichText::new("bis").small().color(Color32::GRAY));
+            geaendert |= ui
+                .add(
+                    egui::DragValue::new(&mut self.filter.max_helligkeit)
+                        .range(0..=255)
+                        .speed(1.0),
+                )
+                .changed();
+            if ui.button("Filter zurück").clicked() {
+                self.filter = Blattfilter::default();
+                log::info!("laub: Filter zurueckgesetzt");
+                self.erkennen(true);
+            }
+            if geaendert {
+                self.erkennen(false);
+            }
+        });
+        ui.label(
+            RichText::new("Fläche max 0 px = ohne Grenze · Sättigung 0…1 · Helligkeit 0…255")
+                .small()
+                .color(Color32::GRAY),
+        );
         if !self.erkennung.is_empty() {
             ui.label(&self.erkennung);
         }
@@ -1760,21 +1922,49 @@ impl LaubPanel {
             }
             ui.label("Abstände");
         });
+        // Farbmodus: exakte RGB-Grenzen oder Mischwerte. Vorgabe gemischt
+        // (Diktat 2026-10-20), weil Herbstlaub selten ein reines Rot oder Gelb
+        // ist; die Gruppen-Beschreibung, „Anhören“ und das Rendern (Farbe →
+        // Instrument) hängen alle an diesem Schalter.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Farbe:");
+            if ui.selectable_label(self.farbe_gemischt, "gemischt").clicked() {
+                self.farbe_gemischt = true;
+                self.status = "Farbe: gemischt (Mischwerte)".to_string();
+                log::info!("laub: Farbe gemischt (Mischwerte)");
+            }
+            if ui.selectable_label(!self.farbe_gemischt, "exakt").clicked() {
+                self.farbe_gemischt = false;
+                self.status = "Farbe: exakt (RGB-Grenzen)".to_string();
+                log::info!("laub: Farbe exakt (RGB-Grenzen)");
+            }
+            ui.label(
+                RichText::new("wirkt auf Gruppen, Anhören, Rendern")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
         if !self.abstaende.is_empty() {
-            let schritte = self.gruppen_schritte();
-            let text = schritte
-                .iter()
-                .enumerate()
-                .map(|(i, n)| {
-                    if i == 0 {
-                        format!("G1: {n} Schritte")
-                    } else {
-                        format!("G{}: {n}", i + 1)
+            // Gruppen-Beschreibungen aus dem Kern: Schritte, Farb-Mix, Form-Mix
+            // und Untergruppen. Die Untergruppen stehen nur bei der gewählten
+            // Gruppe, sonst würde der Tab bei vielen Gruppen unübersichtlich.
+            let beschreibungen = self.gruppen_beschreibungen();
+            let auswahl = self
+                .gruppe_auswahl
+                .min(beschreibungen.len().saturating_sub(1));
+            for (i, text) in beschreibungen.iter().enumerate() {
+                ui.label(RichText::new(text).small().color(Color32::GRAY));
+                if i == auswahl {
+                    let unter = self.untergruppen_beschreibung(i);
+                    if !unter.is_empty() {
+                        ui.label(
+                            RichText::new(format!("Untergruppen: {unter}"))
+                                .small()
+                                .color(Color32::GRAY),
+                        );
                     }
-                })
-                .collect::<Vec<_>>()
-                .join(" · ");
-            ui.label(RichText::new(text).small().color(Color32::GRAY));
+                }
+            }
         }
         // Taktgruppe: eine Folge von Takten (z. B. G1 G2 G1 G3). Ein Takt ist
         // eine Gruppe aus der Zeile darüber; die Folge ordnet sie den
@@ -2153,6 +2343,7 @@ fn erkennungstexte(n: usize, med: Option<f32>) -> (String, String) {
 /// `schritte` ist das Ergebnis des Kerns (Menge, sortiert ohne Doppelte); der
 /// Vergleich mit dem Spiegel läuft nur als Warnung — geschrieben wird immer
 /// die Menge des Kerns, damit Kern und Raster nicht auseinanderlaufen.
+#[allow(clippy::too_many_arguments)]
 fn farben_je_schritt(
     blaetter: &[Blatt],
     d: &[f32],
@@ -2161,13 +2352,20 @@ fn farben_je_schritt(
     g: &Genre,
     bpm: f32,
     schritte: &[u32],
+    gemischt: bool,
 ) -> HashMap<u32, u8> {
     let mut karte: HashMap<u32, u8> = HashMap::new();
     for (position, blatt) in spiegel_positionen(d, raster, modus, g, bpm)
         .into_iter()
         .zip(blaetter.iter())
     {
-        karte.entry(position).or_insert_with(|| farbklasse(blatt));
+        // Farbmodus wie in der Anzeige: exakte Grenzen oder Mischwerte.
+        let klasse = if gemischt {
+            farbklasse_blatt_mix(blatt)
+        } else {
+            farbklasse(blatt)
+        };
+        karte.entry(position).or_insert(klasse);
     }
     let mut menge: Vec<u32> = karte.keys().copied().collect();
     menge.sort_unstable();
@@ -2301,6 +2499,8 @@ mod tests {
             x,
             y,
             flaeche: 9,
+            breite: 3,
+            hoehe: 3,
             r,
             g,
             b,
@@ -2511,10 +2711,78 @@ mod tests {
             &techno,
             120.0,
             &kern,
+            true,
         );
         assert_eq!(farben.get(&0), Some(&0), "rot");
         assert_eq!(farben.get(&24), Some(&1), "gelb");
         assert_eq!(farben.get(&48), Some(&3), "grün");
+    }
+
+    /// Der Farbmodus wirkt bis in die Instrumentwahl: ein Blatt an der
+    /// Rot-Gelb-Grenze wird exakt gelb, über Mischwerte noch rot.
+    #[test]
+    fn farbmodus_aendert_das_instrument() {
+        let grenzblatt = blatt(0.0, 0.0, 220, 110, 50);
+        assert_eq!(farbklasse(&grenzblatt), jamcore::laub::FARBE_GELB, "exakt");
+        assert_eq!(
+            farbklasse_blatt_mix(&grenzblatt),
+            jamcore::laub::FARBE_ROT,
+            "gemischt"
+        );
+        let techno = genre("Techno").expect("Techno");
+        let d = vec![1.0];
+        let kern = schritte_aus_abstaenden_bpm(&d, 96, Abstandsmodus::Relativ, &techno, 120.0);
+        let gemischt = farben_je_schritt(
+            &[grenzblatt],
+            &d,
+            96,
+            Abstandsmodus::Relativ,
+            &techno,
+            120.0,
+            &kern,
+            true,
+        );
+        let exakt = farben_je_schritt(
+            &[grenzblatt],
+            &d,
+            96,
+            Abstandsmodus::Relativ,
+            &techno,
+            120.0,
+            &kern,
+            false,
+        );
+        assert_eq!(gemischt.get(&0), Some(&jamcore::laub::FARBE_ROT));
+        assert_eq!(exakt.get(&0), Some(&jamcore::laub::FARBE_GELB));
+    }
+
+    /// Die Gruppenzeilen im Tab kommen aus dem Kern und nennen Schritte,
+    /// Farbe und Form — in beiden Farbmodi.
+    #[test]
+    fn gruppenbeschreibungen_im_tab() {
+        let mut panel = LaubPanel::new();
+        panel.abstaende = vec![1.0, 1.0];
+        panel.gruppe_groesse = 2;
+        panel.blaetter = vec![
+            blatt(0.0, 0.0, 200, 40, 30),
+            blatt(1.0, 1.0, 190, 35, 25),
+            blatt(2.0, 2.0, 230, 200, 50),
+        ];
+        let gemischt = panel.gruppen_beschreibungen();
+        assert_eq!(gemischt.len(), 1);
+        assert!(
+            gemischt[0].starts_with("G1: 2 Schritte · rot/gelb-gemischt · rund"),
+            "{gemischt:?}"
+        );
+        assert!(gemischt[0].contains("(3 Blätter)"), "{gemischt:?}");
+        assert!(
+            panel.untergruppen_beschreibung(0).contains("rot/gemischt"),
+            "{:?}",
+            panel.untergruppen_beschreibung(0)
+        );
+        panel.farbe_gemischt = false;
+        let exakt = panel.gruppen_beschreibungen();
+        assert!(exakt[0].contains("rot/gelb-exakt"), "{exakt:?}");
     }
 
     #[test]
