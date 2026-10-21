@@ -2160,8 +2160,16 @@ impl LaubPanel {
                 }
             }
         });
+        // Rückmeldung direkt unter den Aktionen („Gruppen -> Patterns: …“,
+        // „Farbe: gemischt“). Vorher stand sie am Ende des Tabs hinter allen
+        // Gruppen-Beschreibungen — auf dem Handy außerhalb des Bildschirms,
+        // der Nutzer sah nach dem Tippen nichts.
         if !self.status.is_empty() {
-            ui.label(&self.status);
+            ui.label(
+                RichText::new(&self.status)
+                    .small()
+                    .color(Color32::from_rgb(170, 200, 225)),
+            );
         }
     }
 }

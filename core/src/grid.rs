@@ -204,6 +204,39 @@ impl Pattern {
         true
     }
 
+    /// Legt eine Note **zellenweise** an: ersetzt nur die Zelle
+    /// `(Schritt, Kanal)`, andere Kanäle auf demselben Schritt bleiben stehen.
+    ///
+    /// Warum neben [`Pattern::insert`] statt als Ersatz: `insert` ist das
+    /// Raster-Verhalten des Desktop-Recorders (eine Note je Schritt) und wird
+    /// von Bild-Follow, Euklid und Laub unverändert genutzt — ein Ersetzen
+    /// dort würde bestehende Patterns ändern. Die Tracker-Eingabe arbeitet
+    /// dagegen zellenweise ([`crate::tracker::setzen`]); ihr fehlte eine
+    /// öffentliche Methode auf [`Pattern`], weil `tracker::setzen` nur über
+    /// das kern-interne `noten_mut` schreiben kann. So kann auch die
+    /// Android-Seite eine Zelle setzen, ohne fremde Kanäle zu löschen.
+    ///
+    /// Der Schritt wird wie bei [`Pattern::insert`] über
+    /// [`Pattern::abschnitt_step`] in die Patternlänge übersetzt, der Kanal auf
+    /// 0..=63 geklemmt; danach ist nach `(Schritt, Kanal, Tonhöhe)` sortiert.
+    ///
+    /// Rückgabe: `true`, wenn die Zelle vorher leer war (angelegt), `false`,
+    /// wenn eine vorhandene Note ersetzt wurde — wie
+    /// [`crate::tracker::setzen`].
+    pub fn insert_zelle(&mut self, note: Note) -> bool {
+        let step = self.abschnitt_step(note.step);
+        let channel = crate::tracker::klemme_kanal(i32::from(note.channel));
+        let war_leer = self.zelle(step, channel).is_none();
+        self.notes.retain(|n| !(n.step == step && n.channel == channel));
+        self.notes.push(Note {
+            step,
+            channel,
+            ..note
+        });
+        self.notes.sort_by_key(|n| (n.step, n.channel, n.pitch));
+        war_leer
+    }
+
     pub fn has_at(&self, step: u16, pitch: i32) -> bool {
         let step = step % self.steps_per_cycle;
         self.notes
@@ -537,6 +570,16 @@ mod tests {
             p.toggle(step, pitch);
         }
         p
+    }
+
+    fn note(step: u16, channel: u8, pitch: i32) -> Note {
+        Note {
+            step,
+            instrument: 0,
+            pitch,
+            glide: false,
+            channel,
+        }
     }
 
     #[test]
@@ -1094,5 +1137,89 @@ mod tests {
         assert_eq!(p.zelle(1, 5).map(|n| n.channel), Some(5), "Zelle (1, 5)");
         assert_eq!(p.zelle(1, 0), None, "andere Zelle desselben Schritts");
         assert_eq!(p.zelle(99, 5), None, "hinter der Patternlaenge");
+    }
+
+    #[test]
+    fn insert_zelle_laesst_andere_kanaele_stehen() {
+        // Punkt 14: ein Tracker-Einsatz auf Kanal 1 darf die Note auf Kanal 0
+        // desselben Schritts nicht löschen (das war das Verhalten von `insert`).
+        let mut p = Pattern::with_steps(16);
+        assert!(p.insert_zelle(note(4, 0, 60)), "erste Zelle ist leer");
+        assert!(p.insert_zelle(note(4, 1, 64)), "anderer Kanal ist leer");
+        assert_eq!(p.notes().len(), 2);
+        assert_eq!(p.zelle(4, 0).map(|n| n.pitch), Some(60));
+        assert_eq!(p.zelle(4, 1).map(|n| n.pitch), Some(64));
+    }
+
+    #[test]
+    fn insert_zelle_ersetzt_nur_die_eigene_zelle() {
+        let mut p = Pattern::with_steps(16);
+        assert!(p.insert_zelle(note(4, 2, 60)));
+        // Gleiche Zelle: ersetzen, nicht anhängen. Rückgabe sagt „ersetzt“.
+        assert!(
+            !p.insert_zelle(note(4, 2, 67)),
+            "belegte Zelle wird ersetzt"
+        );
+        assert_eq!(p.notes().len(), 1, "kein Duplikat in derselben Zelle");
+        assert_eq!(p.zelle(4, 2).map(|n| n.pitch), Some(67));
+        // Der Nachbarkanal bleibt von der Ersetzung unberührt.
+        assert!(p.insert_zelle(note(4, 3, 72)));
+        assert!(!p.insert_zelle(note(4, 2, 69)));
+        assert_eq!(p.notes().len(), 2);
+        assert_eq!(p.zelle(4, 3).map(|n| n.pitch), Some(72));
+    }
+
+    #[test]
+    fn insert_zelle_klemmt_kanal_und_sortiert() {
+        let mut p = Pattern::with_steps(16);
+        // Kanal 200 landet in der letzten Spalte (63); ein zweiter Einsatz
+        // dort ersetzt die Note statt eine neue Spalte zu erfinden.
+        assert!(p.insert_zelle(note(8, 200, 60)));
+        assert!(p.insert_zelle(note(2, 0, 62)));
+        assert!(p.insert_zelle(note(5, 1, 64)));
+        assert_eq!(p.notes().len(), 3);
+        assert!(!p.insert_zelle(note(8, 63, 65)));
+        let kanaele: Vec<(u16, u8, i32)> = p
+            .notes()
+            .iter()
+            .map(|n| (n.step, n.channel, n.pitch))
+            .collect();
+        assert_eq!(
+            kanaele,
+            vec![(2, 0, 62), (5, 1, 64), (8, 63, 65)],
+            "nach Schritt, Kanal und Tonhöhe sortiert"
+        );
+    }
+
+    #[test]
+    fn insert_zelle_folgt_dem_abschnitt() {
+        // Wie `insert`: Schritte kommen in X-Auflösung und werden über den
+        // Ausschnitt in die Patternlänge übersetzt (inklusive Umlauf).
+        let mut p = Pattern::mit_abschnitt(4, 20, 40);
+        assert_eq!(p.steps_per_cycle(), 17);
+        assert!(p.insert_zelle(note(4, 0, 60)));
+        assert_eq!(p.zelle(0, 0).map(|n| n.pitch), Some(60), "Start = 0");
+        assert!(p.insert_zelle(note(20, 0, 72)));
+        assert_eq!(p.zelle(16, 0).map(|n| n.pitch), Some(72), "Ende = 16");
+        assert!(p.insert_zelle(note(2, 0, 62)));
+        assert_eq!(
+            p.zelle(15, 0).map(|n| n.pitch),
+            Some(62),
+            "zwei vor dem Start umgebrochen"
+        );
+    }
+
+    #[test]
+    fn insert_bleibt_schrittweise_fuer_die_alten_aufrufer() {
+        // Kompatibilität: `insert` ersetzt weiterhin **alle** Noten des
+        // Schritts (Bild-Follow, Euklid, Laub und Desktop-CSV verlassen sich
+        // darauf). Der Unterschied zu `insert_zelle` ist genau die Zelle.
+        let mut p = Pattern::with_steps(16);
+        p.insert_zelle(note(4, 0, 60));
+        p.insert_zelle(note(4, 1, 64));
+        assert!(p.insert(note(4, 0, 67)));
+        assert_eq!(p.notes().len(), 1, "insert räumt den ganzen Schritt");
+        assert_eq!(p.zelle(4, 0).map(|n| n.pitch), Some(67));
+        assert_eq!(p.zelle(4, 1), None);
     }
 }

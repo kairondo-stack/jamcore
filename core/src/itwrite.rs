@@ -40,6 +40,51 @@ pub struct Sample {
     pub c5speed: u32,
 }
 
+/// Inhalt der IT-Song-Message (`Special`-Bit 0 im Kopf, Tag `0x00E1` in der
+/// IT-Welt): der Platz für die Angaben „welches Pattern, an welchem Tag, zu
+/// welchem Bild" und für freie Notizen.
+///
+/// `titel` steht als erste Zeile, `zeilen` folgen darunter. Beides ist
+/// **UTF-8**; libopenmpt erkennt gültiges UTF-8 und zeigt Umlaute richtig an.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Meta {
+    /// Erste Zeile der Nachricht (z. B. „JamCore"), leer = keine Kopfzeile.
+    pub titel: String,
+    /// Zeilen darunter: eine je Pattern, danach freie Notizen.
+    pub zeilen: Vec<String>,
+}
+
+impl Meta {
+    /// Nichts zu schreiben? Dann bleibt die Datei byte-gleich zum Export ohne
+    /// Meta (kein Special-Bit, MsgLgth 0, MsgOffset 0).
+    pub fn ist_leer(&self) -> bool {
+        self.titel.is_empty() && self.zeilen.iter().all(String::is_empty)
+    }
+}
+
+/// Eine Zeile je Pattern im vereinbarten Format
+/// `Pattern 1: 2026-10-21, quelle=bild:klein_Quebec.jpg, notiz=…`.
+///
+/// `quelle` ist der zuletzt geladene Bild-/Videopfad (ohne Quelle bleibt das
+/// Feld leer), `notiz` der Text aus dem Notizfeld des Exports.
+pub fn meta_fuer_patterns(datum: &str, quelle: &str, notiz: &str, anzahl: usize) -> Meta {
+    Meta {
+        titel: String::new(),
+        zeilen: (0..anzahl)
+            .map(|i| meta_zeile(i + 1, datum, quelle, notiz))
+            .collect(),
+    }
+}
+
+/// Eine einzelne Pattern-Zeile im Format
+/// `Pattern 3: 2026-10-21, quelle=bild:klein_Quebec.jpg, notiz=…`.
+///
+/// Getrennt von [`meta_fuer_patterns`], weil der Export je Pattern ein anderes
+/// Datum/eine andere Quelle kennt (Patterns entstehen an verschiedenen Tagen).
+pub fn meta_zeile(nummer: usize, datum: &str, quelle: &str, notiz: &str) -> String {
+    format!("Pattern {nummer}: {datum}, quelle={quelle}, notiz={notiz}")
+}
+
 /// Eine Pattern-Zelle; `None` heißt leer.
 ///
 /// Die Werte sind die rohen IT-Bytes: `note` 0…119 (0 = C-0),
@@ -114,6 +159,22 @@ pub fn bytes_mit_patterns(
     patterns: &[Pattern],
     titel: &str,
 ) -> Result<Vec<u8>, String> {
+    bytes_mit_patterns_und_meta(samples, titel, patterns, &Meta::default())
+}
+
+/// Wie [`bytes_mit_patterns`], zusätzlich mit Song-Message ([`Meta`]).
+///
+/// Die Nachricht hängt am **Dateiende** (Offset steht im Kopf); Samples,
+/// Patterns und Orders bleiben dadurch an denselben Stellen wie ohne Meta —
+/// ein Export ohne Meta ist byte-gleich. Je Pattern schreibt der Aufrufer
+/// normalerweise eine Zeile aus [`meta_fuer_patterns`], danach dürfen freie
+/// Notizen folgen (Leerzeilen bleiben als Absatz erhalten).
+pub fn bytes_mit_patterns_und_meta(
+    samples: &[Sample],
+    titel: &str,
+    patterns: &[Pattern],
+    meta: &Meta,
+) -> Result<Vec<u8>, String> {
     if samples.len() > MAX_SAMPLES {
         return Err(format!(
             "zu viele Samples: {} (höchstens {MAX_SAMPLES})",
@@ -129,6 +190,13 @@ pub fn bytes_mit_patterns(
     let ord_num = patterns.len() as u16;
     let smp_num = samples.len() as u16;
     let pat_num = patterns.len() as u16;
+
+    // Song-Message vorbereiten: leer = gar keine Nachricht (Bytes wie bisher).
+    let nachricht = if meta.ist_leer() {
+        Vec::new()
+    } else {
+        nachricht_bytes(meta)?
+    };
 
     // Absolute Offsets im Aufbau: Orders, Parapointer, Sample-Köpfe, Patterns,
     // PCM. Instrumente gibt es nicht (reine Samples), also keine Ins-Pointer.
@@ -160,8 +228,15 @@ pub fn bytes_mit_patterns(
         daten_offset += s.daten.len() * 2;
     }
 
-    let mut out = Vec::with_capacity(daten_offset);
-    out.extend_from_slice(&kopf(titel, ord_num, smp_num, pat_num));
+    let mut out = Vec::with_capacity(daten_offset + nachricht.len());
+    let msg = if nachricht.is_empty() {
+        None
+    } else {
+        // Die Nachricht steht hinter den PCM-Daten; ihr Offset im Kopf ist
+        // die einzige Bindung (Reihenfolge im Datei-Aufbau ist frei).
+        Some((nachricht.len() as u16, daten_offset as u32))
+    };
+    out.extend_from_slice(&kopf(titel, ord_num, smp_num, pat_num, msg));
     for i in 0..ord_num {
         out.push(i as u8); // Order-Liste: 0, 1, 2, …
     }
@@ -198,12 +273,23 @@ pub fn bytes_mit_patterns(
             out.extend_from_slice(&wert.to_le_bytes());
         }
     }
-    debug_assert_eq!(out.len(), daten_offset);
+    // Song-Message ans Ende (der Offset im Kopf zeigt hierher).
+    out.extend_from_slice(&nachricht);
+    debug_assert_eq!(out.len(), daten_offset + nachricht.len());
     Ok(out)
 }
 
 /// Der 192-Byte-Kopf. Instrumente gibt es nicht (reine Samples).
-fn kopf(titel: &str, ord_num: u16, smp_num: u16, pat_num: u16) -> [u8; KOPF] {
+///
+/// `msg` = `(Länge in Bytes, Datei-Offset)` der Song-Message; `None` lässt
+/// `Special`, `MsgLgth` und `MsgOffset` auf 0 (das ist der Export ohne Meta).
+fn kopf(
+    titel: &str,
+    ord_num: u16,
+    smp_num: u16,
+    pat_num: u16,
+    msg: Option<(u16, u32)>,
+) -> [u8; KOPF] {
     let mut k = [0u8; KOPF];
     k[0x00..0x04].copy_from_slice(b"IMPM");
     let name = kuerzen(titel, 26);
@@ -217,14 +303,19 @@ fn kopf(titel: &str, ord_num: u16, smp_num: u16, pat_num: u16) -> [u8; KOPF] {
     k[0x28..0x2a].copy_from_slice(&0x0214u16.to_le_bytes()); // Cwt/v: IT 2.14
     k[0x2a..0x2c].copy_from_slice(&0x0214u16.to_le_bytes()); // Cmwt
     k[0x2c..0x2e].copy_from_slice(&0x0001u16.to_le_bytes()); // Flags: Stereo-Wiedergabe
-    // 0x2e Special = 0 (keine eingebettete Nachricht/History/Highlights)
+    // 0x2e Special: Bit 0 = Song-Message angehängt (sonst 0)
     k[0x30] = 128; // GV: Global Volume
     k[0x31] = 48; // MV: Mix Volume (OpenMPT-Vorgabe)
     k[0x32] = 6; // IS: Initial Speed
     k[0x33] = 125; // IT: Initial Tempo
     k[0x34] = 128; // Sep: Pan-Separation
     k[0x35] = 0; // PWD: Pitch-Wheel-Tiefe
-    // 0x36 MsgLgth = 0, 0x38 MsgOffset = 0, 0x3c Reserved = 0
+                   // 0x36 MsgLgth = 0, 0x38 MsgOffset = 0, 0x3c Reserved = 0
+    if let Some((laenge, offset)) = msg {
+        k[0x2e] = 0x01; // Special: Nachricht vorhanden
+        k[0x36..0x38].copy_from_slice(&laenge.to_le_bytes());
+        k[0x38..0x3c].copy_from_slice(&offset.to_le_bytes());
+    }
     k[0x40..0x80].fill(32); // ChnlPan: alle Kanäle mittig (0x20)
     k[0x80..0xc0].fill(64); // ChnlVol: volle Lautstärke
     k
@@ -314,6 +405,63 @@ fn pattern_packen(p: &Pattern) -> Result<Vec<u8>, String> {
         out.push(0x00); // Zeilenende
     }
     Ok(out)
+}
+
+/// Serialisiert die Song-Message so, wie IT/libopenmpt sie liest: je Zeile
+/// ein Längenbyte (max. 255), der Text und ein CR (`0x0D`).
+///
+/// Warum Längenbyte je Zeile statt eines Textblocks: das IT-Format speichert
+/// Zeilenlängen getrennt (ITTECH.TXT, `ReadMessage` in libopenmpt) — ein
+/// reiner `\r`-Text würde beim Laden falsch zerschnitten.
+fn nachricht_bytes(meta: &Meta) -> Result<Vec<u8>, String> {
+    let mut zeilen: Vec<&str> = Vec::new();
+    if !meta.titel.is_empty() {
+        zeilen.push(&meta.titel);
+    }
+    zeilen.extend(meta.zeilen.iter().map(String::as_str));
+    let mut out = Vec::new();
+    for zeile in zeilen {
+        let zeile = kuerzen(zeile, 255);
+        out.push(zeile.len() as u8);
+        out.extend_from_slice(zeile.as_bytes());
+        out.push(0x0d);
+    }
+    if out.len() > u16::MAX as usize {
+        return Err(format!(
+            "Song-Message zu lang: {} Bytes (höchstens {})",
+            out.len(),
+            u16::MAX
+        ));
+    }
+    Ok(out)
+}
+
+/// Heutiges Datum als `JJJJ-MM-TT` (UTC) für die Meta-Zeilen.
+///
+/// Warum UTC und nicht Ortszeit: ohne Zeitzonen-Datenbank (Android/Nix)
+/// liefert die Ortszeit je nach Gerät etwas anderes; für „an welchem Tag
+/// aufgenommen" ist der UTC-Tag stabil und im Zweifel einen Tag daneben.
+pub fn datum_heute() -> String {
+    let tage = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86_400)
+        .unwrap_or(0) as i64;
+    datum_aus_tagen(tage)
+}
+
+/// Tage seit 1970-01-01 → `JJJJ-MM-TT` (Howard Hinnant, „civil_from_days").
+fn datum_aus_tagen(tage: i64) -> String {
+    let z = tage + 719_468;
+    let aera = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097); // Tag der 400-Jahres-Ära
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let jahr = yoe + aera * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let tag = doy - (153 * mp + 2) / 5 + 1;
+    let monat = if mp < 10 { mp + 3 } else { mp - 9 };
+    let jahr = if monat <= 2 { jahr + 1 } else { jahr };
+    format!("{jahr:04}-{monat:02}-{tag:02}")
 }
 
 /// Auf höchstens `max` Bytes kürzen, ohne ein UTF-8-Zeichen zu zerteilen.
@@ -473,6 +621,163 @@ mod tests {
         assert_eq!(u16_le(&b, 0x26), 1, "ein leeres Pattern");
         // Kopf + Order + Pattern-Parapointer (kein Sample, kein PCM).
         assert_eq!(b.len(), KOPF + 1 + 4);
+    }
+
+    /// Mini-Parser für die Song-Message: `None` = keine Nachricht, sonst der
+    /// Text mit `\n` je Zeile (die Datei trennt mit Längenbyte + `\r`).
+    fn nachricht(b: &[u8]) -> Option<String> {
+        if u16_le(b, 0x2e) & 0x01 == 0 {
+            return None;
+        }
+        let len = u16_le(b, 0x36) as usize;
+        let off = u32_le(b, 0x38) as usize;
+        let mut pos = off;
+        let mut text = String::new();
+        while pos < off + len {
+            let l = b[pos] as usize;
+            pos += 1;
+            text.push_str(std::str::from_utf8(&b[pos..pos + l]).expect("UTF-8"));
+            pos += l;
+            assert_eq!(b[pos], 0x0d, "Zeilenende ist CR");
+            pos += 1;
+            text.push('\n');
+        }
+        Some(text)
+    }
+
+    #[test]
+    fn meta_schreibt_song_message() {
+        let meta = Meta {
+            titel: "JamCore".to_string(),
+            zeilen: vec![
+                "Pattern 1: 2026-10-21, quelle=bild:klein_Quebec.jpg, notiz=erste Idee".to_string(),
+            ],
+        };
+        let b = bytes_mit_patterns_und_meta(&[sample("A", 8)], "T", &[Pattern::leer()], &meta)
+            .unwrap();
+        assert_eq!(u16_le(&b, 0x2e) & 0x01, 1, "Special: Nachricht angehängt");
+        let len = u16_le(&b, 0x36) as usize;
+        let off = u32_le(&b, 0x38) as usize;
+        assert!(len > 0, "MsgLgth > 0");
+        assert!(off >= KOPF, "MsgOffset zeigt in die Datei");
+        assert_eq!(off + len, b.len(), "Nachricht steht am Dateiende");
+        assert_eq!(
+            nachricht(&b).unwrap(),
+            "JamCore\nPattern 1: 2026-10-21, quelle=bild:klein_Quebec.jpg, notiz=erste Idee\n",
+            "Text-Rundlauf"
+        );
+    }
+
+    #[test]
+    fn meta_mit_leeren_zeichen_ist_keine_nachricht() {
+        // Weiße Zeilen zählen als Inhalt (Absätze in den Notizen), aber ein
+        // komplett leeres Meta darf keine Nachricht anhängen.
+        let b = bytes_mit_patterns_und_meta(
+            &[sample("A", 8)],
+            "T",
+            &[Pattern::leer()],
+            &Meta::default(),
+        )
+        .unwrap();
+        assert_eq!(u16_le(&b, 0x2e) & 0x01, 0, "kein Special-Bit");
+        assert_eq!(u16_le(&b, 0x36), 0, "MsgLgth 0");
+        assert_eq!(u32_le(&b, 0x38), 0, "MsgOffset 0");
+        assert_eq!(nachricht(&b), None);
+        // Notizen mit Leerzeilen bleiben erhalten.
+        let meta = Meta {
+            titel: String::new(),
+            zeilen: vec!["Notizen:".to_string(), String::new(), "zweiter Absatz".to_string()],
+        };
+        let b = bytes_mit_patterns_und_meta(&[sample("A", 8)], "T", &[Pattern::leer()], &meta)
+            .unwrap();
+        assert_eq!(
+            nachricht(&b).unwrap(),
+            "Notizen:\n\nzweiter Absatz\n",
+            "Leerzeile bleibt"
+        );
+    }
+
+    #[test]
+    fn export_ohne_meta_unveraendert() {
+        let samples = [sample("Eins", 10), sample("Zwei", 20)];
+        let patterns = [Pattern::leer()];
+        let alt = bytes_mit_patterns(&samples, &patterns, "Titel").unwrap();
+        let neu = bytes_mit_patterns_und_meta(&samples, "Titel", &patterns, &Meta::default())
+            .unwrap();
+        assert_eq!(alt, neu, "ohne Meta identische Bytes");
+        // Und `bytes` (der alte Einstieg) bleibt ebenfalls gleich.
+        assert_eq!(bytes(&samples, "Titel").unwrap(), alt);
+    }
+
+    #[test]
+    fn order_liste_entspricht_patterns() {
+        // Vier Patterns: die Orders sind 0, 1, 2, 3 — auch wenn dazwischen
+        // leere Patterns liegen (die bleiben Parapointer 0).
+        let gefuellt = Pattern {
+            zeilen: 1,
+            kanaele: 1,
+            zellen: vec![Zelle {
+                note: Some(59),
+                instrument: Some(1),
+                ..Zelle::default()
+            }],
+        };
+        let patterns = [gefuellt.clone(), Pattern::leer(), gefuellt, Pattern::leer()];
+        let b = bytes_mit_patterns(&[sample("A", 8)], &patterns, "T").unwrap();
+        assert_eq!(u16_le(&b, 0x20), 4, "OrdNum");
+        assert_eq!(&b[0xC0..0xC4], &[0, 1, 2, 3], "Order-Liste 0..n");
+        // Die Order ist genau so lang wie die Zahl der Patterns, danach folgen
+        // die Sample-Parapointer (hier 4, weil es keine Instrumente gibt).
+        let smp_zeiger = KOPF + 4;
+        assert_eq!(
+            u32_le(&b, smp_zeiger),
+            (KOPF + 4 + 4 + 4 * 4) as u32,
+            "erster Sample-Parapointer zeigt hinter die Pattern-Parapointer"
+        );
+    }
+
+    #[test]
+    fn meta_fuer_patterns_format() {
+        let meta = meta_fuer_patterns("2026-10-21", "bild:klein_Quebec.jpg", "erste Idee", 2);
+        assert_eq!(
+            meta.zeilen,
+            vec![
+                "Pattern 1: 2026-10-21, quelle=bild:klein_Quebec.jpg, notiz=erste Idee".to_string(),
+                "Pattern 2: 2026-10-21, quelle=bild:klein_Quebec.jpg, notiz=erste Idee".to_string(),
+            ]
+        );
+        // Ohne Quelle bleibt das Feld leer („falls bekannt, sonst leer").
+        let meta = meta_fuer_patterns("2026-10-21", "", "", 1);
+        assert_eq!(meta.zeilen, vec!["Pattern 1: 2026-10-21, quelle=, notiz=".to_string()]);
+        assert!(meta.titel.is_empty(), "Titel setzt der Aufrufer");
+    }
+
+    #[test]
+    fn lange_zeile_wird_an_255_bytes_gekuerzt() {
+        // IT-Zeilen tragen ein Längenbyte (max. 255); ein Umlaut darf nicht
+        // zerteilt werden.
+        let lang = "ä".repeat(200); // 400 Bytes
+        let meta = Meta {
+            titel: String::new(),
+            zeilen: vec![lang],
+        };
+        let b = bytes_mit_patterns_und_meta(&[sample("A", 8)], "T", &[Pattern::leer()], &meta)
+            .unwrap();
+        let text = nachricht(&b).unwrap();
+        let zeile = text.trim_end_matches('\n');
+        assert_eq!(zeile.len(), 254, "254 Bytes = 127 Umlaute, gerade noch gültig");
+        assert_eq!(zeile, "ä".repeat(127), "nicht mitten im Zeichen");
+    }
+
+    #[test]
+    fn datum_heute_ist_iso() {
+        assert_eq!(datum_aus_tagen(0), "1970-01-01");
+        assert_eq!(datum_aus_tagen(10_957), "2000-01-01");
+        assert_eq!(datum_aus_tagen(20_747), "2026-10-21");
+        let heute = datum_heute();
+        assert_eq!(heute.len(), 10, "JJJJ-MM-TT: {heute}");
+        assert_eq!(&heute[4..5], "-");
+        assert_eq!(&heute[7..8], "-");
     }
 
     #[test]

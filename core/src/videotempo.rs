@@ -19,11 +19,20 @@
 //!    Autokorrelation, z.B. bei reiner Belichtungs-Drift, immer den
 //!    Bereichsrand als „Treffer“), kleinster Lag bei gleich starken Peaks,
 //!    **zum Fundament herunterzählen** (Vielfache der Periode sind gleich
-//!    stark, und ein Vielfaches kann den ganzzahligen Lag besser treffen als
-//!    die Periode selbst) und mit einer **Parabel** durch die drei
-//!    Nachbar-Lags verfeinern (die Feinheit liegt zwischen den
-//!    Abtastschritten).
-//! 4. **Oktav-Regel**: Die Autokorrelation ist bei Vielfachen der Periode
+//!    stark, und ein Vielfaches kann den Lag besser treffen als die Periode
+//!    selbst) und mit einer **Parabel** durch die drei Nachbar-Lags
+//!    verfeinern (die Feinheit liegt zwischen den Abtastschritten).
+//!    Das Herunterzählen rechnet den Lag **gebrochen** (lineare
+//!    Interpolation): 128 BPM sind bei 20 fps 9,375 Frames je Schlag; der
+//!    ganzzahlige Lag 9 wäre sonst schwächer als sein Dreifaches und die
+//!    Auswertung landete bei 42,7 statt 128 BPM.
+//! 4. **Aliasing-Schutz**: Liegt schon **unter** dem BPM-Bereich ein fast
+//!    gleich starker echter Peak, ist der Treffer ein Vielfaches einer
+//!    schnelleren Periode. Bis zu einer Oktave über dem Bereich ist das die
+//!    gewollte Halbzeit-Faltung (300 BPM → 150); viel schneller ist Alias —
+//!    50-Hz-Netzflimmern bei 20 fps erscheint als 10 Hz = 600 BPM und liefert
+//!    bewusst `None` statt „150 BPM“.
+//! 5. **Oktav-Regel**: Die Autokorrelation ist bei Vielfachen der Periode
 //!    gleich stark — halbe und doppelte Periode sind also gleich gute
 //!    Kandidaten. Ist einer davon fast so stark wie der Peak (≥ 90 %),
 //!    gewinnt der Kandidat, der **näher an der Mitte des Bereichs** liegt
@@ -62,6 +71,18 @@ const MINDEST_SEKUNDEN: f32 = 2.0;
 /// Ab dieser Höhe der normierten Autokorrelation gilt ein Peak als Takt.
 /// Reines Rauschen bleibt darunter (bei den üblichen Reihenlängen).
 const MINDEST_PEAK: f32 = 0.3;
+
+/// Ab diesem Anteil des Peaks gilt ein kürzerer Lag als **Fundament**
+/// (Herunterzählen der Vielfachen, siehe [`bpm_aus_reihe`]).
+///
+/// Kleiner als [`OKTAV_ANTEIL`], weil ein gebrochener Lag durch das
+/// Abtastraster geschwächt wird, ohne dass der Takt schlechter wäre: ein
+/// 2-Frame-Puls bei 96 BPM und 20 fps hat seine Periode bei 12,5 Frames, und
+/// die Korrelation dort liegt gemessen bei 0,83 gegenüber 0,99 beim doppelten
+/// Lag (25). Mit 0,9 blieb die Auswertung auf 48 BPM stehen; 0,8 trifft das
+/// Fundament (Sweep 60…200 BPM, 2026-10-21). Rauschen bleibt draußen, weil
+/// vorher schon [`MINDEST_PEAK`] und die Prominenz geprüft werden.
+const FUNDAMENT_ANTEIL: f32 = 0.8;
 
 /// Ab diesem Anteil des Peaks gilt die halbe/doppelte Periode als „fast
 /// gleich stark" (Oktav-Regel, siehe Modulkopf).
@@ -106,6 +127,19 @@ pub fn graumittel(rgba: &[u8]) -> f32 {
     }
 }
 
+/// Dauer als Log-/Statustext: „12.3 s“ oder „unbekannt“.
+///
+/// Warum im Kern: die Android-Brücke liefert nur `Option<f32>` (Sekunden) aus
+/// `MediaMetadataRetriever`; die Formatierung ist die einzige Logik dazwischen
+/// und damit ohne Gerät prüfbar. Werte bis 0,05 s gelten als unbekannt — der
+/// Retriever liefert bei kaputten Containern 0, und „0.0 s“ wäre irreführend.
+pub fn dauer_text(dauer: Option<f32>) -> String {
+    match dauer {
+        Some(s) if s.is_finite() && s > 0.05 => format!("{s:.1} s"),
+        _ => "unbekannt".to_string(),
+    }
+}
+
 /// Helligkeits-Zeitreihe (je Frame) → BPM-Schätzung.
 ///
 /// `fps` ist die **Abtastrate der Reihe** (nicht zwingend die Bildrate des
@@ -135,9 +169,11 @@ pub fn bpm_aus_reihe(werte: &[f32], fps: f32, min_bpm: f32, max_bpm: f32) -> Opt
         return None;
     }
     let (lag_min, lag_max) = lag_bereich(x.len(), fps, min_bpm, max_bpm)?;
-    // Alle r-Werte des Bereichs einmal ausrechnen: lokale Maxima und
-    // Prominenz brauchen die Nachbarschaft, nicht nur den größten Wert.
-    let r: Vec<f32> = (lag_min..=lag_max)
+    // r ab Lag 1: die kurzen Lags **unter** `lag_min` braucht der
+    // Aliasing-Schutz weiter unten; Lag 1 ist selbst kein Kandidat, dient aber
+    // als linker Nachbar von Lag 2 (sonst wäre ein 2-Frame-Alias unsichtbar).
+    const R_VON: usize = 1;
+    let r: Vec<f32> = (R_VON..=lag_max)
         .map(|lag| autokorrelation(&x, lag))
         .collect();
     // Kandidaten sind nur **echte lokale Maxima**. Ohne diese Bedingung nimmt
@@ -147,51 +183,77 @@ pub fn bpm_aus_reihe(werte: &[f32], fps: f32, min_bpm: f32, max_bpm: f32) -> Opt
     // 40…220, 300,0 BPM bei 40…300 — der Wert wanderte mit dem Rand mit).
     let mut bester_lag: Option<usize> = None;
     for (i, wert) in r.iter().enumerate() {
-        if !lokales_maximum(&r, i) {
+        let lag = R_VON + i;
+        if lag < lag_min || !lokales_maximum(&r, i) {
             continue;
         }
-        let lag = lag_min + i;
         match bester_lag {
             None => bester_lag = Some(lag),
             Some(bisher) => {
-                if *wert > r[bisher - lag_min] * (1.0 + PEAK_TOLERANZ) {
+                if *wert > r[bisher - R_VON] * (1.0 + PEAK_TOLERANZ) {
                     bester_lag = Some(lag);
                 }
             }
         }
     }
-    let Some(mut bester_lag) = bester_lag else {
+    let Some(bester_lag) = bester_lag else {
         return None;
     };
     // Ein einzelner flacher Buckel auf einer fallenden Kurve ist noch kein
     // Takt: der Peak muss deutlich über seiner Nachbarschaft liegen.
-    if !ist_prominent(&r, bester_lag - lag_min) {
+    if !ist_prominent(&r, bester_lag - R_VON) {
         return None;
     }
-    let mut bester_r = r[bester_lag - lag_min];
+    let mut bester_r = r[bester_lag - R_VON];
     if bester_r < MINDEST_PEAK {
         return None;
     }
+    // Aliasing-Schutz: schon **unterhalb** des Bereichs ein fast gleich
+    // starker, echter Peak? Dann ist der gefundene Lag ein Vielfaches einer
+    // schnelleren Periode. Bis zu einer Oktave über `max_bpm` ist das die
+    // gewollte Halbzeit-Faltung (300 BPM → 150, siehe Bereichstest); viel
+    // schneller ist dagegen Alias — z.B. 50-Hz-Netzflimmern bei 20 fps
+    // (Alias 10 Hz = 600 BPM), das sonst als „150 BPM“ durchginge. Dort ist
+    // „nichts erkannt“ ehrlicher als ein Vielfaches des Alias.
+    for (i, wert) in r.iter().enumerate() {
+        let lag = R_VON + i;
+        if lag < 2 || lag >= lag_min {
+            continue;
+        }
+        if !lokales_maximum(&r, i) || *wert < bester_r * OKTAV_ANTEIL {
+            continue;
+        }
+        if 60.0 * fps / lag as f32 > 2.0 * max_bpm {
+            return None;
+        }
+        break;
+    }
     // Fundament statt Vielfaches: bei einem Takt sind alle Vielfachen der
     // Periode gleich stark — und je nach Abtastraster trifft ein Vielfaches
-    // den ganzzahligen Lag besser als die Periode selbst (gemessen: ein Sinus
-    // mit 127,8 BPM bei 20 fps landete auf dem Dreifachen, also 42,6 BPM).
-    // Deshalb von unten herunterzählen: jeder kürzere Lag im Bereich, der fast
-    // so stark ist wie der Peak, ist der bessere Kandidat.
+    // den ganzzahligen Lag besser als die Periode selbst. Deshalb von unten
+    // herunterzählen: jeder kürzere Lag im Bereich, der fast so stark ist wie
+    // der Peak, ist der bessere Kandidat.
+    //
+    // Der Lag wird dabei **gebrochen** gerechnet (lineare Interpolation):
+    // 128 BPM bei 20 fps sind 9,375 Frames je Schlag, und der ganzzahlige
+    // Lag 9 unterschätzt die Stärke so weit, dass das Dreifache (Lag 28)
+    // gewinnt (gemessen: 42,7 statt 128 BPM). Mit 28/3 = 9,333 ist die
+    // Korrelation wieder so stark wie der Peak.
+    let mut bester_lag = bester_lag as f32;
     let mut k = 2usize;
-    while bester_lag > lag_min {
-        let lag = (bester_lag as f32 / k as f32).round() as usize;
-        if lag < lag_min {
+    while bester_lag > lag_min as f32 {
+        let lag = bester_lag / k as f32;
+        if lag < lag_min as f32 {
             break;
         }
-        let r = autokorrelation(&x, lag);
-        if r >= bester_r * OKTAV_ANTEIL {
+        let r = autokorrelation_f(&x, lag);
+        if r >= bester_r * FUNDAMENT_ANTEIL {
             bester_lag = lag;
             bester_r = r;
             k = 2;
         } else {
             k += 1;
-            if k > bester_lag {
+            if k > bester_lag.ceil() as usize {
                 break;
             }
         }
@@ -201,24 +263,33 @@ pub fn bpm_aus_reihe(werte: &[f32], fps: f32, min_bpm: f32, max_bpm: f32) -> Opt
     }
     // Oktav-Regel: halbe und doppelte Periode sind gleich gute Kandidaten.
     let mitte = 0.5 * (min_bpm + max_bpm);
-    let mut gewaehlt = 60.0 * fps / bester_lag as f32;
+    let mut gewaehlt = 60.0 * fps / bester_lag;
     let mut naehe = (gewaehlt - mitte).abs();
     for kandidat in [gewaehlt * 0.5, gewaehlt * 2.0] {
         if !(min_bpm..=max_bpm).contains(&kandidat) {
             continue;
         }
-        let lag = (60.0 * fps / kandidat).round() as usize;
-        if lag < 2 || lag >= x.len() {
+        let lag = 60.0 * fps / kandidat;
+        if lag < 2.0 || lag >= x.len() as f32 {
             continue;
         }
-        let r = autokorrelation(&x, lag);
+        let r = autokorrelation_f(&x, lag);
         if r >= bester_r * OKTAV_ANTEIL && (kandidat - mitte).abs() < naehe {
             gewaehlt = kandidat;
             naehe = (kandidat - mitte).abs();
         }
     }
-    let lag = (60.0 * fps / gewaehlt).round() as usize;
-    Some(60.0 * fps / feinlag(&x, lag, lag_min, lag_max))
+    // Feinschliff: ein Lag aus dem **ganzzahligen** Raster liegt oft zwischen
+    // zwei Lags (Parabel durch die Nachbarn). Ein gebrochener Lag aus der
+    // Fundament-Suche ist dagegen schon der exakte Kandidat — dort würde die
+    // Parabel nur wieder auf das Raster ziehen.
+    let lag = 60.0 * fps / gewaehlt;
+    let fein = if (lag - lag.round()).abs() < 1e-3 {
+        feinlag(&x, lag.round() as usize, lag_min, lag_max)
+    } else {
+        lag
+    };
+    Some(60.0 * fps / fein)
 }
 
 /// Bequem: aus einer Liste von Frame-Mittelwerten, Bereich 40…220 BPM.
@@ -391,6 +462,45 @@ fn autokorrelation(werte: &[f32], lag: usize) -> f32 {
     for i in 0..n {
         let a = werte[i] as f64;
         let b = werte[i + lag] as f64;
+        summe += a * b;
+        aa += a * a;
+        bb += b * b;
+    }
+    let nenner = (aa * bb).sqrt();
+    if nenner <= 1e-12 {
+        0.0
+    } else {
+        (summe / nenner) as f32
+    }
+}
+
+/// Normierte Autokorrelation bei **gebrochenem** Lag: zwischen den
+/// Abtastwerten wird linear interpoliert (`frac` = Nachkommaanteil).
+///
+/// Warum das nötig ist: ein Takt von 128 BPM bei 20 Bildern je Sekunde hat
+/// 9,375 Frames je Schlag. Der ganzzahlige Lag 9 misst dann nur die Schläge,
+/// deren Phase zufällig passt, und ist deutlich schwächer als das Dreifache
+/// (Lag 28) — die Auswertung fiele auf 42,7 BPM. Bei exakt ganzzahligem Lag
+/// wird [`autokorrelation`] benutzt (gleiche Werte wie bisher).
+fn autokorrelation_f(werte: &[f32], lag: f32) -> f32 {
+    if !lag.is_finite() || lag < 1.0 {
+        return 0.0;
+    }
+    let ganz = lag.floor();
+    let frac = lag - ganz;
+    let i0 = ganz as usize;
+    if frac < 1e-6 {
+        return autokorrelation(werte, i0);
+    }
+    if i0 + 1 >= werte.len() {
+        return 0.0;
+    }
+    let n = werte.len() - i0 - 1;
+    let (mut summe, mut aa, mut bb) = (0.0f64, 0.0f64, 0.0f64);
+    for i in 0..n {
+        let a = werte[i] as f64;
+        let b = werte[i + i0] as f64 * (1.0 - frac as f64)
+            + werte[i + i0 + 1] as f64 * frac as f64;
         summe += a * b;
         aa += a * a;
         bb += b * b;
@@ -796,6 +906,187 @@ mod tests {
         assert_eq!(konfidenz(&takt, 30.0, 1000.0), 0.0);
         assert_eq!(konfidenz(&[], 30.0, 120.0), 0.0);
         assert_eq!(konfidenz(&takt, 0.0, 120.0), 0.0);
+    }
+
+    #[test]
+    fn dauer_text_zeigt_sekunden_oder_unbekannt() {
+        // Punkt 9: die Brücke liefert Millisekunden, geloggt wird „12.3 s“.
+        assert_eq!(dauer_text(Some(12.34)), "12.3 s");
+        assert_eq!(dauer_text(Some(0.4)), "0.4 s");
+        assert_eq!(dauer_text(Some(3725.5)), "3725.5 s");
+        // Unbekannt ist alles, was keine brauchbare Dauer ist: fehlend,
+        // Retriever-Nullwert, NaN/unendlich und negative Werte.
+        assert_eq!(dauer_text(None), "unbekannt");
+        assert_eq!(dauer_text(Some(0.0)), "unbekannt");
+        assert_eq!(dauer_text(Some(0.04)), "unbekannt");
+        assert_eq!(dauer_text(Some(-2.0)), "unbekannt");
+        assert_eq!(dauer_text(Some(f32::NAN)), "unbekannt");
+        assert_eq!(dauer_text(Some(f32::INFINITY)), "unbekannt");
+    }
+
+    /// Pulszug mit beliebiger (auch nicht ganzzahliger) Periode: je Schlag ein
+    /// Plateau der Breite `breite` Frames, dazwischen 0; `rausch` legt
+    /// gleichverteiltes Rauschen (±0,5·rausch) darüber.
+    fn puls(bpm: f32, fps: f32, sekunden: f32, breite: usize, rausch: f32) -> Vec<f32> {
+        let n = (fps * sekunden) as usize;
+        let periode = 60.0 * fps / bpm;
+        let roh = rauschen(n);
+        let mut v = vec![0.0f32; n];
+        let mut k = 0usize;
+        loop {
+            let start = (k as f32 * periode).round() as usize;
+            if start >= n {
+                break;
+            }
+            for i in start..(start + breite).min(n) {
+                v[i] = 1.0;
+            }
+            k += 1;
+        }
+        for (i, wert) in v.iter_mut().enumerate() {
+            *wert += rausch * roh[i];
+        }
+        v
+    }
+
+    #[test]
+    fn puls_mit_krummer_periode_bleibt_im_takt() {
+        // 128 BPM bei 20 fps sind 9,375 Frames je Schlag — kein ganzzahliger
+        // Lag. Die Autokorrelation ist deshalb beim Dreifachen (Lag 28)
+        // stärker als beim Fundament (Lag 9); früher kam 42,7 BPM heraus.
+        let werte = puls(128.0, 20.0, 20.0, 2, 0.05);
+        let bpm = bpm_aus_frames(&werte, 20.0).expect("128 BPM im Pulszug");
+        assert!((bpm - 128.0).abs() < 2.0, "erwartet 128, war {bpm}");
+    }
+
+    #[test]
+    fn puls_140_bei_20_fps_faellt_nicht_auf_halbzeit() {
+        // 140 BPM liegen bei 20 fps bei 8,57 Frames; der stärkste ganzzahlige
+        // Lag ist 17 (zwei Schläge) — das ist 70 BPM. Der halbe Wert darf
+        // nicht gewinnen, wenn er nur vom Lag-Raster kommt.
+        let werte = puls(140.0, 20.0, 20.0, 2, 0.1);
+        let bpm = bpm_aus_frames(&werte, 20.0).expect("140 BPM im Pulszug");
+        assert!((bpm - 140.0).abs() < 3.0, "erwartet 140, war {bpm}");
+    }
+
+    #[test]
+    fn puls_bei_50_und_100_hz_abtastung() {
+        // Dieselbe Helligkeitsfolge mit 50 und 100 Bildern je Sekunde
+        // abgetastet (Kameras/Anzeigen liefern beides): das Tempo bleibt.
+        for fps in [50.0f32, 100.0] {
+            let werte = puls(120.0, fps, 12.0, 2, 0.05);
+            let bpm = bpm_aus_frames(&werte, fps).expect("120 BPM bei {fps} fps");
+            assert!(
+                (bpm - 120.0).abs() < 1.5,
+                "{fps} fps: erwartet 120, war {bpm}"
+            );
+        }
+    }
+
+    #[test]
+    fn verrauschter_puls_wird_noch_erkannt() {
+        // SNR unter 1: die Helligkeit schwankt stärker als der Schlag
+        // (Rauschen ±0,2 um einen Puls der Höhe 1). Der Takt muss bleiben,
+        // aber die Konfidenz darf kleiner sein als beim sauberen Puls.
+        let werte = puls(120.0, 30.0, 12.0, 2, 0.4);
+        let bpm = bpm_aus_frames(&werte, 30.0).expect("verrauschter 120er-Puls");
+        assert!((bpm - 120.0).abs() < 2.0, "erwartet 120, war {bpm}");
+        let k = konfidenz(&werte, 30.0, bpm);
+        assert!(k > 0.3, "der Puls muss noch überzeugen, war {k}");
+    }
+
+    #[test]
+    fn verrauschter_takt_bleibt_trotz_drift_erkannt() {
+        // Ein echter Videotakt mit Belichtungsdrift und Rauschen: die
+        // Ausgleichsgerade nimmt die Drift, der Puls bleibt.
+        let mut werte = puls(100.0, 25.0, 16.0, 3, 0.3);
+        for (i, v) in werte.iter_mut().enumerate() {
+            *v += 0.8 * i as f32 / 400.0;
+        }
+        let bpm = bpm_aus_frames(&werte, 25.0).expect("Puls unter der Drift");
+        assert!((bpm - 100.0).abs() < 2.5, "erwartet 100, war {bpm}");
+    }
+
+    #[test]
+    fn betonter_takt_bleibt_bei_seinem_tempo() {
+        // Jeder vierte Schlag ist stärker (Taktbetonung, wie eine Kick auf
+        // der Eins). Der stärkste Autokorrelations-Peak liegt dadurch beim
+        // Takt (vier Schläge), das Tempo muss trotzdem der Schlag bleiben.
+        let mut werte = puls(160.0, 30.0, 20.0, 2, 0.05);
+        let periode = 60.0 * 30.0 / 160.0;
+        let mut k = 0usize;
+        loop {
+            let start = (k as f32 * periode).round() as usize;
+            if start >= werte.len() {
+                break;
+            }
+            if k % 4 == 0 {
+                for i in start..(start + 2).min(werte.len()) {
+                    werte[i] = 1.0;
+                }
+            } else {
+                for i in start..(start + 2).min(werte.len()) {
+                    werte[i] = werte[i].min(0.55);
+                }
+            }
+            k += 1;
+        }
+        let bpm = bpm_aus_frames(&werte, 30.0).expect("betonter 160er-Takt");
+        assert!((bpm - 160.0).abs() < 3.0, "erwartet 160, war {bpm}");
+    }
+
+    #[test]
+    fn taktloses_rauschen_mit_drift_bleibt_none() {
+        // Verrauschte, driftende Helligkeit ohne Puls (Gegenprobe zu den
+        // Puls-Tests): kein lokales Maximum mit Prominenz.
+        let roh = rauschen(600);
+        let mut stand = 0.0f32;
+        let reihe: Vec<f32> = roh
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                stand = 0.97 * stand + r;
+                stand + 0.3 * i as f32 / 600.0
+            })
+            .collect();
+        assert!(
+            bpm_aus_frames(&reihe, 30.0).is_none(),
+            "Rauschen mit Drift ist kein Takt"
+        );
+    }
+
+    /// Netzflimmern mit fester Frequenz und beliebiger Phase (Cosinus): eine
+    /// Sinus-Reihe mit Phase 0 trifft bei 50 Hz / 20 fps zufällig genau die
+    /// Nullstellen und wäre konstant.
+    fn flimmern(hz: f32, fps: f32, sekunden: f32) -> Vec<f32> {
+        let n = (fps * sekunden) as usize;
+        (0..n)
+            .map(|i| {
+                // In f64 rechnen: 100 Hz bei 20 fps sind exakt 5 Perioden je
+                // Frame; in f32 bliebe ein Rundungsrest, der nach dem
+                // Detrenden wie ein Takt aussähe.
+                let t = i as f64 / fps as f64;
+                let phase = 2.0 * std::f64::consts::PI * hz as f64 * t + 0.7;
+                (0.5 + 0.5 * phase.cos()) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flimmern_bei_50_und_100_hz_liefert_nichts() {
+        // Netzflimmern: 50 Hz bzw. 100 Hz Helligkeit, mit 20/30 fps
+        // abgetastet. 50 Hz wird bei 20 fps zum Alias von 10 Hz (Periode 2
+        // Frames) = 600 BPM — viermal über dem Bereich. Die Halbzeit-Faltung
+        // darf daraus kein „150 BPM“ machen: das ist ein Vielfaches des
+        // Alias, kein Takt. Echte 300 BPM (eine Oktave über dem Bereich)
+        // werden weiterhin auf 150 gefaltet (siehe `bereich_grenzt…`).
+        for (hz, fps) in [(50.0f32, 20.0f32), (100.0, 20.0), (50.0, 30.0), (100.0, 30.0)] {
+            let werte = flimmern(hz, fps, 12.0);
+            assert!(
+                bpm_aus_frames(&werte, fps).is_none(),
+                "{hz} Hz Flimmern bei {fps} fps ist kein Takt"
+            );
+        }
     }
 
     #[test]

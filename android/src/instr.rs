@@ -90,6 +90,12 @@ pub fn spielen_mit_kanaelen(
     let note = note.clamp(0, 119);
     let mut kanaele = Vec::new();
     for index in &liste {
+        // Ein getauschtes Sample hat Vorrang („instr. sampletausch"): es klingt
+        // statt des Modul-Instruments. Sonst wuerde der Tausch zwar angezeigt,
+        // beim Spielen aber weiter das alte Modul-Sample zu hoeren sein.
+        if crate::slicer::instrument_sample_spielen(*index as usize, note) {
+            continue;
+        }
         if let Some(kanal) = quelle.note_spielen(*index, note, volume) {
             kanaele.push(kanal);
         }
@@ -100,6 +106,51 @@ pub fn spielen_mit_kanaelen(
 /// Voreinstellung fuer einen noch leeren Bereich: C-4 bis C-5.
 const VON_STANDARD: i32 = 60;
 const BIS_STANDARD: i32 = 72;
+
+/// Was der Tab vom Aufrufer möchte (Datei-Browser öffnen).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Aktion {
+    Keine,
+    /// „Sample…" in Zeile `index`: Audiodatei wählen und als Sample dieses
+    /// Instruments einsetzen.
+    SampleWaehlen(usize),
+}
+
+/// Ein Sample aus einer Datei als Sample von Instrument `index` einsetzen
+/// (0-basiert wie [`Eintrag::index`]).
+///
+/// Warum über den Slicer: dort liegt die Ablage, die der Klangweg liest
+/// (`crate::slicer::setze_sample_pfad`/`instrument_sample_spielen`). Der
+/// Instrument-Tab schreibt nur hinein — so klingt der Tausch sofort im
+/// Rhythmus-Tab und im Bild-Scan, ohne dass beide Seiten dieselbe Datei
+/// bearbeiten.
+pub fn sample_tauschen(index: usize, pfad: &str) -> Result<String, String> {
+    let datei = std::path::Path::new(pfad)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| pfad.to_string());
+    crate::slicer::setze_sample_pfad(index, pfad)?;
+    let dauer = crate::slicer::sample_fuer_instrument(index)
+        .map(|s| s.pcm.len() as f64 / f64::from(s.rate.max(1)))
+        .unwrap_or(0.0);
+    info!(
+        "instr: Sample fuer Instrument {} getauscht ({datei}, {dauer:.1} s)",
+        index + 1
+    );
+    Ok(format!(
+        "Instrument {}: Sample getauscht ({datei}, {dauer:.1} s)",
+        index + 1
+    ))
+}
+
+/// Den Tausch eines Instruments wieder entfernen.
+pub fn tausch_entfernen(index: usize) -> bool {
+    let entfernt = crate::slicer::tausch_loeschen(index);
+    if entfernt {
+        info!("instr: Sample fuer Instrument {} entfernt", index + 1);
+    }
+    entfernt
+}
 
 /// Kompakte Anzeige der Bereiche eines Eintrags fuer die Listenzeile.
 fn bereiche_text(e: &Eintrag) -> String {
@@ -175,11 +226,12 @@ impl InstrumentPanel {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, quelle: Option<&ModulQuelle>) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, quelle: Option<&ModulQuelle>) -> Aktion {
+        let mut aktion = Aktion::Keine;
         ui.heading("Instrumente & Samples");
         let Some(quelle) = quelle else {
             ui.label("Kein Modul geladen — im Player-Tab ein Modul laden.");
-            return;
+            return aktion;
         };
         ui.horizontal(|ui| {
             if ui.selectable_label(!self.samples, "Instrumente").clicked() {
@@ -205,6 +257,14 @@ impl InstrumentPanel {
             .small()
             .color(egui::Color32::DARK_GRAY),
         );
+        ui.label(
+            egui::RichText::new(
+                "„Sample…“ ersetzt das Sample eines Instruments durch eine Audiodatei \
+                 (WAV/MP3/…): beim Spielen dieses Instruments klingt die Datei, nicht das Modul.",
+            )
+            .small()
+            .color(egui::Color32::GRAY),
+        );
 
         // Liste des Moduls holen und die Zuordnung angleichen.
         let liste_quelle: Vec<(i32, String)> = if self.samples {
@@ -218,7 +278,7 @@ impl InstrumentPanel {
             } else {
                 "Das Modul hat keine Instrumente (MOD/S3M haben nur Samples)."
             });
-            return;
+            return aktion;
         }
         let mut liste = eintraege();
         let passt = liste.len() == liste_quelle.len()
@@ -327,7 +387,7 @@ impl InstrumentPanel {
             .id_salt("instr_liste")
             .show(ui, |ui| {
                 for (i, e) in liste.iter_mut().enumerate() {
-                    // Zeile 1: Haken, Name, kompakte Anzeige der Bereiche.
+                    // Zeile 1: Haken, Name, getauschtes Sample, „Sample…".
                     ui.horizontal(|ui| {
                         if let Some(m) = self.markiert.get_mut(i) {
                             ui.checkbox(m, "");
@@ -336,6 +396,45 @@ impl InstrumentPanel {
                         ui.label(
                             egui::RichText::new(format!("{:>3} {}", e.index + 1, kurz)).small(),
                         );
+                        // Ein getauschtes Sample wird mit Name und Dauer
+                        // angezeigt — so sieht man, dass dieses Instrument
+                        // nicht mehr das Modul-Sample spielt.
+                        if let Some(sample) = crate::slicer::sample_fuer_instrument(e.index as usize)
+                        {
+                            let dauer = sample.pcm.len() as f64 / f64::from(sample.rate.max(1));
+                            ui.label(
+                                egui::RichText::new(format!("*{} ({dauer:.1} s)", sample.name))
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 220, 150)),
+                            );
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("getauschtes Sample entfernen")
+                                .clicked()
+                            {
+                                tausch_entfernen(e.index as usize);
+                                self.status =
+                                    format!("{}: getauschtes Sample entfernt", e.name);
+                            }
+                        }
+                        if ui
+                            .small_button(">")
+                            .on_hover_text("Note C-4 auf diesem Instrument spielen")
+                            .clicked()
+                        {
+                            // Vorschau: ein getauschtes Sample klingt genau wie
+                            // beim Spielen; sonst das Modul-Instrument.
+                            if !crate::slicer::instrument_sample_spielen(e.index as usize, 60) {
+                                quelle.note_spielen(e.index, 60, 0.8);
+                            }
+                        }
+                        if ui
+                            .small_button("Sample…")
+                            .on_hover_text("Audiodatei als Sample dieses Instruments einsetzen")
+                            .clicked()
+                        {
+                            aktion = Aktion::SampleWaehlen(e.index as usize);
+                        }
                         // Die Anzeige darf die Zeile nicht sprengen: sie wird
                         // am Zeilenende abgeschnitten (Werte stehen in den
                         // Reglern darunter).
@@ -419,5 +518,6 @@ impl InstrumentPanel {
                 .small()
                 .color(egui::Color32::GRAY),
         );
+        aktion
     }
 }

@@ -46,6 +46,13 @@ pub fn start(app: &android_activity::AndroidApp, pfad: &str, fps: u32) -> Result
     });
     match ergebnis {
         Some(Ok(())) => {
+            // Die Dauer kommt aus den Datei-Metadaten der Brücke. Eigene Zeile,
+            // damit sie im Logcat leicht zu greifen ist (Punkt 9: der
+            // Laub-Tab sampelt später über die ganze Länge).
+            info!(
+                "video: dauer={}",
+                jamcore::videotempo::dauer_text(dauer_s(app))
+            );
             info!("video start angefragt ({pfad}, {fps} fps)");
             Ok(())
         }
@@ -76,6 +83,54 @@ pub fn fps_setzen(app: &android_activity::AndroidApp, fps: u32) {
             );
         }
     });
+}
+
+/// Dauer der **laufenden** Videoquelle in Sekunden; `None` = unbekannt.
+///
+/// Warum die Brücke sie merkt: der Laub-Tab sampelt über die ganze Länge
+/// (`jamcore::laub::stichproben_zeiten(dauer_s, 30)`), und ein zweiter
+/// Dateizugriff aus Rust wäre teuer und fehleranfällig. Der Wert steht ab
+/// dem erfolgreichen [`start`] bereit und bleibt bis zum nächsten Start
+/// gültig (auch nach [`stop`]).
+pub fn dauer_s(app: &android_activity::AndroidApp) -> Option<f32> {
+    dauer_ms(app, None).map(|ms| ms as f32 / 1000.0)
+}
+
+/// Dauer einer beliebigen Videodatei in Sekunden; `None` = unbekannt oder
+/// nicht lesbar. Für Aufrufer, die die Länge **vor** dem Start brauchen
+/// (z.B. um die Zahl der Stichproben zu planen).
+pub fn dauer_s_von(app: &android_activity::AndroidApp, pfad: &str) -> Option<f32> {
+    dauer_ms(app, Some(pfad)).map(|ms| ms as f32 / 1000.0)
+}
+
+/// Millisekunden von der Brücke holen: ohne Pfad die gemerkte Dauer der
+/// laufenden Quelle, mit Pfad eine frische Messung. `< 0` (Java-Kennung für
+/// „unbekannt“) wird zu `None`.
+fn dauer_ms(app: &android_activity::AndroidApp, pfad: Option<&str>) -> Option<i64> {
+    let ergebnis = jniutil::with_env(app, |env, activity| {
+        use jni::objects::{JObject, JValue};
+
+        let klasse = klasse_holen(env, activity, "org.jamcore.app.VideoBridge").ok()?;
+        let wert = match pfad {
+            None => env.call_static_method(klasse, "dauerMs", "()J", &[]),
+            Some(pfad) => {
+                let name = env.new_string(pfad).ok()?;
+                env.call_static_method(
+                    klasse,
+                    "dauerMsVon",
+                    "(Ljava/lang/String;)J",
+                    &[JValue::Object(&JObject::from(name))],
+                )
+            }
+        };
+        let Ok(wert) = wert else {
+            jniutil::describe_and_clear(env);
+            return None;
+        };
+        let ms = wert.j().ok()?;
+        (ms > 0).then_some(ms)
+    });
+    ergebnis.flatten()
 }
 
 /// Von Java gemeldeter Zustand (z.B. Dekodierfehler).

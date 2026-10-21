@@ -1947,6 +1947,16 @@ impl RhythmPanel {
                 self.rueckgaengig_anwenden();
             }
         });
+        // Rückmeldung direkt unter dem Umschalter: vorher stand die Statuszeile
+        // ganz unten hinter allen Werkzeugen — nach „Akkord“/„Rückgängig“ sah
+        // man auf dem Handy nichts davon, weil der Tab nicht so weit scrollt.
+        if !self.status.is_empty() {
+            ui.label(
+                RichText::new(&self.status)
+                    .small()
+                    .color(Color32::from_rgb(170, 200, 225)),
+            );
+        }
 
         ui.horizontal(|ui| {
             // Acht Slots wie im Desktop-Recorder; gespeichert wird je Slot
@@ -2200,33 +2210,47 @@ impl RhythmPanel {
                     if ui.button("Slice hören").clicked() {
                         crate::slicer::slice_spielen(self.instrument as usize);
                     }
-                    // Nutzerwunsch „Slices kann noch max vol“: globale
-                    // Lautstaerke 0…200 % (Vorgabe 100 %) fuer **alle**
-                    // Slice-Wiedergaben. Der Wert liegt in `klang`, damit er
-                    // Tab-Wechsel und den Render-Thread ueberlebt.
-                    let mut prozent = crate::klang::slices_lautstaerke() as f32;
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut prozent, 0.0..=200.0)
-                                .suffix(" %")
-                                .text("Slices-Lautstärke"),
-                        )
-                        .changed()
-                    {
-                        crate::klang::slices_lautstaerke_setzen(prozent);
-                        self.status = format!("Slices-Lautstärke: {:.0} %", prozent.round());
-                    }
-                    if ui
-                        .small_button("Max")
-                        .on_hover_text("Slices-Lautstärke auf 200 %")
-                        .clicked()
-                    {
-                        crate::klang::slices_lautstaerke_setzen(200.0);
-                        self.status = "Slices-Lautstärke: 200 % (max)".to_string();
-                    }
                 }
             }
         });
+        // Nutzerwunsch „Slices kann noch max vol“: globale Lautstaerke 0…200 %
+        // (Vorgabe 100 %) fuer **alle** Slice-Wiedergaben. Der Wert liegt in
+        // `klang`, damit er Tab-Wechsel und den Render-Thread ueberlebt.
+        //
+        // Warum ausserhalb des „Slices“-Zweigs: `puffer_spielen` wendet den
+        // Wert auch auf **getauschte Samples** an (`Instr N ← Slice`), die bei
+        // Klangquelle „Modul-Samples“ klingen. Vorher war der Regler dort
+        // unsichtbar, obwohl er wirkte.
+        if crate::slicer::slice_anzahl() > 0 || !crate::slicer::getauschte_liste().is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Slices").small().color(Color32::GRAY));
+                let mut prozent = crate::klang::slices_lautstaerke() as f32;
+                if ui
+                    .add(
+                        egui::Slider::new(&mut prozent, 0.0..=200.0)
+                            .suffix(" %")
+                            .text("Lautstärke"),
+                    )
+                    .changed()
+                {
+                    crate::klang::slices_lautstaerke_setzen(prozent);
+                    self.status = format!("Slices-Lautstärke: {:.0} %", prozent.round());
+                }
+                if ui
+                    .small_button("Max")
+                    .on_hover_text("Slices-Lautstärke auf 200 %")
+                    .clicked()
+                {
+                    crate::klang::slices_lautstaerke_setzen(200.0);
+                    self.status = "Slices-Lautstärke: 200 % (max)".to_string();
+                }
+                ui.label(
+                    RichText::new("gilt für Slices und getauschte Samples")
+                        .small()
+                        .color(Color32::GRAY),
+                );
+            });
+        }
         // Kanalvergabe (Nutzerwunsch 2026-10-20): das Sample soll im Kanal
         // bleiben und nicht bei jeder Note wechseln. Die Reihenfolge der
         // Regeln ist wählbar; sie wirkt beim Verteilen und in der Wiedergabe
@@ -2579,7 +2603,8 @@ impl RhythmPanel {
             ui.add_space(4.0);
         }
 
-        ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
+        // Die Statuszeile steht oben unter dem Ansicht-Umschalter (sichtbar
+        // ohne Scrollen); hier bleibt nur der Hinweis auf den Ablageort.
         ui.label(
             RichText::new("CSV (Desktop-Format) und Clipboard-XML liegen im App-Ordner patterns/.")
                 .small()

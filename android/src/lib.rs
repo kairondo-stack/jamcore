@@ -20,6 +20,7 @@ mod mic;
 mod ordner;
 mod osc;
 mod paths;
+mod pipeline;
 mod player;
 mod quint;
 mod rhythm;
@@ -88,6 +89,11 @@ struct JamApp {
     browser_bild: Option<browser::Browser>,
     /// Datei-Browser des Laub-Tabs („Video laden …"), offen solange `Some`.
     browser_video: Option<browser::Browser>,
+    /// Datei-Browser des Instr-Tabs („Sample…"): offen solange `Some`.
+    browser_instr: Option<browser::Browser>,
+    /// Welches Instrument (0-basiert) gerade ein Sample bekommen soll, während
+    /// `browser_instr` offen ist.
+    instr_tausch: Option<usize>,
     looping: bool,
     player: Option<player::Player>,
     instr: instr::InstrumentPanel,
@@ -128,6 +134,13 @@ struct JamApp {
     link: jamcore::rusty_link::AblLink,
     link_report: Instant,
     kamera_laeuft: bool,
+    /// Kameraframes beim letzten Anzeigeframe und deren Zeitpunkt: die
+    /// Pipeline markiert „Kamera läuft" daran (die Kamera kann auch im
+    /// Bild-Tab starten).
+    kamera_frames: u64,
+    kamera_frame_zeit: Instant,
+    /// Export-Bereich im Überblick (Datum/Quelle/Notiz, Order, Sichern).
+    export: pipeline::ExportPanel,
     /// „Alle Dateien" (`MANAGE_EXTERNAL_STORAGE`) erteilt? Wird einmal pro
     /// Sekunde neu geprüft, damit die Anzeige nach dem Besuch der Systemseite
     /// umspringt (Nutzerentscheidung D2, 2026-10-16).
@@ -152,6 +165,8 @@ impl Default for JamApp {
             browser_audio: None,
             browser_bild: None,
             browser_video: None,
+            browser_instr: None,
+            instr_tausch: None,
             looping: true,
             player: None,
             instr: instr::InstrumentPanel::default(),
@@ -188,6 +203,9 @@ impl Default for JamApp {
             },
             link_report: Instant::now(),
             kamera_laeuft: false,
+            kamera_frames: 0,
+            kamera_frame_zeit: Instant::now(),
+            export: pipeline::ExportPanel::new(),
             ordner_erlaubt: false,
             ordner_pruefung: Instant::now(),
         }
@@ -321,6 +339,21 @@ impl eframe::App for JamApp {
                 if link_support::aktivieren(&app).is_ok() {
                     self.multicast_aktiv = true;
                 }
+            }
+        }
+        // Pipeline: neue Kameraframes bemerken, egal in welchem Tab die Kamera
+        // gestartet wurde. Die Markierung „Kamera läuft" gilt eine Sekunde
+        // nach dem letzten neuen Frame — ein abgestürzter Decoder bleibt so
+        // nicht für immer grün.
+        let (frames, _, _) = camera::stand();
+        if frames != self.kamera_frames {
+            let erster = self.kamera_frames == 0;
+            self.kamera_frames = frames;
+            self.kamera_frame_zeit = Instant::now();
+            // Die ersten Bilder nach dem Start machen die Kamera zur aktuellen
+            // Quelle (sonst stünde im Export noch das zuletzt geladene Bild).
+            if erster {
+                pipeline::quelle_setzen("kamera", "livebild");
             }
         }
         // S2b-Spike: einmal pro Sekunde den Link-Zustand ins Log, damit der
@@ -504,6 +537,8 @@ impl eframe::App for JamApp {
             let mut offen = true;
             let gewaehlt = browser.ui(ui.ctx(), &mut offen);
             if let Some(path) = gewaehlt {
+                // Quelle für die .it-Meta-Zeilen merken („zu welchem Bild").
+                pipeline::quelle_setzen("bild", &path.display().to_string());
                 self.laub.laden(&path.display().to_string());
                 offen = false;
             }
@@ -520,11 +555,32 @@ impl eframe::App for JamApp {
             let gewaehlt = browser.ui(ui.ctx(), &mut offen);
             if let Some(path) = gewaehlt {
                 self.status = format!("Video: {} — Bilder werden geprüft …", file_name(&path));
+                pipeline::quelle_setzen("video", &path.display().to_string());
                 self.laub.video_laden(&path.display().to_string());
                 offen = false;
             }
             if offen {
                 self.browser_video = Some(browser);
+            }
+        }
+
+        // Datei-Browser des Instr-Tabs („Sample…"): die gewählte Audiodatei
+        // ersetzt das Sample des Instruments. Die Ablage liegt im Slicer, der
+        // Klangweg liest sie beim Spielen dieses Instruments.
+        if let Some(mut browser) = self.browser_instr.take() {
+            let mut offen = true;
+            let gewaehlt = browser.ui(ui.ctx(), &mut offen);
+            if let Some(path) = gewaehlt {
+                if let Some(index) = self.instr_tausch.take() {
+                    match instr::sample_tauschen(index, &path.display().to_string()) {
+                        Ok(meldung) => self.status = meldung,
+                        Err(e) => self.status = format!("Sample-Tausch: {e}"),
+                    }
+                }
+                offen = false;
+            }
+            if offen {
+                self.browser_instr = Some(browser);
             }
         }
 
@@ -572,64 +628,121 @@ impl JamApp {
 
     fn view_ueberblick(&mut self, ui: &mut egui::Ui) {
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.label(
-                "Fertig: Modul-Player, OSC zu Renoise, Rhythmus-Raster, Tempo-Messung. \
-                 Es folgen: Bild/Scan (S7), Session (S9), Tagebuch (S10).",
-            );
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("Kamera an").clicked() {
-                    let ergebnis = match self.app() {
-                        Some(app) => camera::start(app),
-                        None => Err("keine Activity".to_string()),
-                    };
-                    match ergebnis {
-                        Ok(()) => {
-                            self.kamera_laeuft = true;
-                            self.status = "Kamera startet …".to_string();
+            // Der Überblick ist die zentrale Seite (Kamera, Module, Pipeline,
+            // Export) — auf dem Handy passt das nur mit Scrollen.
+            egui::ScrollArea::vertical()
+                .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
+                .id_salt("ueberblick_inhalt")
+                .show(ui, |ui| {
+                    ui.label(
+                        "Fertig: Modul-Player, OSC zu Renoise, Rhythmus-Raster, Tempo-Messung, \
+                         Bild/Scan, Laub, Slicer, Tagebuch. Die Pipeline unten zeigt, welche \
+                         Stufe gerade läuft.",
+                    );
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui.button("Kamera an").clicked() {
+                            let ergebnis = match self.app() {
+                                Some(app) => camera::start(app),
+                                None => Err("keine Activity".to_string()),
+                            };
+                            match ergebnis {
+                                Ok(()) => {
+                                    self.kamera_laeuft = true;
+                                    self.status = "Kamera startet …".to_string();
+                                }
+                                Err(e) => self.status = format!("Kamera: {e}"),
+                            }
                         }
-                        Err(e) => self.status = format!("Kamera: {e}"),
+                        if ui.button("Kamera aus").clicked() {
+                            if let Some(app) = self.app() {
+                                camera::stop(app);
+                            }
+                            self.kamera_laeuft = false;
+                            self.status = "Kamera gestoppt".to_string();
+                        }
+                        let (frames, breite, hoehe) = camera::stand();
+                        ui.label(format!("Kamera: {frames} Frames, {breite}x{hoehe}"));
+                    });
+                    ui.label(format!("Module gefunden: {}", self.modules.len()));
+                    if !self.module_hint.is_empty() {
+                        ui.label(&self.module_hint);
                     }
-                }
-                if ui.button("Kamera aus").clicked() {
-                    if let Some(app) = self.app() {
-                        camera::stop(app);
+                    ui.separator();
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.button("Module neu suchen").clicked() {
+                            self.scan_modules();
+                        }
+                        // „Alle Dateien" (D2): Systemseite für dieses Paket öffnen.
+                        if ui.button("Ordner-Zugriff erlauben").clicked() {
+                            let ergebnis = match self.app() {
+                                Some(app) => ordner::einstellungen_oeffnen(app),
+                                None => Err("keine Activity".to_string()),
+                            };
+                            match ergebnis {
+                                Ok(()) => {
+                                    self.status =
+                                        "Systemseite für Alle Dateien geöffnet".to_string()
+                                }
+                                Err(e) => self.meldung = format!("Ordner-Zugriff: {e}"),
+                            }
+                        }
+                        let stand = zugriff_text(self.ordner_erlaubt);
+                        ui.label(format!("Alle Dateien: {stand}"));
+                    });
+                    if ui.button("Zum Player").clicked() {
+                        self.tab = Tab::Player;
+                        if self.modules.is_empty() {
+                            self.scan_modules();
+                        }
                     }
-                    self.kamera_laeuft = false;
-                    self.status = "Kamera gestoppt".to_string();
-                }
-                let (frames, breite, hoehe) = camera::stand();
-                ui.label(format!("Kamera: {frames} Frames, {breite}x{hoehe}"));
-            });
-            ui.label(format!("Module gefunden: {}", self.modules.len()));
-            if !self.module_hint.is_empty() {
-                ui.label(&self.module_hint);
-            }
-            ui.separator();
-            ui.horizontal_wrapped(|ui| {
-                if ui.button("Module neu suchen").clicked() {
-                    self.scan_modules();
-                }
-                // „Alle Dateien" (D2): Systemseite für dieses Paket öffnen.
-                if ui.button("Ordner-Zugriff erlauben").clicked() {
-                    let ergebnis = match self.app() {
-                        Some(app) => ordner::einstellungen_oeffnen(app),
-                        None => Err("keine Activity".to_string()),
+
+                    // ==== Pipeline: farbige Stufen mit Live-Markierung ====
+                    ui.separator();
+                    let kamera_aktiv = self.kamera_frame_zeit.elapsed()
+                        < std::time::Duration::from_secs(1);
+                    let video_aktiv = self.laub.video_laeuft();
+                    let live = pipeline::Live {
+                        kamera: kamera_aktiv || self.kamera_laeuft,
+                        video: video_aktiv,
+                        // Erkennung läuft nur, solange der Laub-Tab offen ist
+                        // und Bilder ankommen (dort rechnet `ui` je Frame).
+                        laub: self.tab == Tab::Laub && (kamera_aktiv || video_aktiv),
+                        // „Rendern" gehört zum Rhythmus-Tab; einen öffentlichen
+                        // Zustand gibt es dort nicht, der offene Tab ist der
+                        // sichtbare Hinweis.
+                        rhythmus: self.tab == Tab::Rhythmus,
+                        export: self.export.export_live(),
                     };
-                    match ergebnis {
-                        Ok(()) => self.status = "Systemseite für Alle Dateien geöffnet".to_string(),
-                        Err(e) => self.meldung = format!("Ordner-Zugriff: {e}"),
-                    }
-                }
-                let stand = zugriff_text(self.ordner_erlaubt);
-                ui.label(format!("Alle Dateien: {stand}"));
-            });
-            if ui.button("Zum Player").clicked() {
-                self.tab = Tab::Player;
-                if self.modules.is_empty() {
-                    self.scan_modules();
-                }
-            }
+                    egui::CollapsingHeader::new("Pipeline")
+                        .default_open(true)
+                        .id_salt("pipeline_kopf")
+                        .show(ui, |ui| {
+                            pipeline::ui_pipeline(ui, &live);
+                        });
+
+                    // ==== Export: Raster + Slices als .it mit Song-Message ====
+                    egui::CollapsingHeader::new("Export (.it mit Meta)")
+                        .default_open(true)
+                        .id_salt("export_kopf")
+                        .show(ui, |ui| {
+                            let rhythmus = self.rhythm.pattern().clone();
+                            let bild = self.bild.abschnitt_pattern(rhythmus.steps_per_cycle());
+                            let aktion = self.export.ui(ui, &rhythmus, &bild);
+                            if aktion == pipeline::Aktion::Sichern {
+                                match self.export.sichern(&rhythmus) {
+                                    Ok(pfad) => {
+                                        self.status = format!("IT gesichert: {pfad}");
+                                    }
+                                    Err(e) => {
+                                        pipeline::export_fehler(&e);
+                                        self.meldung = format!("IT-Export: {e}");
+                                        self.status = format!("IT-Export: {e}");
+                                    }
+                                }
+                            }
+                        });
+                });
         });
     }
 
@@ -1249,12 +1362,31 @@ impl JamApp {
     fn view_instr(&mut self, ui: &mut egui::Ui) {
         // Das Modul des Players an die Zuordnung reichen (Klon der Quelle).
         let quelle = self.player.as_ref().map(|p| p.modul_quelle());
+        let mut aktion = instr::Aktion::Keine;
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical()
                 .scroll_source(egui::scroll_area::ScrollSource::SCROLL_BAR)
                 .id_salt("instr_inhalt")
-                .show(ui, |ui| self.instr.ui(ui, quelle.as_ref()));
+                .show(ui, |ui| aktion = self.instr.ui(ui, quelle.as_ref()));
         });
+        // „Sample…": Audiodatei wählen; nach der Wahl ersetzt sie das Sample
+        // dieses Instruments (Ablage im Slicer, Klangweg liest sie).
+        if let instr::Aktion::SampleWaehlen(index) = aktion {
+            let start = match self.app() {
+                Some(app) => browser::startordner(app, browser::Filter::Audio),
+                None => Vec::new(),
+            };
+            self.instr_tausch = Some(index);
+            self.browser_instr = Some(browser::Browser::neu_audio(start));
+            self.status = format!(
+                "Instrument {}: Audiodatei für den Sample-Tausch wählen …",
+                index + 1
+            );
+            log::info!(
+                "instr: Sample-Auswahl fuer Instrument {} geoeffnet",
+                index + 1
+            );
+        }
     }
 
     fn view_player(&mut self, ui: &mut egui::Ui) {

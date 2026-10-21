@@ -4,6 +4,7 @@ import android.media.Image;
 import android.media.MediaCodec;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
+import android.media.MediaMetadataRetriever;
 import android.util.Log;
 
 import java.nio.ByteBuffer;
@@ -39,12 +40,20 @@ public final class VideoBridge {
     private static volatile int fps = 20;
     /** Drehung aus den Datei-Metadaten (KEY_ROTATION), 0/90/180/270. */
     private static volatile int drehung;
+    /**
+     * Dauer der zuletzt gestarteten Datei in Millisekunden; < 0 heisst
+     * unbekannt. Wird beim Start einmal ermittelt, damit die native Seite sie
+     * ohne zweiten Dateizugriff abholen kann (Laub-Tab sampelt ueber die
+     * ganze Laenge).
+     */
+    private static volatile long dauerMs = -1;
     private static String fehler = "";
 
     /** Startet die Wiedergabe der Datei; Rueckgabe "" oder Fehlertext. */
     public static synchronized String start(String pfad, int fpsWunsch) {
         stop();
         fehler = "";
+        dauerMs = -1;
         fps = Math.max(1, Math.min(60, fpsWunsch));
         try {
             extractor = new MediaExtractor();
@@ -66,6 +75,10 @@ public final class VideoBridge {
             }
             extractor.selectTrack(spur);
             String mime = format.getString(MediaFormat.KEY_MIME);
+            // Die Laenge gehoert zur Datei, nicht zum Dekoder: einmal beim
+            // Start messen (MediaMetadataRetriever liest den Container-Kopf)
+            // und fuer die native Seite bereithalten.
+            dauerMs = dauerMsVon(pfad);
             // Hochkant aufgenommene Videos tragen ihre Drehung nur als
             // Metadaten; der Dekoder liefert die Bilder ungedreht. Der Wert
             // geht je Bild an die native Seite (wie bei der Kamera).
@@ -83,7 +96,8 @@ public final class VideoBridge {
             running = true;
             thread = new Thread(VideoBridge::schleife, "jam-video");
             thread.start();
-            Log.i(TAG, "start " + pfad + " (" + mime + ", " + fps + " fps, rotation=" + drehung + ")");
+            Log.i(TAG, "start " + pfad + " (" + mime + ", " + fps + " fps, rotation=" + drehung
+                    + ", dauer=" + dauerMs + " ms)");
         } catch (Throwable e) {
             fehler = e.getClass().getSimpleName() + ": " + e.getMessage();
             Log.i(TAG, "start: " + fehler);
@@ -181,5 +195,40 @@ public final class VideoBridge {
 
     public static synchronized String status() {
         return fehler;
+    }
+
+    /**
+     * Dauer der zuletzt gestarteten Datei in Millisekunden; < 0 heisst
+     * unbekannt (noch kein Video gestartet oder Datei ohne Zeitangabe).
+     */
+    public static synchronized long dauerMs() {
+        return dauerMs;
+    }
+
+    /**
+     * Dauer einer Videodatei in Millisekunden ueber den Container-Kopf
+     * ({@link MediaMetadataRetriever}); < 0 heisst unbekannt. Oeffnet die
+     * Datei nur zum Lesen der Metadaten und laesst sie sofort wieder los —
+     * fuer Aufrufer, die die Laenge vor dem Start brauchen.
+     */
+    public static long dauerMsVon(String pfad) {
+        MediaMetadataRetriever leser = new MediaMetadataRetriever();
+        try {
+            leser.setDataSource(pfad);
+            String text = leser.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+            if (text == null) {
+                return -1;
+            }
+            long ms = Long.parseLong(text.trim());
+            return ms > 0 ? ms : -1;
+        } catch (Throwable e) {
+            Log.i(TAG, "Dauer: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            return -1;
+        } finally {
+            try {
+                leser.release();
+            } catch (Throwable ignored) {
+            }
+        }
     }
 }
