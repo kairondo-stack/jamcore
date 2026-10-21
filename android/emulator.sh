@@ -22,14 +22,16 @@
 #   shell              adb shell im Emulator
 #
 # Umgebung: AVD_NAME, SYSTEM_IMAGE (Default API 36 AOSP x86_64), DEVICE_PROFILE,
-#           GPU (Default swiftshader_indirect), PORT (Default 5554).
+#           GPU (Default host = echte GPU; swiftshader_indirect heizt die CPU:
+#           2026-10-21 gemessen 480–680 % statt 12 % und 82–89 °C statt 60 °C),
+#           PORT (Default 5554).
 set -euo pipefail
 
 ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 AVD_NAME="${AVD_NAME:-jamcore_api36}"
 SYSTEM_IMAGE="${SYSTEM_IMAGE:-system-images;android-36;default;x86_64}"
 DEVICE_PROFILE="${DEVICE_PROFILE:-pixel_6}"
-GPU="${GPU:-swiftshader_indirect}"
+GPU="${GPU:-host}"
 PORT="${PORT:-5554}"
 SERIAL="emulator-$PORT"
 LOG="${ANDROID_EMULATOR_HOME:-$ROOT/.android}/emulator.log"
