@@ -176,6 +176,9 @@ pub struct RhythmPanel {
     feinheit: u16,
     /// Laub-Rendern auf zwei Patterns verteilen (erste Hälfte / Rest).
     zwei_patterns: bool,
+    /// Wie viele Patterns „Rendern" hintereinander spielt (1 = nur das
+    /// aktuelle; macht Taktgruppen/Pools hörbar: Slot 1, 2, …).
+    kette: usize,
     /// Anzeige-Buendelung: so viele Schritte fasst eine Rasterzelle zusammen
     /// (1 = ein Schritt; 2, 4, 8, 16, 32 fuer lange Patterns).
     buendel: u16,
@@ -257,6 +260,7 @@ impl RhythmPanel {
             instrument: 0,
             feinheit: 16,
             zwei_patterns: false,
+            kette: 1,
             buendel: 1,
             skala: 0,
             grundton: 60,
@@ -701,10 +705,36 @@ impl RhythmPanel {
         if self.render_laeuft {
             return;
         }
-        let noten_roh: Vec<Note> = self.pattern().notes().to_vec();
+        let kette = self.kette.clamp(1, self.slots.len());
+        let noten_roh: Vec<Note> = {
+            // Kette: die ersten `kette` Patterns hintereinander (Taktgruppen
+            // hörbar machen). Jedes Pattern bringt seine eigene Länge mit.
+            if kette == 1 {
+                self.pattern().notes().to_vec()
+            } else {
+                let mut alle = Vec::new();
+                let mut versatz = 0u16;
+                for slot in self.slots.iter().take(kette) {
+                    let laenge = slot.steps_per_cycle().max(1);
+                    for n in slot.notes() {
+                        let mut n = n.clone();
+                        n.step = n.step.saturating_add(versatz);
+                        alle.push(n);
+                    }
+                    versatz = versatz.saturating_add(laenge);
+                }
+                alle
+            }
+        };
         // Die Laenge des Zyklus fuer den Render-Thread: die gemeinsame
-        // Patternlaenge (frueher fest 16).
-        let schritte = self.pattern().steps_per_cycle().max(1);
+        // Patternlaenge (frueher fest 16) — bei einer Kette die Summe.
+        let schritte = self
+            .slots
+            .iter()
+            .take(kette)
+            .map(|p| p.steps_per_cycle().max(1))
+            .fold(0u16, |a, b| a.saturating_add(b))
+            .max(1);
         if noten_roh.is_empty() {
             self.status = "Raster ist leer - nichts zu rendern.".to_string();
             return;
@@ -815,9 +845,11 @@ impl RhythmPanel {
                 self.render_schritt = schritt;
                 self.render_laeuft = true;
                 self.status = format!(
-                    "Rendern läuft ({anzahl} Noten auf {kanaele} Kanälen, {bpm:.0} BPM)"
+                    "Rendern läuft ({anzahl} Noten auf {kanaele} Kanälen, {kette} Pattern(s), {bpm:.0} BPM)"
                 );
-                info!("Rendern gestartet ({anzahl} Noten auf {kanaele} Kanälen)");
+                info!(
+                    "Rendern gestartet ({anzahl} Noten auf {kanaele} Kanälen, {kette} Pattern(s))"
+                );
             }
             Err(e) => self.status = format!("Rendern-Thread: {e}"),
         }
@@ -1613,49 +1645,50 @@ impl RhythmPanel {
             if ui.button("Interpolieren").clicked() {
                 self.interpolieren();
             }
-            ui.separator();
-            // Patternlaenge. Das Raster darunter, das Abspielen und der
-            // Maske-Tab (dessen Zeitabstaende) lesen dieselbe Zahl.
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Laenge");
-                let mut laenge = self.pattern().steps_per_cycle() as i32;
+        });
+        // Patternlaenge in eigener Zeile — im Querformat brach sie sonst
+        // mitten in den Werkzeugen um (Bündelung wurde zur Buchstabensäule).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Laenge");
+            let mut laenge = self.pattern().steps_per_cycle() as i32;
+            if ui
+                .add(egui::DragValue::new(&mut laenge).range(1..=MAX_STEPS_PER_CYCLE as i32))
+                .changed()
+            {
+                self.pattern_mut().set_steps_per_cycle(laenge as u16);
+                self.status = format!("Patternlaenge: {laenge} Schritte");
+            }
+            // Schnellwahl für lange Laub-Renderings: 128 (Vorgabe) und
+            // Vielfache davon; der aktuelle Wert bleibt hervorgehoben.
+            for wert in [64u16, 128, 192, 256, 384, 512] {
                 if ui
-                    .add(egui::DragValue::new(&mut laenge).range(1..=MAX_STEPS_PER_CYCLE as i32))
-                    .changed()
+                    .selectable_label(
+                        self.pattern().steps_per_cycle() == wert,
+                        wert.to_string(),
+                    )
+                    .clicked()
                 {
-                    self.pattern_mut().set_steps_per_cycle(laenge as u16);
-                    self.status = format!("Patternlaenge: {laenge} Schritte");
+                    self.pattern_mut().set_steps_per_cycle(wert);
+                    self.status = format!("Patternlaenge: {wert} Schritte");
                 }
-                // Schnellwahl für lange Laub-Renderings: 128 (Vorgabe) und
-                // Vielfache davon; der aktuelle Wert bleibt hervorgehoben.
-                for wert in [64u16, 128, 192, 256, 384, 512] {
-                    if ui
-                        .selectable_label(
-                            self.pattern().steps_per_cycle() == wert,
-                            wert.to_string(),
-                        )
-                        .clicked()
-                    {
-                        self.pattern_mut().set_steps_per_cycle(wert);
-                        self.status = format!("Patternlaenge: {wert} Schritte");
-                    }
+            }
+        });
+        // Anzeige-Buendelung: lange Patterns in weniger Zellen, ohne die
+        // Patternlaenge zu aendern (Nutzerentscheidung 2026-10-14).
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Bündelung");
+            for wert in [1u16, 2, 4, 8, 16, 32] {
+                if ui
+                    .selectable_label(self.buendel == wert, wert.to_string())
+                    .clicked()
+                {
+                    self.buendel = wert;
+                    self.status = format!("Bündelung: {wert} Schritt(e) je Zelle");
+                    info!("Buendelung: {wert}");
                 }
-            });
-            // Anzeige-Buendelung: lange Patterns in weniger Zellen, ohne die
-            // Patternlaenge zu aendern (Nutzerentscheidung 2026-10-14).
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Bündelung");
-                for wert in [1u16, 2, 4, 8, 16, 32] {
-                    if ui
-                        .selectable_label(self.buendel == wert, wert.to_string())
-                        .clicked()
-                    {
-                        self.buendel = wert;
-                        self.status = format!("Bündelung: {wert} Schritt(e) je Zelle");
-                        info!("Buendelung: {wert}");
-                    }
-                }
-            });
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
             ui.label("Bereich");
             ui.add(egui::DragValue::new(&mut self.bereich_von).range(0..=MAX_STEPS_PER_CYCLE - 1));
             ui.add(egui::DragValue::new(&mut self.bereich_bis).range(0..=MAX_STEPS_PER_CYCLE - 1));
@@ -1929,6 +1962,24 @@ impl RhythmPanel {
             // kann. Also nur anzeigen, woher er kommt.
             ui.label(
                 RichText::new(format!("{:.0} BPM (folgt App-Tempo)", self.render_bpm))
+                    .color(Color32::GRAY),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Kette").small().color(Color32::GRAY));
+            for wert in [1usize, 2, 3, 4, 8] {
+                if ui
+                    .selectable_label(self.kette == wert, wert.to_string())
+                    .on_hover_text("So viele Patterns spielt „Rendern“ hintereinander")
+                    .clicked()
+                {
+                    self.kette = wert;
+                    self.status = format!("Kette: {wert} Pattern(s)");
+                }
+            }
+            ui.label(
+                RichText::new(format!("{} / 8", self.kette))
+                    .small()
                     .color(Color32::GRAY),
             );
         });
