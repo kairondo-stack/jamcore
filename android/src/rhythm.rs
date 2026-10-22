@@ -9,7 +9,7 @@
 //! Der Austausch mit Renoise läuft über `jamcore::grid` (CSV wie im Desktop-
 //! Recorder, Clipboard-XML für den Import) und über OSC fürs sofortige Hören.
 
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,19 @@ const EUCLID_PITCH: i32 = ROWS[0];
 /// jede Note gleich. Vier Tonstufen lassen den Laub-Rhythmus melodisch
 /// wirken, ohne die Farbzuordnung (Instrument) zu verändern.
 const LAUB_STUFEN: [i32; 4] = [0, 3, 7, 12];
+
+/// Gewählter Tracker-Kanal als geteilter Wert für andere Tabs.
+///
+/// Warum ein `static` zusätzlich zum Feld: der Bild-Tab bekommt von der App
+/// nur das Pattern durchgereicht, nicht das Panel — genauso wie der Slicer sein
+/// Ziel-Instrument über `ZIEL_INSTRUMENT` teilt. Der Bild-Scan rendert ab
+/// diesem Kanal (Ring 0…63).
+static TRACKER_KANAL: AtomicU8 = AtomicU8::new(0);
+
+/// Startkanal für Bild-Noten: der im Rhythmus-Tab gewählte Kanal (0-basiert).
+pub fn tracker_kanal_gewaehlt() -> u8 {
+    TRACKER_KANAL.load(Ordering::Relaxed)
+}
 
 /// Tonhöhe einer Laub-Farbe auf der Schlagzeug-Zeile: [`EUCLID_PITCH`] plus
 /// Terz/Quinte/Oktave. Dieselbe Abbildung nutzen Pattern und Anhören, damit
@@ -995,14 +1008,18 @@ impl RhythmPanel {
         let transport = self.transport_mit;
         let klangquelle = self.klangquelle;
         let welle = self.welle;
-        // Feinheit: 16 Zeilen je Takt = 16tel, 32 = 32tel, 64 = 64tel. Die
-        // Zeilendauer ist 60/bpm / (feinheit/4) — bei 1/16 wie bisher 16tel.
-        let feinheit = self.feinheit.max(1);
+        // Feinheit: 16 Zeilen je Takt = 16tel, 32 = 32tel, 64 = 64tel. Der
+        // Render-Thread liest das Raster aus der gemeinsamen Uhr; hier bleibt
+        // nur die Kanalvergabe, die dieselbe Feinheit braucht.
         let modul = self.modul_quelle.clone();
         let stopp = Arc::new(AtomicBool::new(false));
         let schritt = Arc::new(AtomicU16::new(0));
         let stopp_c = Arc::clone(&stopp);
         let schritt_c = Arc::clone(&schritt);
+        // Vor dem Thread anmelden: der Thread prueft als Erstes, ob die Uhr
+        // laeuft. Erst hier, weil ein leerer Slot oben schon zurueckkehrt und
+        // die Uhr dann nicht ohne Klang weiterliefe.
+        crate::transport::teil_an(crate::transport::Teil::Rhythmus);
         let thread = std::thread::Builder::new()
             .name("jam-render".to_string())
             .spawn(move || {
@@ -1012,7 +1029,7 @@ impl RhythmPanel {
                         let _ = Renoise::new(o).transport_start(7000);
                     }
                 }
-                let mut i: u16 = 0;
+                let mut letzter: Option<u64> = None;
                 let mut klang_gemeldet = false;
                 info!(
                     "tracker: Wiedergabe {anzahl} Noten auf {kanaele} Kanälen (polyphon, {})",
@@ -1023,52 +1040,85 @@ impl RhythmPanel {
                     }
                 );
                 while !stopp_c.load(Ordering::Relaxed) {
-                    let start = Instant::now();
-                    // Alle Noten dieses Schritts klingen — auch mehrere auf
-                    // demselben Schritt aus verschiedenen Kanälen. Die
-                    // Klangwege nehmen keinen Kanal entgegen: das Modul vergibt
-                    // je Note einen freien Modul-Kanal, der Mixer je Note eine
-                    // Stimme; deshalb steht der Kanal nur im Log/Status.
-                    for (s, pitch, instrument, kanal) in &noten {
-                        if *s == i {
-                            let gespielt = match klangquelle {
-                                Klangquelle::Modul => {
-                                    crate::slicer::instrument_sample_spielen(
-                                        *instrument as usize,
-                                        *pitch,
-                                    ) || modul_gespielt(&modul, *pitch)
-                                }
-                                Klangquelle::Slices => {
-                                    crate::slicer::slice_spielen((*instrument).max(0) as usize)
-                                }
-                                Klangquelle::Welle => false,
-                            };
-                            if !gespielt {
-                                crate::klang::spielen_welle(*pitch, welle);
+                    // Die gemeinsame Uhr liefert die absolute Rasterposition.
+                    // Alle drei Erzeuger lesen dieselbe, deshalb laufen sie
+                    // phasengleich; eine eigene `Instant`-Schleife haette beim
+                    // zweiten Start einen Versatz erzeugt.
+                    if !crate::transport::laeuft() {
+                        break;
+                    }
+                    let position = crate::transport::position_jetzt();
+                    let absolut = position.floor().max(0.0) as u64;
+                    let mut zu_spielen: Vec<u64> = Vec::new();
+                    match letzter {
+                        // Erster Durchlauf: den aktuellen Schritt sofort
+                        // spielen, damit der Start nicht eine Zeile stumm
+                        // bleibt.
+                        None => zu_spielen.push(absolut),
+                        Some(letzte) if absolut > letzte => {
+                            // Nach einem Anzeige-Stall nicht alle verpassten
+                            // Schritte nachfeuern (Klangstau); die letzten 8
+                            // genuegen fuer den hoerbaren Anschluss.
+                            let aufholen = (absolut - letzte).min(8);
+                            for a in (absolut - aufholen + 1)..=absolut {
+                                zu_spielen.push(a);
                             }
-                            if !klang_gemeldet {
-                                let name = match (gespielt, klangquelle) {
-                                    (true, Klangquelle::Modul) => "Modul-Samples",
-                                    (true, Klangquelle::Slices) => "Slices",
-                                    _ => "Tongenerator",
+                        }
+                        _ => {}
+                    }
+                    for a in zu_spielen {
+                        let i = (a % schritte as u64) as u16;
+                        // Alle Noten dieses Schritts klingen — auch mehrere auf
+                        // demselben Schritt aus verschiedenen Kanälen. Die
+                        // Klangwege nehmen keinen Kanal entgegen: das Modul vergibt
+                        // je Note einen freien Modul-Kanal, der Mixer je Note eine
+                        // Stimme; deshalb steht der Kanal nur im Log/Status.
+                        for (s, pitch, instrument, kanal) in &noten {
+                            if *s == i {
+                                let gespielt = match klangquelle {
+                                    Klangquelle::Modul => {
+                                        crate::slicer::instrument_sample_spielen(
+                                            *instrument as usize,
+                                            *pitch,
+                                        ) || modul_gespielt(&modul, *pitch)
+                                    }
+                                    Klangquelle::Slices => {
+                                        crate::slicer::slice_spielen((*instrument).max(0) as usize)
+                                    }
+                                    Klangquelle::Welle => false,
                                 };
-                                info!(
-                                    "Klang: {name} (erster Ton auf Kanal {})",
-                                    *kanal as usize + 1
-                                );
-                                klang_gemeldet = true;
-                            }
-                            if let Some(o) = out.as_ref() {
-                                let _ = Renoise::new(o).note_on(7000, *pitch, 100);
+                                if !gespielt {
+                                    crate::klang::spielen_welle(*pitch, welle);
+                                }
+                                if !klang_gemeldet {
+                                    let name = match (gespielt, klangquelle) {
+                                        (true, Klangquelle::Modul) => "Modul-Samples",
+                                        (true, Klangquelle::Slices) => "Slices",
+                                        _ => "Tongenerator",
+                                    };
+                                    info!(
+                                        "Klang: {name} (erster Ton auf Kanal {})",
+                                        *kanal as usize + 1
+                                    );
+                                    klang_gemeldet = true;
+                                }
+                                if let Some(o) = out.as_ref() {
+                                    let _ = Renoise::new(o).note_on(7000, *pitch, 100);
+                                }
                             }
                         }
                     }
-                    schritt_c.store(i, Ordering::Relaxed);
-                    i = (i + 1) % schritte;
-                    // Zeilendauer bei bpm: 60/bpm / (feinheit/4) Sekunden.
-                    let ziel = (60_000.0 * 4.0 / (bpm * feinheit as f32)) as u64;
-                    let rest = ziel.saturating_sub(start.elapsed().as_millis() as u64);
-                    std::thread::sleep(Duration::from_millis(rest));
+                    letzter = Some(absolut);
+                    schritt_c.store((absolut % schritte as u64) as u16, Ordering::Relaxed);
+                    // Bis zur naechsten Rasterzeile schlafen, aber hoechstens
+                    // 20 ms: so greifen Stop und Tempoaenderung ohne spuerbare
+                    // Verzoegerung.
+                    let dauer = jamcore::transport::step_dauer(
+                        crate::transport::bpm(),
+                        crate::transport::feinheit(),
+                    );
+                    let rest = (1.0 - position.fract()) * dauer;
+                    std::thread::sleep(Duration::from_secs_f64(rest.clamp(0.001, 0.02)));
                 }
                 if transport {
                     if let Some(o) = out.as_ref() {
@@ -1089,7 +1139,11 @@ impl RhythmPanel {
                     "Rendern gestartet ({anzahl} Noten auf {kanaele} Kanälen, {kette} Pattern(s))"
                 );
             }
-            Err(e) => self.status = format!("Rendern-Thread: {e}"),
+            Err(e) => {
+                // Ohne Thread darf der Rhythmus nicht als „laeuft“ bleiben.
+                crate::transport::teil_aus(crate::transport::Teil::Rhythmus);
+                self.status = format!("Rendern-Thread: {e}");
+            }
         }
     }
 
@@ -1258,6 +1312,9 @@ impl RhythmPanel {
             let _ = thread.join();
         }
         self.render_laeuft = false;
+        // Der Rhythmus-Teil ist abgemeldet; laufen Bild oder Laub weiter,
+        // bleibt die gemeinsame Uhr stehen (Sync), sonst haelt sie an.
+        crate::transport::teil_aus(crate::transport::Teil::Rhythmus);
         self.status = "Rendern gestoppt.".to_string();
         info!("Rendern gestoppt");
     }
@@ -1270,6 +1327,14 @@ impl RhythmPanel {
             return;
         }
         if self.follow {
+            return;
+        }
+        // Laeuft der Rhythmus auf der gemeinsamen Uhr, zeigt der Playhead
+        // deren Phase — dieselbe wie Bild und Laub.
+        if crate::transport::teil_aktiv(crate::transport::Teil::Rhythmus)
+            && crate::transport::laeuft()
+        {
+            self.current_step = crate::transport::step_jetzt() % schritte;
             return;
         }
         let elapsed = self.clock.elapsed().as_secs_f32();
@@ -1518,10 +1583,32 @@ impl RhythmPanel {
             .copied()
     }
 
+    /// Im Tracker gewählter Kanal (0-basiert). Der Bild-Tab rendert ab hier.
+    pub fn tracker_kanal(&self) -> u8 {
+        self.tracker_kanal
+    }
+
+    /// Kanalwahl setzen und den geteilten Wert fortschreiben.
+    ///
+    /// Warum über eine Stelle: der Bild-Tab liest den Wert über
+    /// [`tracker_kanal_gewaehlt`]; jede Änderung (Zellwahl, „Kanal ±“) muss
+    /// dort ankommen, sonst rendert das Bild weiter ab dem alten Kanal.
+    fn tracker_kanal_setzen(&mut self, kanal: u8) {
+        let kanal = klemme_kanal(i32::from(kanal));
+        if kanal != self.tracker_kanal {
+            self.tracker_kanal = kanal;
+            TRACKER_KANAL.store(kanal, Ordering::Relaxed);
+            info!(
+                "tracker: Kanal {} gewählt (Bild rendert ab hier)",
+                kanal as usize + 1
+            );
+        }
+    }
+
     /// Zellwahl aus der Tracker-Ansicht (Tipp auf eine Zelle).
     fn tracker_zelle_waehlen(&mut self, step: u16, kanal: u8) {
         self.tracker_schritt = step % self.pattern().steps_per_cycle().max(1);
-        self.tracker_kanal = kanal;
+        self.tracker_kanal_setzen(kanal);
         let text = zelle_text(self.tracker_zelle().as_ref());
         info!(
             "tracker: Zelle Schritt {} Kanal {} gewählt ({})",
@@ -1611,7 +1698,7 @@ impl RhythmPanel {
 
     /// Gewählten Kanal verschieben (Knopf „Kanal ±“), 0…63 geklemmt.
     fn tracker_kanal_verschieben(&mut self, delta: i32) {
-        self.tracker_kanal = klemme_kanal(self.tracker_kanal as i32 + delta);
+        self.tracker_kanal_setzen(klemme_kanal(self.tracker_kanal as i32 + delta));
         self.tracker_status();
     }
 
@@ -2403,6 +2490,16 @@ impl RhythmPanel {
                     .color(Color32::GRAY),
             );
         });
+        // Gemeinsame Uhr: derselbe Text in allen drei Tabs, damit man sieht,
+        // was gerade mitspielt (auch aus einem anderen Tab).
+        ui.label(
+            RichText::new(format!(
+                "Transport: {}",
+                crate::transport::status_text()
+            ))
+            .small()
+            .color(Color32::GRAY),
+        );
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Kette").small().color(Color32::GRAY));
             for wert in [1usize, 2, 3, 4, 8] {

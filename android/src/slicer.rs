@@ -12,6 +12,10 @@
 //! - **Langes Tippen** (≥ 0,7 s ohne Bewegung) löscht den Slice unter dem
 //!   Finger (`slice::loesche`); der Knopf „× löschen" tut dasselbe für den
 //!   gewählten Slice.
+//! - **„Marker setzen"** teilt den Slice an der Auswahl und legt damit eine
+//!   **neue** Schnittmarke an; **„Marker löschen"** entfernt die Marke an der
+//!   Auswahl (die beiden Nachbar-Slices werden wieder eins). Beides ist
+//!   rückgängig-fähig (ein Schritt, wie die Werkzeuge).
 //! - Die **Nummernknöpfe** 1 … N (und „Vorhören") spielen einen Slice über
 //!   `klang::puffer_spielen` — dieselbe Funktion, die auch das Rhythmus-Raster
 //!   benutzt (Instrument-Quelle „Slices").
@@ -891,6 +895,148 @@ impl SlicerPanel {
         true
     }
 
+    /// Bezugsposition für „Marker setzen“/„Marker löschen“ in Proben
+    /// (`None` = keine Auswahl).
+    ///
+    /// Warum so: der Slicer hat keinen eigenen Cursor/Playhead — „aktuell“ ist
+    /// die Auswahl. Ein von Hand aufgezogener Bereich zählt ab seinem Anfang
+    /// (dort hat der Finger die Stelle bestimmt, und sie ist fast nie schon
+    /// eine Marke). Ohne Bereich ist der gewählte Slice die Auswahl; sein
+    /// Anfang ist bereits eine Marke, an der keine neue entstehen könnte,
+    /// deshalb die Mitte des Slice.
+    fn marker_position(&self) -> Option<usize> {
+        let len = self.laenge();
+        let (von, bis) = match self.bereich {
+            Some((von, bis)) => (von, bis),
+            None => {
+                let s = self.schnitte.get(self.auswahl)?;
+                (s.von, s.bis)
+            }
+        };
+        let (von, bis) = (von.min(len), bis.min(len));
+        if bis <= von {
+            return None;
+        }
+        Some(if self.bereich.is_some() {
+            von
+        } else {
+            von + (bis - von) / 2
+        })
+    }
+
+    /// Eine **neue** Schnittmarke an der Auswahl setzen: der Slice, in dem die
+    /// Position liegt, wird geteilt (aus einem Slice werden zwei).
+    ///
+    /// Warum Teilen und nicht [`Self::schnitt_setzen`]: das verschiebt die
+    /// nächstgelegene Marke, die Anzahl bleibt gleich. Der Wunsch war eine
+    /// **neue** Marke („noch einen Marker für den Slice“). Der Kern hat kein
+    /// `teile`; die Invariante der Liste (sortiert, lückenlos, mindestens ein
+    /// Sample je Slice) bleibt hier erhalten, weil nur an einer Stelle
+    /// `von < Position < bis` geteilt wird.
+    ///
+    /// Der Undo-Snapshot entsteht wie bei jeder Bearbeitung in
+    /// [`Self::bearbeitung_beginnen`] — Rückgängig nimmt auch die Marke zurück.
+    fn marker_setzen(&mut self) {
+        if self.laenge() == 0 {
+            self.status = "Kein Audio geladen — erst öffnen oder aufnehmen.".to_string();
+            return;
+        }
+        let Some(probe) = self.marker_position() else {
+            self.status = "Keine Auswahl für die Marke — erst einen Slice wählen.".to_string();
+            return;
+        };
+        let k = self.slice_bei(probe);
+        let Some(s) = self.schnitte.get(k).copied() else {
+            return;
+        };
+        let sekunden = self.sekunden(probe);
+        if probe <= s.von || probe >= s.bis {
+            // Auf einer vorhandenen Grenze gibt es nichts zu teilen (und an
+            // den Rändern der Probe erst recht nicht).
+            self.status = format!("Bei {sekunden:.2} s ist schon eine Marke.");
+            info!("slicer: Marke bei {sekunden:.2} s ist schon da");
+            return;
+        }
+        self.bearbeitung_beginnen();
+        self.schnitte[k].bis = probe;
+        self.schnitte.insert(
+            k + 1,
+            Slice {
+                von: probe,
+                bis: s.bis,
+            },
+        );
+        // Eine ausdrückliche Bereichsauswahl bleibt Auswahl; der gewählte
+        // Slice bleibt der linke Teil (die Marke ist seine neue Grenze).
+        if self.auswahl > k {
+            self.auswahl += 1;
+        }
+        self.nach_bearbeitung(false);
+        self.status = format!(
+            "Marker bei {sekunden:.2} s gesetzt ({} Slices).",
+            self.schnitte.len()
+        );
+        info!(
+            "slicer: Marker bei {sekunden:.2} s gesetzt ({} Slices)",
+            self.schnitte.len()
+        );
+    }
+
+    /// Die Marke an der Auswahl löschen (die beiden Nachbar-Slices werden
+    /// wieder einer).
+    ///
+    /// Welche Marke: die inneren Grenzen sind `schnitte[i].bis` für
+    /// `i = 0 … n−2` (Anfang und Ende der Probe sind keine Schnittmarken).
+    /// - von Hand aufgezogener Bereich: die erste Marke an/über seinem Anfang
+    ///   (rechts davon), sonst die letzte;
+    /// - gewählter Slice: die Marke an seinem Anfang (`auswahl > 0`), beim
+    ///   ersten Slice die an seinem Ende — also immer die Marke, die zur
+    ///   Auswahl gehört, und nicht zufällig die Nachbarin.
+    ///
+    /// [`slice::loesche`] gibt den Bereich des entfernten Slices an den
+    /// vorherigen — genau dadurch verschwindet die Marke zwischen beiden.
+    fn marker_loeschen(&mut self) {
+        if self.laenge() == 0 {
+            self.status = "Kein Audio geladen — erst öffnen oder aufnehmen.".to_string();
+            return;
+        }
+        if self.schnitte.len() <= 1 {
+            self.status = "Keine Marke zum Löschen — der letzte Slice bleibt.".to_string();
+            return;
+        }
+        let k = if self.bereich.is_some() {
+            let Some(probe) = self.marker_position() else {
+                self.status = "Keine Auswahl für die Marke — erst einen Slice wählen.".to_string();
+                return;
+            };
+            let mut k = self.schnitte.len() - 2;
+            for i in 0..self.schnitte.len() - 1 {
+                if self.schnitte[i].bis >= probe {
+                    k = i;
+                    break;
+                }
+            }
+            k
+        } else if self.auswahl > 0 {
+            self.auswahl - 1
+        } else {
+            0
+        };
+        let sekunden = self.sekunden(self.schnitte[k].bis);
+        self.bearbeitung_beginnen();
+        slice::loesche(&mut self.schnitte, k + 1);
+        self.auswahl = self.auswahl.min(self.schnitte.len() - 1);
+        self.nach_bearbeitung(false);
+        self.status = format!(
+            "Marker bei {sekunden:.2} s gelöscht ({} Slices).",
+            self.schnitte.len()
+        );
+        info!(
+            "slicer: Marker bei {sekunden:.2} s geloescht ({} Slices)",
+            self.schnitte.len()
+        );
+    }
+
     /// Einen Slice vorhören — derselbe Weg wie die Raster-Noten
     /// (`klang::puffer_spielen`, einmal, mit der Rate des Audios).
     fn vorhoeren(&mut self, k: usize) {
@@ -1494,6 +1640,35 @@ impl SlicerPanel {
             });
         }
         let bereit = !self.schnitte.is_empty();
+        // Schnittmarken von Hand: „Marker setzen“ teilt die Auswahl (eine
+        // Marke mehr), „Marker löschen“ nimmt die Marke an der Auswahl weg
+        // (eine Marke weniger). Beide ändern kein Audio, sichern aber wie die
+        // Werkzeuge den Undo-Stand.
+        ui.horizontal_wrapped(|ui| {
+            let hat_audio = self.laenge() > 0;
+            if ui
+                .add_enabled(hat_audio, egui::Button::new("Marker setzen"))
+                .on_hover_text("Neue Schnittmarke an der Auswahl (Bereichsanfang bzw. Mitte des Slice)")
+                .clicked()
+            {
+                self.marker_setzen();
+            }
+            if ui
+                .add_enabled(
+                    hat_audio && self.schnitte.len() > 1,
+                    egui::Button::new("Marker löschen"),
+                )
+                .on_hover_text("Marke an der Auswahl entfernen (Nachbar-Slices werden eins)")
+                .clicked()
+            {
+                self.marker_loeschen();
+            }
+            ui.label(
+                RichText::new("Marke an der Auswahl")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(bereit, egui::Button::new("Vorhören"))
@@ -1567,7 +1742,10 @@ impl SlicerPanel {
             RichText::new(
                 "Wellenform: tippen setzt den Schnitt, ziehen zieht einen Bereich auf (Modus \
                  „Bereich“) oder verschiebt den nächsten Schnitt (Modus „Schnitt“), langes \
-                 Tippen löscht den Slice. „Bearbeiten“ wirkt auf die Auswahl, sonst auf den \
+                 Tippen löscht den Slice. „Marker setzen“ teilt die Auswahl an einer neuen \
+                 Marke (Bereichsanfang bzw. Mitte des Slice), „Marker löschen“ entfernt die \
+                 Marke an der Auswahl; „× löschen“ entfernt dagegen den ganzen Slice. \
+                 „Bearbeiten“ wirkt auf die Auswahl, sonst auf den \
                  gewählten Slice; „Rückgängig“ nimmt den letzten Schritt zurück. „Als .it \
                  sichern“ legt die Slices als Samples in <App-Ordner>/module/<Name>.it ab \
                  (im Player-Tab ladbar); das Rhythmus-Raster spielt sie über die Klangquelle \

@@ -16,6 +16,8 @@
 //! `schrittweite::timestamps`); die Wischgeschwindigkeit moduliert deren
 //! Krümmung.
 
+use std::sync::{Mutex, OnceLock};
+
 use eframe::egui::{self, Color32, RichText};
 use jamcore::grid::Pattern;
 use log::info;
@@ -35,6 +37,58 @@ pub const ZOOM_MAX: f32 = 4.0;
 /// Regenbogenfarbe fuer den Touch-Verlauf (0.0 = rot, 1.0 = violett).
 fn regenbogen(anteil: f32) -> Color32 {
     egui::ecolor::Hsva::new(anteil.clamp(0.0, 1.0) * 0.8, 0.85, 0.95, 1.0).into()
+}
+
+/// Farbe eines Verlaufsschritts aus seiner Tonhöhe. Tonklassen liegen
+/// nebeneinander im Regenbogen, damit die Blöcke einer M2-Aufnahme (8/4/6)
+/// auch als getrennte Blöcke erkennbar sind.
+pub fn verlauf_farbe(ton: i32) -> Color32 {
+    let anteil = ton.rem_euclid(12) as f32 / 12.0;
+    regenbogen(anteil)
+}
+
+/// Der gemeinsame Verlauf von Maske 1 und Maske 2 — **eine** Datenquelle,
+/// keine Kopie in den Panels (Nutzerentscheidung 2026-10-22).
+///
+/// Maske 2 schreibt die Schritte und die laufende Aufnahme, Maske 1 liest sie
+/// für die Vorschau und hält den gewählten Bereich. Der Bild-Scan bekommt die
+/// Zeitpunkte aus derselben Quelle (`Maske2Panel::zeiten`).
+#[derive(Clone, Debug, Default)]
+pub struct VerlaufZustand {
+    /// Festgehaltener Verlauf, ein Eintrag je Schritt: (Schrittnummer, Ton).
+    pub schritte: Vec<(u32, i32)>,
+    /// Gewählter Bereich `[von, bis)` aus Maske 1 für die nächste M2-Aufnahme.
+    pub bereich: Option<(u32, u32)>,
+    /// Laufende M2-Aufnahme als (Ton, Dauer) — für die Vorschau in Maske 1,
+    /// solange der Bereich noch nicht festgeschrieben ist.
+    pub entwurf: Vec<(i32, u32)>,
+}
+
+static VERLAUF: OnceLock<Mutex<VerlaufZustand>> = OnceLock::new();
+
+/// Der eine Verlaufs-Speicher. Panels sperren ihn nur kurz zum Lesen/Schreiben.
+pub fn verlauf_zustand() -> &'static Mutex<VerlaufZustand> {
+    VERLAUF.get_or_init(|| Mutex::new(VerlaufZustand::default()))
+}
+
+/// Kopie des Zustands fürs Zeichnen (die Sperre wird nicht über egui-Aufrufe
+/// gehalten, damit kein anderer Masken-Teil blockiert).
+pub fn verlauf_snapshot() -> VerlaufZustand {
+    verlauf_zustand()
+        .lock()
+        .map(|z| z.clone())
+        .unwrap_or_default()
+}
+
+/// Zeitpunkte eines Verlaufs für den Bild-Scan: ein Punkt je Schritt,
+/// gleichmäßig von 0 bis 1. Die Bild-Maske normiert die Spanne selbst.
+pub fn verlauf_zeiten(verlauf: &[(u32, i32)]) -> Vec<f32> {
+    let n = verlauf.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let letzte = (n - 1).max(1) as f32;
+    (0..n).map(|i| i as f32 / letzte).collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +160,9 @@ pub struct MaskePanel {
     /// Wann zuletzt etwas aufgenommen wurde — die zuletzt benutzte Maske
     /// speist den gruenen Balken im Bild-Tab.
     letzte_aenderung: Option<std::time::Instant>,
+    /// Erster Tipp im M2-Verlauf: der nächste Tipp setzt das Bereichsende.
+    /// Der fertige Bereich steht im gemeinsamen [`VerlaufZustand`].
+    verlauf_anker: Option<u32>,
 }
 
 impl Default for MaskePanel {
@@ -137,6 +194,7 @@ impl MaskePanel {
             pan: egui::Vec2::ZERO,
             sichtbar: egui::Rect::NOTHING,
             letzte_aenderung: None,
+            verlauf_anker: None,
         }
     }
 
@@ -173,6 +231,7 @@ impl MaskePanel {
         self.auswahl = None;
         self.fest = false;
         self.anker = None;
+        self.verlauf_anker = None;
         self.letzte_aenderung = Some(std::time::Instant::now());
         self.status = "neu — Feld tippen nimmt auf".to_string();
         info!("Maske: neu");
@@ -314,6 +373,152 @@ impl MaskePanel {
         }
     }
 
+    /// Der Verlauf aus Maske 2 in Maske 1: Blöcke je Schritt, der gewählte
+    /// Bereich und die laufende neue Aufnahme als Vorschau. Antippen setzt
+    /// Start und Ende; in M2 werden die Tasten dann in diesen Bereich gemappt.
+    fn verlauf_ui(&mut self, ui: &mut egui::Ui, breite: f32) {
+        let zustand = verlauf_snapshot();
+        let schritte = &zustand.schritte;
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Verlauf (Maske 2)").strong());
+            if !schritte.is_empty() {
+                ui.label(
+                    RichText::new(format!("{} Schritte", schritte.len()))
+                        .color(Color32::from_rgb(120, 230, 160)),
+                );
+            }
+            if zustand.bereich.is_some() && ui.button("Bereich weg").clicked() {
+                self.verlauf_anker = None;
+                if let Ok(mut z) = verlauf_zustand().lock() {
+                    z.bereich = None;
+                }
+                info!("maske: Bereich aufgehoben");
+            }
+        });
+
+        if schritte.is_empty() && zustand.entwurf.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Noch kein M2-Verlauf. In M2 Tasten mit ihrer Dauer tippen \
+                     (8 4 6 = 8+4+6 = 18 Schritte); der Verlauf erscheint hier.",
+                )
+                .small()
+                .color(Color32::DARK_GRAY),
+            );
+            return;
+        }
+
+        // Der Balken: ein Block je Schritt. 18 Schritte = 18 Blöcke, damit
+        // die Summe der Dauern direkt ablesbar ist.
+        let hoehe = 44.0;
+        let (leiste, painter) =
+            ui.allocate_painter(egui::vec2(breite, hoehe), egui::Sense::click());
+        let rect = leiste.rect;
+        let n = schritte.len();
+        if n > 0 {
+            let block = rect.width() / n as f32;
+            for (i, (_, ton)) in schritte.iter().enumerate() {
+                let r = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + i as f32 * block, rect.top()),
+                    egui::vec2((block - 0.5).max(1.0), rect.height()),
+                );
+                painter.rect_filled(r, 0.0, verlauf_farbe(*ton));
+            }
+
+            // Laufende M2-Aufnahme in den gewählten Bereich gemappt zeigen:
+            // so sieht man vor dem „Ende“ schon, was den Bereich ersetzt.
+            if let (Some((von, bis)), false) = (zustand.bereich, zustand.entwurf.is_empty()) {
+                let von = von.min(n as u32);
+                let bis = bis.min(n as u32);
+                if von < bis {
+                    let gemappt = jamcore::maske::dauern_auf_bereich(&zustand.entwurf, bis - von);
+                    let mut k = von as usize;
+                    for (ton, dauer) in gemappt {
+                        for _ in 0..dauer {
+                            if k >= n {
+                                break;
+                            }
+                            let r = egui::Rect::from_min_size(
+                                egui::pos2(rect.left() + k as f32 * block, rect.top()),
+                                egui::vec2((block - 0.5).max(1.0), rect.height()),
+                            );
+                            let c = verlauf_farbe(ton);
+                            painter.rect_filled(
+                                r,
+                                0.0,
+                                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150),
+                            );
+                            k += 1;
+                        }
+                    }
+                }
+            }
+
+            // Gewählter Bereich als Rahmen; Start/Ende stehen als Text dabei.
+            if let Some((von, bis)) = zustand.bereich {
+                let von = von.min(n as u32);
+                let bis = bis.min(n as u32);
+                if von < bis {
+                    let r = egui::Rect::from_min_max(
+                        egui::pos2(rect.left() + von as f32 * block, rect.top()),
+                        egui::pos2(rect.left() + bis as f32 * block, rect.bottom()),
+                    );
+                    painter.rect_stroke(
+                        r,
+                        2.0,
+                        egui::Stroke::new(2.5, Color32::WHITE),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+            }
+
+            // Antippen: erster Tipp = Start, zweiter = Ende (einschließlich).
+            // Der Bereich ist [Start, Ende+1), wie im Log „Bereich 4-12“.
+            if leiste.clicked() {
+                if let Some(pos) = leiste.interact_pointer_pos() {
+                    let anteil = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 0.9999);
+                    let index = (anteil * n as f32) as u32;
+                    match self.verlauf_anker.take() {
+                        None => {
+                            self.verlauf_anker = Some(index);
+                            if let Ok(mut z) = verlauf_zustand().lock() {
+                                z.bereich = None;
+                            }
+                            info!("maske: Bereichsstart {index} gewaehlt");
+                        }
+                        Some(start) => {
+                            let von = start.min(index);
+                            let bis = start.max(index) + 1;
+                            if let Ok(mut z) = verlauf_zustand().lock() {
+                                z.bereich = Some((von, bis));
+                            }
+                            info!("maske: Bereich {von}-{bis} gewaehlt");
+                        }
+                    }
+                }
+            }
+        }
+
+        ui.label(
+            RichText::new(match (zustand.bereich, self.verlauf_anker) {
+                (Some((von, bis)), _) => format!(
+                    "Bereich {von}-{bis} ({} Schritte): in M2 tippen und „Ende“ \
+                     drücken — die neue Gesamtzeit wird auf diese Bereichszeit gemappt.",
+                    bis - von
+                ),
+                (None, Some(start)) => {
+                    format!("Start bei Schritt {start}: jetzt das Ende antippen.")
+                }
+                (None, None) => {
+                    "Balken antippen: Start, nochmal antippen: Ende des Bereichs.".to_string()
+                }
+            })
+            .small()
+            .color(Color32::GRAY),
+        );
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
         ui.heading("Takt-Maske");
         ui.horizontal(|ui| {
@@ -338,6 +543,7 @@ impl MaskePanel {
                 self.spur.clear();
                 self.fest = false;
                 self.anker = None;
+                self.verlauf_anker = None;
                 self.letzte_aenderung = Some(std::time::Instant::now());
                 self.status = "Aufzeichnung geleert.".to_string();
             }
@@ -660,6 +866,10 @@ impl MaskePanel {
                 }
             }
         }
+
+        // Der Verlauf aus Maske 2 gehört zu dieser Maske: gleiche Datenquelle
+        // für Anzeige, Bereichsauswahl und die neue Aufnahme (Nutzer 2026-10-22).
+        self.verlauf_ui(ui, breite);
 
         // Min/max Schritte des angetippten Abschnitts. Die Rampe laeuft dann
         // von `min` nach `max`, statt die Feldwerte der beiden Tipps zu

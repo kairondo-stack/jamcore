@@ -27,6 +27,7 @@ use jamcore::oszillator::{
 use jamcore::scan::{verschiebe_bereich, verschiebe_position};
 use jamcore::scanmask::{Aufloesung, ScanMaske};
 use jamcore::spirale::{Familie, Spirale};
+use jamcore::tracker::KANAELE;
 
 use crate::camera;
 use crate::video;
@@ -306,24 +307,38 @@ fn rec_takte_text(schritte: u16) -> String {
 }
 
 /// Das Raster (`jamcore::grid::Pattern`) als IT-Pattern für die Aufnahme:
-/// eine Zeile je Schritt, **ein Kanal** (das Raster ist einstimmig — höchstens
-/// eine Note je Schritt), Note = Raster-Tonhöhe, Instrument = Slice-Nummer.
+/// eine Zeile je Schritt, **alle belegten Kanäle** — seit der Bild-Scan seine
+/// Noten ringförmig ab dem gewählten Kanal verteilt, liegen mehrere Noten auf
+/// einem Schritt. Ein einspuriges Pattern würde davon nur eine behalten und
+/// die Aufnahme ärmer machen als das Raster.
 ///
 /// IT zählt Samples 1-basiert, das Raster 0-basiert (Slice 0 = „Slice 1").
 /// Gibt es keine Samples, bleibt das Instrument leer — sonst zeigte die Note
 /// ins Leere.
 fn it_pattern_aus_raster(pattern: &Pattern, samples: usize) -> jamcore::itwrite::Pattern {
     let zeilen = pattern.steps_per_cycle().max(1);
-    let mut zellen = vec![jamcore::itwrite::Zelle::default(); zeilen as usize];
+    // Kanalzahl aus dem Raster (mindestens 1, höchstens die IT-Grenze 64).
+    let kanaele = pattern
+        .notes()
+        .iter()
+        .map(|n| n.channel as u16 + 1)
+        .max()
+        .unwrap_or(1)
+        .min(KANAELE as u16);
+    let mut zellen = vec![
+        jamcore::itwrite::Zelle::default();
+        zeilen as usize * kanaele as usize
+    ];
     for note in pattern.notes() {
         let step = (note.step % zeilen) as usize;
+        let kanal = (note.channel as usize).min(kanaele as usize - 1);
         let instrument = if samples > 0 {
             let nummer = note.instrument as usize + 1;
             (nummer <= samples).then_some(nummer as u8)
         } else {
             None
         };
-        zellen[step] = jamcore::itwrite::Zelle {
+        zellen[step * kanaele as usize + kanal] = jamcore::itwrite::Zelle {
             note: Some(note.pitch.clamp(0, 119) as u8),
             instrument,
             ..jamcore::itwrite::Zelle::default()
@@ -331,7 +346,7 @@ fn it_pattern_aus_raster(pattern: &Pattern, samples: usize) -> jamcore::itwrite:
     }
     jamcore::itwrite::Pattern {
         zeilen,
-        kanaele: 1,
+        kanaele,
         zellen,
     }
 }
@@ -771,6 +786,14 @@ pub struct ImagePanel {
     harmonie: jamcore::harmonie::Harmonie,
     /// Scan-Treffer ins Rhythmus-Pattern schreiben (Desktop: `L`/bpmo3).
     scan_aufnahme: bool,
+    /// Startkanal der Bild-Noten: der im Rhythmus-Tab gewählte Tracker-Kanal
+    /// (0-basiert, Anzeige/Log 1-basiert).
+    kanal_start: u8,
+    /// Ringzeiger der Kanalvergabe (0…63): der nächste Kandidat für eine Note.
+    kanal_ring: u8,
+    /// So viele Noten hat der laufende Durchlauf ins Pattern geschrieben —
+    /// Grundlage der Log-Zeile „bild: N Noten ab Kanal X (Ring) ins Pattern".
+    pattern_noten: u64,
     /// Aus der Masken-Folge berechnete Zeitpunkte (fuer Status/Log).
     tipp_zeiten: Vec<f32>,
     /// Klangquelle des Bild-Scans — gespiegelt aus dem Rhythmus-Tab, damit ein
@@ -799,6 +822,10 @@ pub struct ImagePanel {
     scan_x: i32,
     scan_puffer: Option<(usize, usize, Vec<u8>)>,
     scan_naechste_spalte: std::time::Instant,
+    /// Sweep-Durchlauf der gemeinsamen Uhr beim letzten Zeichnen. Ein Wechsel
+    /// bedeutet „ein Durchlauf ist zu Ende“ — so haengen Zaehler, Puffer und
+    /// Aufnahme am Takt der Uhr statt an einem eigenen `scan_x`-Rundlauf.
+    sweep_runde: u64,
     sweep_noten: u64,
     sweep_gezeichnet: u64,
     /// Stroboskop-Ansicht: das Bild liegt mehrfach und wird mit der
@@ -970,6 +997,9 @@ impl ImagePanel {
             finger: crate::touch::Mehrfinger::neu(),
             harmonie: jamcore::harmonie::Harmonie::default(),
             scan_aufnahme: false,
+            kanal_start: 0,
+            kanal_ring: 0,
+            pattern_noten: 0,
             tipp_zeiten: Vec::new(),
             tipp_status: String::new(),
             aufgenommen: 0,
@@ -982,6 +1012,7 @@ impl ImagePanel {
             scan_x: 0,
             scan_puffer: None,
             scan_naechste_spalte: std::time::Instant::now(),
+            sweep_runde: 0,
             sweep_noten: 0,
             sweep_gezeichnet: 0,
             strobo_an: false,
@@ -2090,6 +2121,85 @@ impl ImagePanel {
         }
     }
 
+    /// Eine Note des Bild-Scans ins Rhythmus-Pattern schreiben: ab dem im
+    /// Rhythmus-Tab gewählten Kanal ringförmig auf den nächsten **freien**
+    /// Kanal desselben Schritts.
+    ///
+    /// Warum nicht `Pattern::insert`: das ersetzt **alle** Noten des Schritts.
+    /// Eine Spalte liefert aber viele Treffer auf demselben Schritt — mit
+    /// `insert` blieb davon nur der letzte übrig („da kommen so wenig Noten
+    /// an"). `insert_zelle` setzt genau eine Zelle, und die Suche nach dem
+    /// freien Kanal verhindert, dass sich die Treffer eines Schritts
+    /// gegenseitig überschreiben. Sind alle 64 Kanäle belegt, ersetzt die Note
+    /// den Ring-Kandidaten — besser als sie ganz wegzuwerfen.
+    fn note_ins_pattern(&mut self, pattern: &mut Pattern, step: u16, pitch: i32) {
+        // Kanalwechsel im Rhythmus-Tab: der Ring beginnt wieder beim neuen
+        // Startkanal, nicht irgendwo im alten Umlauf.
+        let start = crate::rhythm::tracker_kanal_gewaehlt();
+        if start != self.kanal_start {
+            self.kanal_start = start;
+            self.kanal_ring = start;
+        }
+        // `insert_zelle` übersetzt den Schritt selbst in die Patternlänge; für
+        // die Frei-Prüfung muss dieselbe Zelle gefragt werden.
+        let ziel = pattern.abschnitt_step(step);
+        let mut kanal = self.kanal_ring;
+        for _ in 0..KANAELE {
+            if pattern.zelle(ziel, kanal).is_none() {
+                break;
+            }
+            kanal = (kanal + 1) % KANAELE;
+        }
+        pattern.insert_zelle(Note {
+            step,
+            instrument: 0,
+            pitch,
+            glide: false,
+            channel: kanal,
+        });
+        self.kanal_ring = (kanal + 1) % KANAELE;
+        self.pattern_noten += 1;
+        self.aufgenommen += 1;
+    }
+
+    /// Am Ende eines Durchlaufs melden, wie viele Noten ins Pattern kamen und
+    /// ab welchem Kanal sie verteilt wurden; der Zähler beginnt danach neu.
+    fn pattern_runde_melden(&mut self) {
+        if self.scan_aufnahme {
+            log::info!(
+                "bild: {} Noten ab Kanal {} (Ring) ins Pattern",
+                self.pattern_noten,
+                self.kanal_start as usize + 1
+            );
+        }
+        self.pattern_noten = 0;
+    }
+
+    /// Durchlauf und Zielspalte des Linien-Sweeps aus der gemeinsamen Uhr.
+    ///
+    /// Warum nicht mehr `scan_naechste_spalte` hochzaehlen: Der Sweep muss
+    /// dieselbe Phase haben wie Rhythmus und Laub. Die Uhr liefert Takte seit
+    /// dem gemeinsamen Start; geteilt durch die eingestellte Sweep-Dauer
+    /// (`takte`) ergibt das Durchlauf und Spalte. So startet ein Sweep, der
+    /// spaeter dazukommt, an der Stelle, an der die anderen gerade sind.
+    fn sweep_phase(&self) -> (u64, i32) {
+        let position = crate::transport::position_jetzt();
+        let feinheit = f64::from(crate::transport::feinheit().max(1));
+        // `position` zaehlt Rasterschritte; /feinheit sind volle Takte.
+        let takte_seit_start = position / feinheit;
+        let dauer = self.takte.max(1.0e-9);
+        let gesamt = takte_seit_start / dauer;
+        let schritte = self.schritte().max(1) as f64;
+        if !gesamt.is_finite() || gesamt < 0.0 {
+            return (0, 0);
+        }
+        // `as u64` sättigt; die Spalte bleibt im gueltigen Bereich.
+        let runde = gesamt.floor() as u64;
+        let anteil = gesamt.fract();
+        let ziel = (anteil * schritte).floor() as i32;
+        (runde, ziel.clamp(0, schritte as i32 - 1))
+    }
+
     /// Ein Sweep-Schritt: Spalten scannen, Treffer als OSC-Noten senden.
     ///
     /// Wie im Desktop-rrn5: Der Sweep läuft über die X-Auflösung (Schritte), ein
@@ -2097,7 +2207,7 @@ impl ImagePanel {
     /// Beat). Notenwert aus der Zeile (oben hoch, unten tief). Die Takt-Maske
     /// (rrn5 `biialpha`) sperrt einzelne Spalten; ihr Wert skaliert zusaetzlich
     /// Farbe und Lautstaerke.
-    fn scan_schritt(&mut self, ctx: &egui::Context, pattern: &mut Pattern) {
+    fn scan_schritt(&mut self, ctx: &egui::Context, pattern: &mut Pattern, anzeigen: bool) {
         if !self.scan_an {
             return;
         }
@@ -2135,13 +2245,47 @@ impl ImagePanel {
         // fuer die x/y-Bereiche des Instrument-Tabs.
         let mut noten: Vec<(i32, i32, f32, f32)> = Vec::new();
         while start.elapsed() < budget {
-            let jetzt = std::time::Instant::now();
-            if jetzt < self.scan_naechste_spalte {
-                // Nicht schlafen: bei grossen Taktzeiten waere das Sekunden im
-                // UI-Thread. Stattdessen neu zeichnen lassen, wenn die naechste
-                // Spalte dran ist.
-                ctx.request_repaint_after(self.scan_naechste_spalte - jetzt);
-                break;
+            if self.spirale_an {
+                // Spirale: eigener Takt wie bisher (ein Schritt je Taktzeit).
+                let jetzt = std::time::Instant::now();
+                if jetzt < self.scan_naechste_spalte {
+                    // Nicht schlafen: bei grossen Taktzeiten waere das Sekunden
+                    // im UI-Thread. Stattdessen neu zeichnen lassen, wenn die
+                    // naechste Spalte dran ist.
+                    ctx.request_repaint_after(self.scan_naechste_spalte - jetzt);
+                    break;
+                }
+            } else {
+                // Linien-Sweep: Zielspalte kommt aus der gemeinsamen Uhr.
+                let (runde, ziel) = self.sweep_phase();
+                if runde != self.sweep_runde {
+                    // Durchlauf-Ende: Protokoll, Zaehler zuruecksetzen; der
+                    // naechste Durchlauf beginnt wieder bei Spalte 0.
+                    log::info!(
+                        "Sweep beendet, {} Noten, {} gezeichnet, {} doppelt, {} ({:.2} s)",
+                        self.sweep_noten,
+                        self.sweep_gezeichnet,
+                        self.sweep_doppelt,
+                        jamcore::takte::text(self.takte),
+                        jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64)
+                    );
+                    self.pattern_runde_melden();
+                    self.sweep_noten = 0;
+                    self.sweep_gezeichnet = 0;
+                    self.sweep_doppelt = 0;
+                    self.scan_puffer = None;
+                    self.scan_x = 0;
+                    // Durchlauf-Ende: die Aufnahme schreibt jetzt (Nutzerwunsch).
+                    self.rec_durchlauf_ende(&*pattern);
+                    self.sweep_runde = runde;
+                }
+                if self.scan_x > ziel {
+                    // Eingeholt: bis zur naechsten Spalte neu zeichnen lassen.
+                    // 10 ms reichen fuer das feinste Raster; die genaue
+                    // Spaltenzeit steckt in der Phase der Uhr.
+                    ctx.request_repaint_after(std::time::Duration::from_millis(10));
+                    break;
+                }
             }
             // Zweiter Scan-Modus: die Spirale liest die Zelle am Spiralpunkt
             // statt der Sweep-Spalte; der Linien-Sweep bleibt unberuehrt.
@@ -2162,8 +2306,12 @@ impl ImagePanel {
                 continue;
             }
             if self.scan_x == 0 {
-                // Sweep beginnt: Puffer leeren (nur die Treffer leuchten).
+                // Sweep beginnt: Puffer leeren (nur die Treffer leuchten) und
+                // die Kanalvergabe am gewählten Kanal neu beginnen — so landet
+                // jeder Durchlauf wieder ab dem Kanal aus dem Rhythmus-Tab.
                 self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
+                self.kanal_start = crate::rhythm::tracker_kanal_gewaehlt();
+                self.kanal_ring = self.kanal_start;
             }
             let schritt = self.scan_x.clamp(0, schritte - 1);
             // Schritt auf die Kameraspalte abbilden — im gewaehlten Bereich
@@ -2219,23 +2367,6 @@ impl ImagePanel {
                         if !self.harmonie.note_erlaubt(note, x) {
                             continue;
                         }
-                        // Fuer den Bild-Follow: den Treffer ins Rhythmus-Pattern
-                        // schreiben (Desktop `L`/bpmo3; dort jedes Pixel, hier
-                        // eine Note je Schritt).
-                        if self.scan_aufnahme {
-                            let steps = pattern.steps_per_cycle().max(1) as i64;
-                            let step =
-                                ((x as i64 * steps) / wi.max(1) as i64).clamp(0, steps - 1) as u16;
-                            pattern.insert(Note {
-                                step,
-                                instrument: 0,
-                                pitch: note,
-                                glide: false,
-                                // Bild-Follow schreibt ins Raster (Kanal 0).
-                                channel: 0,
-                            });
-                            self.aufgenommen += 1;
-                        }
                         // Die Bildstelle des Treffers als Anteile der Bildbreite
                         // und -hoehe (die Spalte `x` und die Zeile `*y` liegen
                         // hier vor) — damit greifen die x/y-Bereiche.
@@ -2267,6 +2398,18 @@ impl ImagePanel {
             // Die Doppel zaehlen, damit im Log sichtbar bleibt, wie viel von
             // einer Spalte wirklich dieselbe Note war.
             self.sweep_doppelt += (alle - noten.len()) as u64;
+            // Bild-Follow: erst **nach** dem Entdoppeln ins Pattern schreiben.
+            // Sonst belegten die 182 gleichen Treffer einer Spalte alle Kanäle
+            // des Schritts mit derselben Note; so kommt je verschiedener Note
+            // eine Zelle, und die ringförmige Vergabe ab dem gewählten Kanal
+            // verteilt sie, statt sie zu ersetzen.
+            if self.scan_aufnahme {
+                let steps = pattern.steps_per_cycle().max(1) as i64;
+                let step = ((x as i64 * steps) / wi.max(1) as i64).clamp(0, steps - 1) as u16;
+                for (note, _, _, _) in &noten {
+                    self.note_ins_pattern(pattern, step, *note);
+                }
+            }
             // Pro Spalte: welche Noten mit welcher Lautstaerke. Das ist die
             // Zeile, an der man im Log sieht, ob „y faellt" wirklich faellt.
             if !noten.is_empty() {
@@ -2285,33 +2428,27 @@ impl ImagePanel {
                 self.note_senden(note, vol, Some(x_anteil), Some(y_anteil));
                 self.sweep_noten += 1;
             }
-            let naechster = schritt + 1;
-            if naechster >= schritte {
-                // Sweep zu Ende: Protokoll, Zaehler zuruecksetzen, und der
-                // naechste Durchlauf startet wieder bei Schritt 0.
-                log::info!(
-                    "Sweep beendet, {} Noten, {} gezeichnet, {} doppelt, {} ({:.2} s)",
-                    self.sweep_noten,
-                    self.sweep_gezeichnet,
-                    self.sweep_doppelt,
-                    jamcore::takte::text(self.takte),
-                    jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64)
-                );
-                self.sweep_noten = 0;
-                self.sweep_gezeichnet = 0;
-                self.sweep_doppelt = 0;
-                self.scan_puffer = None;
-                self.scan_x = 0;
-                // Durchlauf-Ende: die Aufnahme schreibt jetzt (Nutzerwunsch).
-                self.rec_durchlauf_ende(&*pattern);
-            } else {
-                self.scan_x = naechster;
+            // Naechste Spalte; das Ziel kommt im naechsten Schleifendurchlauf
+            // frisch aus der gemeinsamen Uhr.
+            self.scan_x = schritt + 1;
+        }
+        if anzeigen {
+            if let Some((w, h, puffer)) = self.scan_puffer.clone() {
+                self.textur_setzen(ctx, w, h, &puffer);
             }
-            self.scan_naechste_spalte += std::time::Duration::from_nanos(schritt_ns);
         }
-        if let Some((w, h, puffer)) = self.scan_puffer.clone() {
-            self.textur_setzen(ctx, w, h, &puffer);
-        }
+    }
+
+    /// Laeuft der Bild-Scan? Auch wenn der Bild-Tab gerade nicht sichtbar ist
+    /// (der Klang laeuft in jedem Tab weiter).
+    pub fn scan_aktiv(&self) -> bool {
+        self.scan_an
+    }
+
+    /// Ein Tick des Scans ohne Textur-Upload — fuer den Klang, waehrend ein
+    /// anderer Tab sichtbar ist. Die JamApp ruft das je Frame.
+    pub fn transport_schritt(&mut self, ctx: &egui::Context, pattern: &mut Pattern) {
+        self.scan_schritt(ctx, pattern, false);
     }
 
     /// Ein Schritt des Spiral-Scans: Spirale fortschreiben, die Zelle am
@@ -2342,8 +2479,11 @@ impl ImagePanel {
         let radius_roh = self.spirale.radius_roh();
         let radius_ende = radius_max(w, h);
         if self.spirale_letzter.is_none() {
-            // Sweep beginnt: Puffer leeren (nur Spur und Treffer leuchten).
+            // Sweep beginnt: Puffer leeren (nur Spur und Treffer leuchten) und
+            // die Kanalvergabe wie beim Linien-Sweep am gewählten Kanal starten.
             self.scan_puffer = Some((w, h, vec![0u8; w * h * 4]));
+            self.kanal_start = crate::rhythm::tracker_kanal_gewaehlt();
+            self.kanal_ring = self.kanal_start;
         }
         // Stroboskop: gelesen wird die Quellspalte hinter der bewegten
         // Ansicht. Die Spur steht in Quellkoordinaten im Puffer; der wird
@@ -2425,21 +2565,8 @@ impl ImagePanel {
                         puffer[idx + 3] = 255;
                     }
                     // Bild-Follow: den Treffer ins Rhythmus-Pattern schreiben
-                    // (wie der Linien-Scan, eine Note je Schritt).
-                    if self.scan_aufnahme {
-                        let steps = pattern.steps_per_cycle().max(1) as i64;
-                        let step = ((x_quelle as i64 * steps) / wi.max(1) as i64)
-                            .clamp(0, steps - 1) as u16;
-                        pattern.insert(Note {
-                            step,
-                            instrument: 0,
-                            pitch: note,
-                            glide: false,
-                            // Bild-Follow schreibt ins Raster (Kanal 0).
-                            channel: 0,
-                        });
-                        self.aufgenommen += 1;
-                    }
+                    // (wie der Linien-Scan, aber erst nach dem Puffer-Block,
+                    // weil `scan_puffer` `self` mutig ausleiht).
                     let x_anteil = (x_quelle as f32 / wi.max(1) as f32).clamp(0.0, 1.0);
                     let y_anteil = (py as f32 / hi.max(1) as f32).clamp(0.0, 1.0);
                     noten.push((
@@ -2453,6 +2580,16 @@ impl ImagePanel {
             }
         }
         for (note, vol, x_anteil, y_anteil) in noten {
+            // Bild-Follow: den Treffer ins Rhythmus-Pattern schreiben (hier
+            // ausserhalb des Puffer-Blocks, weil `scan_puffer` `self` mutig
+            // ausleiht). Jede Note bekommt ab dem gewählten Kanal den
+            // nächsten freien Kanal, statt den Schritt zu ersetzen.
+            if self.scan_aufnahme {
+                let steps = pattern.steps_per_cycle().max(1) as i64;
+                let step = ((x_quelle as i64 * steps) / wi.max(1) as i64)
+                    .clamp(0, steps - 1) as u16;
+                self.note_ins_pattern(pattern, step, note);
+            }
             self.note_senden(note, vol, Some(x_anteil), Some(y_anteil));
             self.sweep_noten += 1;
         }
@@ -2467,6 +2604,7 @@ impl ImagePanel {
                 jamcore::takte::text(self.takte),
                 jamcore::takte::sweep_sekunden(self.takte, self.scan_bpm as f64)
             );
+            self.pattern_runde_melden();
             self.sweep_noten = 0;
             self.sweep_gezeichnet = 0;
             self.sweep_doppelt = 0;
@@ -2567,6 +2705,19 @@ impl ImagePanel {
                 self.scan_an = !self.scan_an;
                 self.scan_puffer = None;
                 self.scan_x = 0;
+                if self.scan_an {
+                    // Gemeinsame Uhr anmelden: laeuft sie schon (Rhythmus
+                    // oder Laub), uebernimmt der Sweep deren Phase; sonst
+                    // startet die Uhr hier.
+                    crate::transport::teil_an(crate::transport::Teil::Bild);
+                    let (runde, ziel) = self.sweep_phase();
+                    self.sweep_runde = runde;
+                    self.scan_x = ziel;
+                } else {
+                    // Nur den Bild-Teil abmelden; Rhythmus/Laub klingen
+                    // weiter.
+                    crate::transport::teil_aus(crate::transport::Teil::Bild);
+                }
                 // Die Spirale beginnt mit dem Scan wieder im Zentrum (sonst
                 // hing die Spur am alten Punkt).
                 self.spirale_letzter = None;
@@ -2609,6 +2760,16 @@ impl ImagePanel {
             ui.checkbox(&mut self.scan_aufnahme, "ins Pattern");
             if self.scan_aufnahme {
                 ui.label(format!("aufgenommen: {}", self.aufgenommen));
+                // Sichtbar machen, ab welchem Kanal die Noten landen: der Wert
+                // kommt aus dem Tracker (Rhythmus-Tab, „Kanal ±“).
+                ui.label(
+                    egui::RichText::new(format!(
+                        "ab Kanal {} (Ring)",
+                        crate::rhythm::tracker_kanal_gewaehlt() as usize + 1
+                    ))
+                    .small()
+                    .color(Color32::GRAY),
+                );
             }
             // Aufnahme: das laufende Raster fortlaufend in eine .it schreiben
             // (Nutzerwunsch 2026-10-18).
@@ -2655,6 +2816,15 @@ impl ImagePanel {
                 self.snapshot_sichern();
             }
         });
+        // Gemeinsame Uhr: derselbe Text wie in Rhythmus und Laub.
+        ui.label(
+            egui::RichText::new(format!(
+                "Transport: {}",
+                crate::transport::status_text()
+            ))
+            .small()
+            .color(Color32::GRAY),
+        );
     }
 
     /// Quellen (Kamera/Video) waehlen — eigene Zeile, damit Bild 2 sie in der
@@ -2764,7 +2934,7 @@ impl ImagePanel {
         self.textur_aktualisieren(ui.ctx());
         // „Tempo aus Video" sammelt hier mit (je Videobild ein Graumittel).
         self.video_abtasten();
-        self.scan_schritt(ui.ctx(), pattern);
+        self.scan_schritt(ui.ctx(), pattern, true);
         self.linien_schritt();
         // Aufnahme: läuft der Durchlauf länger als ~2 s, zwischendurch
         // schreiben (das Ende schreibt der Scan selbst).
@@ -2883,7 +3053,7 @@ impl ImagePanel {
         self.schritte_wahl = schritte;
         self.laenge_anpassen(schritte);
 
-        self.scan_schritt(ui.ctx(), pattern);
+        self.scan_schritt(ui.ctx(), pattern, true);
         self.linien_schritt();
         // Aufnahme: läuft der Durchlauf länger als ~2 s, zwischendurch
         // schreiben (das Ende schreibt der Scan selbst).

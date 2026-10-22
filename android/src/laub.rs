@@ -1261,25 +1261,67 @@ impl LaubPanel {
         let position = Arc::clone(&self.spiel_position);
         position.store(0, Ordering::Relaxed);
         let position_c = Arc::clone(&position);
+        // Vor dem Thread anmelden: der Thread prueft als Erstes die Uhr.
+        crate::transport::teil_an(crate::transport::Teil::Laub);
         let ergebnis = std::thread::Builder::new()
             .name("jam-laub-anhoeren".to_string())
             .spawn(move || {
-                let schrittzeit = 60.0 / bpm / (feinheit as f32 / 4.0);
-                let taktzeit = schrittzeit * feinheit as f32;
+                let mut letzter: Option<u64> = None;
                 'aussen: loop {
-                    let start = Instant::now();
-                    for (zeile, farbe, schritt) in &noten {
-                        let ziel = *zeile as f32 * schrittzeit;
-                        if !warte_bis(&stopp_c, &herz, start, ziel) {
-                            break 'aussen;
-                        }
-                        // Marker im Bild: der Schritt, der jetzt klingt.
-                        position_c.store((*schritt).min(u16::MAX as u32) as u16, Ordering::Relaxed);
-                        crate::klang::spielen_welle(crate::rhythm::laub_pitch(*farbe), welle);
+                    if stopp_c.load(Ordering::Relaxed) {
+                        break;
                     }
-                    if !warte_bis(&stopp_c, &herz, start, taktzeit) {
+                    // Ohne gemeinsame Uhr bzw. nach der Abmeldung endet der
+                    // Thread; eingesammelt wird er in `anhoeren_aufraeumen`.
+                    if !crate::transport::laeuft()
+                        || !crate::transport::teil_aktiv(crate::transport::Teil::Laub)
+                    {
+                        break;
+                    }
+                    // Lebenszeichen: die App haelt den Thread ueber ihren
+                    // Frame-Takt wach, auch wenn der Laub-Tab nicht sichtbar
+                    // ist. Ohne Frames (App im Hintergrund) endet er.
+                    let frisch = herz
+                        .lock()
+                        .map(|h| h.elapsed() < Duration::from_secs(2))
+                        .unwrap_or(true);
+                    if !frisch {
                         break 'aussen;
                     }
+                    // Die gemeinsame Uhr liefert die absolute Rasterposition;
+                    // dieselbe Phase wie Rhythmus und Bild.
+                    let position = crate::transport::position_jetzt();
+                    let absolut = position.floor().max(0.0) as u64;
+                    if letzter != Some(absolut) {
+                        // Verpasste Schritte nicht alle nachfeuern (Klangstau);
+                        // die letzten vier genuegen fuer den hoerbaren
+                        // Anschluss. Beim ersten Durchlauf nur der aktuelle.
+                        let anzahl_jetzt = letzter
+                            .map(|letzte| absolut.saturating_sub(letzte).min(4))
+                            .unwrap_or(1)
+                            .max(1);
+                        for a in (absolut + 1 - anzahl_jetzt)..=absolut {
+                            let schritt = (a % u64::from(feinheit)) as u16;
+                            for (zeile, farbe, schritt_im_raster) in &noten {
+                                if *zeile == schritt {
+                                    // Marker im Bild: der Schritt, der jetzt
+                                    // klingt.
+                                    position_c.store(
+                                        (*schritt_im_raster).min(u16::MAX as u32) as u16,
+                                        Ordering::Relaxed,
+                                    );
+                                    crate::klang::spielen_welle(
+                                        crate::rhythm::laub_pitch(*farbe),
+                                        welle,
+                                    );
+                                }
+                            }
+                        }
+                        letzter = Some(absolut);
+                    }
+                    // Kurz schlafen: so greifen Stop und Tempoaenderung ohne
+                    // spuerbare Verzoegerung, und der Marker bleibt fluessig.
+                    std::thread::sleep(Duration::from_millis(10));
                 }
             });
         match ergebnis {
@@ -1297,7 +1339,11 @@ impl LaubPanel {
                     gruppe + 1
                 );
             }
-            Err(e) => self.status = format!("Anhören-Thread: {e}"),
+            Err(e) => {
+                // Ohne Thread darf der Laub-Teil nicht als „laeuft“ bleiben.
+                crate::transport::teil_aus(crate::transport::Teil::Laub);
+                self.status = format!("Anhören-Thread: {e}");
+            }
         }
     }
 
@@ -1315,6 +1361,8 @@ impl LaubPanel {
         }
         self.anhoeren_laeuft = false;
         if war_an {
+            // Nur diesen Teil abmelden: Rhythmus/Bild laufen weiter.
+            crate::transport::teil_aus(crate::transport::Teil::Laub);
             self.status = "Anhören gestoppt".to_string();
             if loggen {
                 log::info!("laub: Anhören gestoppt");
@@ -1322,7 +1370,16 @@ impl LaubPanel {
         }
     }
 
-    /// Vom Anhören-Thread selbst beendet (Tab-Wechsel): aufräumen und melden.
+    /// Lebenszeichen der App: haelt den Anhören-Thread auch dann wach, wenn
+    /// der Laub-Tab nicht sichtbar ist (Klang soll in jedem Tab weiterlaufen).
+    pub fn lebenszeichen(&self) {
+        if let Ok(mut herz) = self.anhoeren_herz.lock() {
+            *herz = Instant::now();
+        }
+    }
+
+    /// Vom Anhören-Thread selbst beendet (Uhr gestoppt oder App im
+    /// Hintergrund): aufräumen und melden.
     fn anhoeren_aufraeumen(&mut self) {
         if !self.anhoeren_laeuft {
             return;
@@ -2160,6 +2217,15 @@ impl LaubPanel {
                 }
             }
         });
+        // Gemeinsame Uhr: derselbe Text wie im Rhythmus- und Bild-Tab.
+        ui.label(
+            RichText::new(format!(
+                "Transport: {}",
+                crate::transport::status_text()
+            ))
+            .small()
+            .color(Color32::GRAY),
+        );
         // Rückmeldung direkt unter den Aktionen („Gruppen -> Patterns: …“,
         // „Farbe: gemischt“). Vorher stand sie am Ende des Tabs hinter allen
         // Gruppen-Beschreibungen — auf dem Handy außerhalb des Bildschirms,
@@ -2207,34 +2273,6 @@ fn anhoer_noten(takt: &[(u32, u8)], raster: u16, feinheit: u16) -> Vec<(u16, u8,
         .into_iter()
         .map(|(zeile, (farbe, schritt))| (zeile, farbe, schritt))
         .collect()
-}
-
-/// Wartet bis `ziel_s` Sekunden nach `start`; `false`, wenn gestoppt wurde
-/// oder der Laub-Tab verlassen ist (Herzschlag älter als 500 ms).
-///
-/// In kleinen Schritten, damit „Stop“ und Tab-Wechsel nicht erst am Ende eines
-/// Takts wirken.
-fn warte_bis(
-    stopp: &AtomicBool,
-    herz: &Mutex<Instant>,
-    start: Instant,
-    ziel_s: f32,
-) -> bool {
-    loop {
-        if stopp.load(Ordering::Relaxed) {
-            return false;
-        }
-        if let Ok(herz) = herz.lock() {
-            if herz.elapsed().as_millis() > 500 {
-                return false;
-            }
-        }
-        let rest = ziel_s - start.elapsed().as_secs_f32();
-        if rest <= 0.0 {
-            return true;
-        }
-        std::thread::sleep(Duration::from_secs_f32(rest.min(0.02)));
-    }
 }
 
 /// Ist das Video-Prüfen fertig? Nach [`VIDEO_FRAMES_MAX`] Bildern; ohne ein
