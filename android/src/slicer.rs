@@ -22,6 +22,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, RichText, Sense};
+use jamcore::audioedit;
 use jamcore::slice::{self, Schnittmodus, Slice};
 use log::info;
 
@@ -369,6 +370,18 @@ pub fn slice_spielen(index: usize) -> bool {
     true
 }
 
+/// Stand vor einer Bearbeitung für „Rückgängig“ (genau ein Schritt).
+///
+/// Warum die Schnitte mit im Schnappschuss liegen: Löschen und Zuschneiden
+/// verschieben alle Proben-Indizes; ohne die alten Schnitte würde ein
+/// Rückgängig zwar das Audio, aber nicht die Slice-Grenzen wiederherstellen.
+struct Snapshot {
+    proben: Vec<f32>,
+    schnitte: Vec<Slice>,
+    bereich: Option<(usize, usize)>,
+    auswahl: usize,
+}
+
 pub struct SlicerPanel {
     /// Geladenes Audio (Mono, −1 … 1) und seine Abtastrate.
     audio: Option<(Vec<f32>, u32)>,
@@ -383,11 +396,23 @@ pub struct SlicerPanel {
     empfindlichkeit: f32,
     /// Gewählter Slice (0-basiert).
     auswahl: usize,
+    /// Ausdrückliche Bereichsauswahl in Proben `(von, bis)`; hat Vorrang vor
+    /// dem gewählten Slice. `None` = der gewählte Slice ist der Bereich.
+    bereich: Option<(usize, usize)>,
     /// Laufende Aufnahme (None = keine).
     aufnahme: Option<wavrec::Aufnahme>,
     status: String,
     /// Beim Ziehen: welcher Schnitt (= Ende der Slice i) wandert gerade?
     zug_kante: Option<usize>,
+    /// Beim Ziehen im Modus „Bereich“: Startprobe unter dem Finger.
+    zug_bereich_start: Option<usize>,
+    /// Ziehen in der Wellenform: `true` = Bereich aufziehen, `false` =
+    /// nächstgelegenen Schnitt verschieben (bisheriges Verhalten).
+    bereich_ziehen: bool,
+    /// Dauer der Ein-/Ausblendung in Millisekunden (10 … 1000).
+    fade_ms: f32,
+    /// Ein-Schritt-Gedächtnis vor der letzten Bearbeitung.
+    rueckgaengig: Option<Snapshot>,
     /// Lang-Tipp: Beginn des Drucks.
     druck: Option<(Instant, egui::Pos2)>,
     /// Der laufende Druck hat schon gelöscht — der Klick beim Loslassen zählt
@@ -415,9 +440,14 @@ impl SlicerPanel {
             anzahl: ANZAHL_STANDARD,
             empfindlichkeit: 0.5,
             auswahl: 0,
+            bereich: None,
             aufnahme: None,
             status: "Audio öffnen oder aufnehmen — dann schneiden.".to_string(),
             zug_kante: None,
+            zug_bereich_start: None,
+            bereich_ziehen: true,
+            fade_ms: 50.0,
+            rueckgaengig: None,
             druck: None,
             lang_geloescht: false,
             raster_schmutzig: false,
@@ -439,6 +469,222 @@ impl SlicerPanel {
         self.proben().len()
     }
 
+    /// Sekundenposition einer Probe (mindestens 1 Hz als Nenner).
+    fn sekunden(&self, probe: usize) -> f32 {
+        probe as f32 / self.rate().max(1) as f32
+    }
+
+    /// Der aktive Bearbeitungsbereich in Proben: ausdrückliche Auswahl vor
+    /// dem gewählten Slice, jeweils auf die aktuelle Länge geklemmt.
+    ///
+    /// Warum eine Stelle: alle Werkzeuge müssen denselben Bereich sehen, und
+    /// nach einem Löschen/Zuschneiden kann eine alte Auswahl über das Ende
+    /// hinauszeigen.
+    fn aktiver_bereich(&self) -> Option<(usize, usize)> {
+        let len = self.laenge();
+        let (von, bis) = match self.bereich {
+            Some((von, bis)) => (von, bis),
+            None => {
+                let s = self.schnitte.get(self.auswahl)?;
+                (s.von, s.bis)
+            }
+        };
+        let von = von.min(len);
+        let bis = bis.min(len);
+        (bis > von).then_some((von, bis))
+    }
+
+    /// Anzeigetext des Bereichs, z. B. „Bereich 1.23–2.45 s (1.22 s)“.
+    fn bereich_text(&self, (von, bis): (usize, usize)) -> String {
+        let (a, b) = (self.sekunden(von), self.sekunden(bis));
+        format!("Bereich {a:.2}–{b:.2} s ({:.2} s)", b - a)
+    }
+
+    /// Stand vor einer Bearbeitung sichern (ersetzt den vorherigen).
+    fn snapshot_setzen(&mut self) {
+        let Some((proben, _)) = self.audio.as_ref() else {
+            return;
+        };
+        self.rueckgaengig = Some(Snapshot {
+            proben: proben.clone(),
+            schnitte: self.schnitte.clone(),
+            bereich: self.bereich,
+            auswahl: self.auswahl,
+        });
+    }
+
+    /// Wiedergabe anhalten und den Stand für „Rückgängig“ sichern.
+    ///
+    /// Warum vor jeder Bearbeitung: die klingenden Slice-Puffer gehören zum
+    /// alten Audio; ein Schnitt mitten im Ton knackst sonst.
+    fn bearbeitung_beginnen(&mut self) {
+        crate::klang::stimmen_aus();
+        self.snapshot_setzen();
+    }
+
+    /// Nach einer Bearbeitung: Hüllkurve, ggf. Schnitte und das Raster für den
+    /// Rhythmus-Tab neu rechnen.
+    fn nach_bearbeitung(&mut self, laenge_geaendert: bool) {
+        if laenge_geaendert {
+            // Alte Schnitte zeigen auf verschobene Proben — nach Löschen oder
+            // Zuschneiden mit den aktuellen Einstellungen neu legen.
+            let neu = match self.audio.as_ref() {
+                Some((proben, rate)) => slice::schnitte(
+                    proben,
+                    *rate,
+                    self.modus,
+                    self.anzahl,
+                    self.empfindlichkeit,
+                ),
+                None => vec![Slice { von: 0, bis: 0 }],
+            };
+            self.schnitte = neu;
+            self.auswahl = 0;
+            self.bereich = None;
+        }
+        self.huelle = huelle(self.proben(), HUELLEN_KAESTEN);
+        self.raster_aktualisieren();
+        self.raster_schmutzig = false;
+    }
+
+    /// Wo der aktive Bereich liegt — fürs Log (`Bereich` oder `Slice N`).
+    fn bereich_herkunft(&self, von: usize) -> String {
+        if self.bereich.is_some() {
+            "Bereich".to_string()
+        } else {
+            format!("Slice {}", self.slice_bei(von) + 1)
+        }
+    }
+
+    /// Umkehren (Reverse) des aktiven Bereichs.
+    fn werkzeug_umkehren(&mut self) {
+        let Some((von, bis)) = self.aktiver_bereich() else {
+            self.status = "Kein Bereich zum Umkehren — Audio laden oder Slice wählen.".to_string();
+            return;
+        };
+        let herkunft = self.bereich_herkunft(von);
+        let (a, b) = (self.sekunden(von), self.sekunden(bis));
+        self.bearbeitung_beginnen();
+        if let Some((proben, _)) = self.audio.as_mut() {
+            audioedit::umkehren(proben, von, bis);
+        }
+        self.nach_bearbeitung(false);
+        self.status = format!("Umgekehrt: {a:.2}–{b:.2} s ({herkunft}).");
+        info!("slicer: Umkehren {a:.2}-{b:.2} s ({herkunft})");
+    }
+
+    /// Nur den aktiven Bereich behalten.
+    fn werkzeug_zuschneiden(&mut self) {
+        let Some((von, bis)) = self.aktiver_bereich() else {
+            self.status = "Kein Bereich zum Zuschneiden — Audio laden oder Slice wählen."
+                .to_string();
+            return;
+        };
+        let herkunft = self.bereich_herkunft(von);
+        let (a, b) = (self.sekunden(von), self.sekunden(bis));
+        self.bearbeitung_beginnen();
+        if let Some((proben, _)) = self.audio.as_mut() {
+            audioedit::zuschneiden(proben, von, bis);
+        }
+        self.nach_bearbeitung(true);
+        let neu = self.laenge() as f32 / self.rate().max(1) as f32;
+        self.status = format!("Zugeschnitten auf {a:.2}–{b:.2} s -> {neu:.2} s ({herkunft}).");
+        info!("slicer: Zuschneiden {a:.2}-{b:.2} s -> {neu:.2} s");
+    }
+
+    /// Den aktiven Bereich entfernen (Rest rückt zusammen).
+    fn werkzeug_bereich_loeschen(&mut self) {
+        let Some((von, bis)) = self.aktiver_bereich() else {
+            self.status = "Kein Bereich zum Löschen — Audio laden oder Slice wählen.".to_string();
+            return;
+        };
+        let herkunft = self.bereich_herkunft(von);
+        let (a, b) = (self.sekunden(von), self.sekunden(bis));
+        let alt = self.laenge();
+        self.bearbeitung_beginnen();
+        let neu_proben = if let Some((proben, _)) = self.audio.as_mut() {
+            audioedit::bereich_loeschen(proben, von, bis)
+        } else {
+            alt
+        };
+        self.nach_bearbeitung(true);
+        let neu = neu_proben as f32 / self.rate().max(1) as f32;
+        self.status = format!("Bereich gelöscht: {a:.2}–{b:.2} s -> {neu:.2} s ({herkunft}).");
+        info!("slicer: Bereich loeschen {a:.2}-{b:.2} s -> {neu:.2} s");
+    }
+
+    /// Ein- oder Ausblenden über `fade_ms` am aktiven Bereich.
+    fn werkzeug_blende(&mut self, ein: bool) {
+        let Some((von, bis)) = self.aktiver_bereich() else {
+            self.status = "Kein Bereich zum Blenden — Audio laden oder Slice wählen.".to_string();
+            return;
+        };
+        let herkunft = self.bereich_herkunft(von);
+        let rate = self.rate().max(1);
+        let dauer = ((self.fade_ms.max(1.0) / 1000.0) * rate as f32).round() as usize;
+        let dauer = dauer.max(1);
+        let (a, b) = (self.sekunden(von), self.sekunden(bis));
+        self.bearbeitung_beginnen();
+        if let Some((proben, _)) = self.audio.as_mut() {
+            if ein {
+                audioedit::einblenden(proben, von, bis, dauer);
+            } else {
+                audioedit::ausblenden(proben, von, bis, dauer);
+            }
+        }
+        self.nach_bearbeitung(false);
+        let name = if ein { "Einblenden" } else { "Ausblenden" };
+        self.status = format!(
+            "{name}: {a:.2}–{b:.2} s über {:.0} ms ({herkunft}).",
+            self.fade_ms
+        );
+        info!(
+            "slicer: {name} {a:.2}-{b:.2} s ({:.0} ms)",
+            self.fade_ms
+        );
+    }
+
+    /// Den aktiven Bereich auf Spitze 1.0 normalisieren.
+    fn werkzeug_normalisieren(&mut self) {
+        let Some((von, bis)) = self.aktiver_bereich() else {
+            self.status = "Kein Bereich zum Normalisieren — Audio laden oder Slice wählen."
+                .to_string();
+            return;
+        };
+        let herkunft = self.bereich_herkunft(von);
+        let (a, b) = (self.sekunden(von), self.sekunden(bis));
+        self.bearbeitung_beginnen();
+        let faktor = if let Some((proben, _)) = self.audio.as_mut() {
+            audioedit::normalisieren(proben, von, bis)
+        } else {
+            1.0
+        };
+        self.nach_bearbeitung(false);
+        self.status = format!(
+            "Normalisiert: {a:.2}–{b:.2} s, Faktor {faktor:.2} ({herkunft})."
+        );
+        info!("slicer: Normalisieren {a:.2}-{b:.2} s (Faktor {faktor:.2})");
+    }
+
+    /// Die letzte Bearbeitung zurücknehmen (genau ein Schritt).
+    fn rueckgaengig(&mut self) {
+        let Some(s) = self.rueckgaengig.take() else {
+            self.status = "Nichts rückgängig zu machen.".to_string();
+            return;
+        };
+        crate::klang::stimmen_aus();
+        let rate = self.rate();
+        self.audio = Some((s.proben, rate));
+        self.schnitte = s.schnitte;
+        self.bereich = s.bereich;
+        self.auswahl = s.auswahl.min(self.schnitte.len().saturating_sub(1));
+        self.huelle = huelle(self.proben(), HUELLEN_KAESTEN);
+        self.raster_aktualisieren();
+        self.raster_schmutzig = false;
+        self.status = "Rückgängig: vorheriger Stand wiederhergestellt.".to_string();
+        info!("slicer: Rueckgaengig");
+    }
+
     /// Audio laden (aus dem Browser oder von der Aufnahme) und die Slices nach
     /// dem eingestellten Modus legen. `Ok` = Kurzbeschreibung für den Status.
     pub fn laden(&mut self, pfad: &str) -> Result<String, String> {
@@ -455,6 +701,9 @@ impl SlicerPanel {
             self.empfindlichkeit,
         );
         self.auswahl = 0;
+        self.bereich = None;
+        self.zug_bereich_start = None;
+        self.rueckgaengig = None;
         self.raster_schmutzig = true;
         let text = format!(
             "{sekunden:.1} s, {} Hz, {} Slice(s)",
@@ -861,6 +1110,32 @@ impl SlicerPanel {
                 );
             }
         }
+        // Ausdrückliche Bereichsauswahl: oranger Balken über den Slice-Farben,
+        // damit „gewählter Slice“ (grün) und „Bereich“ (orange) unterscheidbar
+        // bleiben. Die Feldwerte können nach einem Zuschnitt veraltet sein —
+        // deshalb hier klemmen, nicht vertrauen.
+        if let Some((von, bis)) = self.bereich {
+            let von = von.min(len);
+            let bis = bis.min(len);
+            if bis > von {
+                let x0 = rect.left() + von as f32 / len as f32 * rect.width();
+                let x1 = rect.left() + bis as f32 / len as f32 * rect.width();
+                painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(x0, rect.top()),
+                        egui::pos2(x1, rect.bottom()),
+                    ),
+                    0.0,
+                    Color32::from_rgba_unmultiplied(250, 170, 60, 60),
+                );
+                for x in [x0, x1] {
+                    painter.line_segment(
+                        [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                        egui::Stroke::new(2.0, Color32::from_rgb(250, 190, 80)),
+                    );
+                }
+            }
+        }
         painter.rect_stroke(
             rect,
             egui::CornerRadius::same(3),
@@ -907,19 +1182,40 @@ impl SlicerPanel {
 
         if response.drag_started() {
             if let Some(pr) = probe {
-                self.zug_kante = self.naechster_schnitt(pr);
-                if let Some(k) = self.zug_kante {
-                    self.status = format!("Schnitt {} ziehen …", k + 1);
+                if self.bereich_ziehen {
+                    // Neuer Bereich ab der Startprobe; eine alte Auswahl wird
+                    // ersetzt, nicht erweitert (ein Finger, ein Bereich).
+                    self.zug_bereich_start = Some(pr);
+                    self.bereich = None;
+                    self.status = "Bereich aufziehen …".to_string();
+                } else {
+                    self.zug_kante = self.naechster_schnitt(pr);
+                    if let Some(k) = self.zug_kante {
+                        self.status = format!("Schnitt {} ziehen …", k + 1);
+                    }
                 }
             }
         }
         if response.dragged() {
-            if let (Some(k), Some(pr)) = (self.zug_kante, probe) {
-                let gesamt = self.laenge();
-                slice::verschiebe(&mut self.schnitte, k, pr, gesamt);
+            if let Some(pr) = probe {
+                if let Some(start) = self.zug_bereich_start {
+                    let (von, bis) = (start.min(pr), start.max(pr));
+                    // Ein Punkt ist noch kein Bereich; erst ab zwei Proben
+                    // wird die Auswahl sichtbar und bearbeitbar.
+                    self.bereich = (bis > von).then_some((von, bis));
+                } else if let Some(k) = self.zug_kante {
+                    let gesamt = self.laenge();
+                    slice::verschiebe(&mut self.schnitte, k, pr, gesamt);
+                }
             }
         }
         if response.drag_stopped() {
+            if self.zug_bereich_start.take().is_some() {
+                self.status = match self.aktiver_bereich() {
+                    Some(bereich) => self.bereich_text(bereich),
+                    None => "Auswahl aufgehoben (zu kurz gezogen).".to_string(),
+                };
+            }
             if self.zug_kante.is_some() {
                 self.raster_schmutzig = true;
                 self.status = format!("Schnitt verschoben: {} Slices", self.schnitte.len());
@@ -1040,6 +1336,144 @@ impl SlicerPanel {
 
         self.wellenform(ui);
 
+        // Bereichsanzeige und Zieh-Modus direkt unter der Wellenform: der
+        // Bereich ist das Ziel aller Werkzeuge, ohne Auswahl gilt der Slice.
+        let aktiver = self.aktiver_bereich();
+        let auswahl_aktiv = self.bereich.is_some();
+        let bereich_text = aktiver.map(|b| self.bereich_text(b));
+        let mut auswahl_aufheben = false;
+        ui.horizontal_wrapped(|ui| {
+            match &bereich_text {
+                Some(text) => {
+                    ui.label(
+                        RichText::new(text)
+                            .small()
+                            .color(Color32::from_rgb(245, 195, 100)),
+                    );
+                }
+                None => {
+                    ui.label(
+                        RichText::new("Kein Bereich — Audio laden oder Slice wählen.")
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
+            }
+            if ui
+                .add_enabled(auswahl_aktiv, egui::Button::new("Auswahl aufheben"))
+                .clicked()
+            {
+                auswahl_aufheben = true;
+            }
+            ui.separator();
+            ui.label(RichText::new("Ziehen:").small());
+            if ui
+                .selectable_label(self.bereich_ziehen, "Bereich")
+                .clicked()
+            {
+                self.bereich_ziehen = true;
+            }
+            if ui
+                .selectable_label(!self.bereich_ziehen, "Schnitt")
+                .clicked()
+            {
+                self.bereich_ziehen = false;
+            }
+        });
+        if auswahl_aufheben {
+            self.bereich = None;
+            self.status = "Auswahl aufgehoben — der gewählte Slice gilt als Bereich.".to_string();
+            info!("slicer: Auswahl aufgehoben");
+        }
+
+        // Werkzeug-Zeile: bearbeitet die Auswahl, sonst den gewählten Slice.
+        // Auch bei leerem (aber geladenem) Audio sichtbar, damit „Rückgängig“
+        // nach dem Löschen des letzten Rests erreichbar bleibt.
+        let hat_audio = self.audio.is_some();
+        let bereich_da = aktiver.is_some();
+        if hat_audio {
+            let (mut umkehren, mut zuschneiden, mut loeschen) = (false, false, false);
+            let (mut einblenden, mut ausblenden, mut normalisieren) = (false, false, false);
+            let mut rueckgaengig = false;
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("Bearbeiten").small());
+                if ui
+                    .add_enabled(bereich_da, egui::Button::new("Umkehren"))
+                    .clicked()
+                {
+                    umkehren = true;
+                }
+                if ui
+                    .add_enabled(bereich_da, egui::Button::new("Zuschneiden"))
+                    .clicked()
+                {
+                    zuschneiden = true;
+                }
+                if ui
+                    .add_enabled(bereich_da, egui::Button::new("Bereich löschen"))
+                    .clicked()
+                {
+                    loeschen = true;
+                }
+                ui.separator();
+                if ui
+                    .add_enabled(bereich_da, egui::Button::new("Einblenden"))
+                    .clicked()
+                {
+                    einblenden = true;
+                }
+                if ui
+                    .add_enabled(bereich_da, egui::Button::new("Ausblenden"))
+                    .clicked()
+                {
+                    ausblenden = true;
+                }
+                ui.add(
+                    egui::DragValue::new(&mut self.fade_ms)
+                        .range(10.0..=1000.0)
+                        .speed(5.0)
+                        .suffix(" ms"),
+                )
+                .on_hover_text("Dauer für Ein-/Ausblenden");
+                ui.separator();
+                if ui
+                    .add_enabled(bereich_da, egui::Button::new("Normalisieren"))
+                    .clicked()
+                {
+                    normalisieren = true;
+                }
+                if ui
+                    .add_enabled(self.rueckgaengig.is_some(), egui::Button::new("Rückgängig"))
+                    .clicked()
+                {
+                    rueckgaengig = true;
+                }
+            });
+            // Erst nach der Zeile ausführen: die Werkzeuge tauschen Audio und
+            // Raster, das soll nicht mitten in egui-Aufrufen passieren.
+            if umkehren {
+                self.werkzeug_umkehren();
+            }
+            if zuschneiden {
+                self.werkzeug_zuschneiden();
+            }
+            if loeschen {
+                self.werkzeug_bereich_loeschen();
+            }
+            if einblenden {
+                self.werkzeug_blende(true);
+            }
+            if ausblenden {
+                self.werkzeug_blende(false);
+            }
+            if normalisieren {
+                self.werkzeug_normalisieren();
+            }
+            if rueckgaengig {
+                self.rueckgaengig();
+            }
+        }
+
         // Slices nummeriert: Tippen wählt und hört vor.
         if !self.schnitte.is_empty() {
             ui.horizontal_wrapped(|ui| {
@@ -1051,6 +1485,9 @@ impl SlicerPanel {
                         .clicked()
                     {
                         self.auswahl = i;
+                        // Slice-Wahl ersetzt eine ausdrückliche Auswahl — sonst
+                        // bliebe der alte Bereich unsichtbar aktiv.
+                        self.bereich = None;
                         self.vorhoeren(i);
                     }
                 }
@@ -1128,11 +1565,14 @@ impl SlicerPanel {
         ui.label(RichText::new(&self.status).small().color(Color32::GRAY));
         ui.label(
             RichText::new(
-                "Wellenform: tippen setzt den Schnitt, ziehen verschiebt ihn, langes Tippen \
-                 löscht den Slice. „Als .it sichern“ legt die Slices als Samples in \
-                 <App-Ordner>/module/<Name>.it ab (im Player-Tab ladbar); das Rhythmus-Raster \
-                 spielt sie über die Klangquelle „Slices“ (Instr = Slice-Nummer). \
-                 „→ Instr N“ macht den gewählten Slice zum Sample von Instrument N.",
+                "Wellenform: tippen setzt den Schnitt, ziehen zieht einen Bereich auf (Modus \
+                 „Bereich“) oder verschiebt den nächsten Schnitt (Modus „Schnitt“), langes \
+                 Tippen löscht den Slice. „Bearbeiten“ wirkt auf die Auswahl, sonst auf den \
+                 gewählten Slice; „Rückgängig“ nimmt den letzten Schritt zurück. „Als .it \
+                 sichern“ legt die Slices als Samples in <App-Ordner>/module/<Name>.it ab \
+                 (im Player-Tab ladbar); das Rhythmus-Raster spielt sie über die Klangquelle \
+                 „Slices“ (Instr = Slice-Nummer). „→ Instr N“ macht den gewählten Slice zum \
+                 Sample von Instrument N.",
             )
             .small()
             .color(Color32::DARK_GRAY),

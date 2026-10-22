@@ -5,6 +5,7 @@
 pub mod bmp;
 pub mod akkord;
 pub mod audio;
+pub mod audioedit;
 pub mod diary;
 pub mod euclid;
 pub mod gesten;
@@ -25,6 +26,7 @@ pub mod oszillator;
 pub mod osc;
 pub mod quint;
 pub mod relay;
+pub mod scan;
 pub mod scanmask;
 pub mod schrittweite;
 pub mod session;
