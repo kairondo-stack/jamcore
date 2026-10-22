@@ -416,28 +416,29 @@ impl eframe::App for JamApp {
 
         egui::Panel::top("kopf").show(ui, |ui| {
             ui.add_space(top);
-            ui.horizontal(|ui| {
+            // Titel **und** Tabs in einer umbrechenden Zeile: die frühere
+            // Verschachtelung („horizontal" um „horizontal_wrapped") ließ das
+            // Panel nur zwei Zeilen hoch werden — die dritte Tab-Zeile ragte
+            // in den Inhalt und fing dessen Klicks ab (auf dem Handy lagen
+            // z. B. „Abspielen" und „Lissa" übereinander).
+            ui.horizontal_wrapped(|ui| {
                 ui.heading("JamCore");
-                // Acht Tabs passen nicht in eine Zeile; sie brechen um. Eine
-                // scrollende Leiste war auf dem Touchscreen schwer zu treffen.
-                ui.horizontal_wrapped(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
-                    ui.selectable_value(&mut self.tab, Tab::Player, "Player");
-                    ui.selectable_value(&mut self.tab, Tab::Instr, "Instr");
-                    ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
-                    ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
-                    ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
-                    ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
-                    ui.selectable_value(&mut self.tab, Tab::Laub, "Laub");
-                    ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
-                    ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
-                    ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
-                    ui.selectable_value(&mut self.tab, Tab::Maske2, "M2");
-                    ui.selectable_value(&mut self.tab, Tab::Bild2, "B2");
-                    ui.selectable_value(&mut self.tab, Tab::Lissa, "Lissa");
-                    ui.selectable_value(&mut self.tab, Tab::Slicer, "Slicer");
-                    ui.selectable_value(&mut self.tab, Tab::Kombi, "Kombi");
-                });
+                ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
+                ui.selectable_value(&mut self.tab, Tab::Player, "Player");
+                ui.selectable_value(&mut self.tab, Tab::Instr, "Instr");
+                ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
+                ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
+                ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
+                ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
+                ui.selectable_value(&mut self.tab, Tab::Laub, "Laub");
+                ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
+                ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
+                ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
+                ui.selectable_value(&mut self.tab, Tab::Maske2, "M2");
+                ui.selectable_value(&mut self.tab, Tab::Bild2, "B2");
+                ui.selectable_value(&mut self.tab, Tab::Lissa, "Lissa");
+                ui.selectable_value(&mut self.tab, Tab::Slicer, "Slicer");
+                ui.selectable_value(&mut self.tab, Tab::Kombi, "Kombi");
             });
             ui.add_space(4.0);
         });
