@@ -24,6 +24,7 @@ use jamcore::osc::{OscOut, Renoise};
 use jamcore::oszillator::{
     anteil_je_zeit, harm_basis, harmonie_an, note_fuer_zeile, Durchlauf, XBasis,
 };
+use jamcore::scan::{verschiebe_bereich, verschiebe_position};
 use jamcore::scanmask::{Aufloesung, ScanMaske};
 use jamcore::spirale::{Familie, Spirale};
 
@@ -760,6 +761,8 @@ pub struct ImagePanel {
     /// Scan-Bereich als Anteile der Bildbreite (rrn5: Alt+D/Alt+C).
     scan_links: f32,
     scan_rechts: f32,
+    /// ×10-Schalter der Verschiebe-Knöpfe: 10 % je Druck statt 1 %.
+    scan_versatz_x10: bool,
     /// Verschiebung des Bildes im Kasten in Punkten (drei Finger).
     bild_versatz: (f32, f32),
     /// Mehrfinger (zwei Finger Zoom, drei Finger verschieben).
@@ -962,6 +965,7 @@ impl ImagePanel {
             bild_zoom: 1.0,
             scan_links: 0.0,
             scan_rechts: 1.0,
+            scan_versatz_x10: false,
             bild_versatz: (0.0, 0.0),
             finger: crate::touch::Mehrfinger::neu(),
             harmonie: jamcore::harmonie::Harmonie::default(),
@@ -3071,6 +3075,70 @@ impl ImagePanel {
             ))
             .small(),
         );
+        // Genre-Faktoren und „BPM vom Scan“: der Versatz ist die sichtbare
+        // Rate in Durchläufen je Minute, also direkt die BPM-Zahl (1 pro
+        // Beat). ÷2/÷3 passen Halbzeit/Triolen an, ×2/×3 Doppelzeit.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(
+                egui::RichText::new("BPM")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            for (name, faktor) in [
+                ("÷3", 1.0 / 3.0),
+                ("÷2", 0.5),
+                ("×2", 2.0),
+                ("×3", 3.0),
+            ] {
+                if ui
+                    .small_button(name)
+                    .on_hover_text("Versatz (Durchläufe je Minute) skalieren")
+                    .clicked()
+                {
+                    if self.strobo_versatz == 0 {
+                        self.status =
+                            "Stroboskop: Versatz ist 0 — erst BPM vom Scan holen.".to_string();
+                    } else {
+                        let neu = (self.strobo_versatz as f64 * faktor).round() as i32;
+                        self.strobo_versatz = neu.clamp(-300, 300);
+                        log::info!(
+                            "bild: Stroboskop-Versatz {name} -> {}/min",
+                            self.strobo_versatz
+                        );
+                        self.status = format!(
+                            "Stroboskop {name}: {}/min",
+                            self.strobo_versatz
+                        );
+                    }
+                }
+            }
+            if ui
+                .button("BPM vom Scan")
+                .on_hover_text("Versatz = aktuelle Scan-BPM (ein Durchlauf je Beat)")
+                .clicked()
+            {
+                let bpm = self.scan_bpm;
+                if bpm.is_finite() && bpm > 0.0 {
+                    self.strobo_versatz = bpm.round().clamp(-300.0, 300.0) as i32;
+                    log::info!(
+                        "bild: Stroboskop-Versatz aus Scan-BPM {:.1} -> {}/min",
+                        bpm,
+                        self.strobo_versatz
+                    );
+                    self.status = format!(
+                        "Stroboskop: {:.0}/min (Scan-BPM {:.1})",
+                        bpm, bpm
+                    );
+                } else {
+                    self.status = "Stroboskop: keine Scan-BPM gemessen.".to_string();
+                }
+            }
+            ui.label(
+                egui::RichText::new(format!("Scan {:.0} BPM", self.scan_bpm))
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        });
     }
 
     /// Spiral-Scan (Desktop: Shift+F8): an/aus, Familie, Schrittweite ÷2/×2
@@ -3720,6 +3788,10 @@ impl ImagePanel {
                 self.scan_rechts = 1.0;
             }
         });
+        // Scan-Linie und Scan-Bereich per Knopf verschieben — direkt unter den
+        // x-Fadern, damit die Knöpfe dort liegen, wo der Bereich eingestellt
+        // wird. Der Finger-Modus „Verschieben“ bleibt unberührt.
+        self.zeile_scan_verschieben(ui);
         ui.horizontal(|ui| {
             if ui.button("Breite").clicked() {
                 self.bild_zoom = 1.0;
@@ -3741,6 +3813,73 @@ impl ImagePanel {
             }
             if ui.button("Mitte").clicked() {
                 self.bild_versatz = (0.0, 0.0);
+            }
+        });
+    }
+
+    /// Scan-Linie und Scan-Bereich per Knopf verschieben: ◀/▶ in
+    /// 1-%-Schritten, „×10“ schaltet auf 10 %. Die Knöpfe ändern nur den
+    /// Zustand — der laufende Scan liest ihn im nächsten Frame, es muss also
+    /// nichts neu gestartet werden.
+    fn zeile_scan_verschieben(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Verschieben:");
+            let schritt = if self.scan_versatz_x10 { 0.10 } else { 0.01 };
+
+            // Linie: dieselbe Position, die auch der Finger im Verschiebe-Modus
+            // zieht (`linie_x`); die Grenze 0..1 setzt der Kern.
+            ui.label("Linie");
+            let links = ui.small_button("◀").clicked();
+            let rechts = ui.small_button("▶").clicked();
+            let delta = match (links, rechts) {
+                (true, false) => -schritt,
+                (false, true) => schritt,
+                _ => 0.0,
+            };
+            if delta != 0.0 {
+                let alt = self.linie_x;
+                let neu = verschiebe_position(alt, delta);
+                if (neu - alt).abs() > 1e-6 {
+                    self.linie_x = neu;
+                    let text = format!("Scan-Linie x {alt:.2} -> {neu:.2}");
+                    log::info!("bild: {text}");
+                    self.status = text;
+                }
+            }
+
+            // Bereich: beide Grenzen gemeinsam, die Breite bleibt. Der eigene
+            // Oszillator-Bereich (`oszi_bereich`) bleibt bewusst unberührt —
+            // die Knöpfe gehören zum geteilten Scan-Bereich („x von/x bis“ im
+            // Zoom-Block, auch vom Kreis-Tab benutzt).
+            ui.label("Bereich");
+            let links = ui.small_button("◀").clicked();
+            let rechts = ui.small_button("▶").clicked();
+            let delta = match (links, rechts) {
+                (true, false) => -schritt,
+                (false, true) => schritt,
+                _ => 0.0,
+            };
+            if delta != 0.0 {
+                let (alt_von, alt_bis) = (self.scan_links, self.scan_rechts);
+                let (von, bis) = verschiebe_bereich(alt_von, alt_bis, delta);
+                // An der Wand ändert sich nichts — dann auch nicht loggen
+                // (sonst spammt jeder Druck dieselbe Zeile).
+                if (von - alt_von).abs() > 1e-6 || (bis - alt_bis).abs() > 1e-6 {
+                    self.scan_links = von;
+                    self.scan_rechts = bis;
+                    let text =
+                        format!("Scan-Bereich x {alt_von:.2}-{alt_bis:.2} -> {von:.2}-{bis:.2}");
+                    log::info!("bild: {text}");
+                    self.status = text;
+                }
+            }
+
+            if ui.selectable_label(self.scan_versatz_x10, "×10").clicked() {
+                self.scan_versatz_x10 = !self.scan_versatz_x10;
+                log::info!(
+                    "bild: Scan-Verschieben Schritt {:.0} %",
+                    if self.scan_versatz_x10 { 10.0 } else { 1.0 }
+                );
             }
         });
     }
