@@ -2977,6 +2977,15 @@ impl ImagePanel {
                 self.regler_formel(ui);
                 return;
             }
+            if self.strobo_an {
+                ui.label(
+                    egui::RichText::new(
+                        "Formel einschalten für BPM-Faktoren (÷2, ÷3, ×2, ×3) und „BPM vom Scan“.",
+                    )
+                    .small()
+                    .color(Color32::GRAY),
+                );
+            }
             // Parameterwechsel halten die Phase (sonst springt das Bild).
             if ui.selectable_label(!self.strobo_rechts, "◀").clicked() {
                 self.strobo_phase_erhalten();
