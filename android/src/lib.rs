@@ -10,6 +10,7 @@ mod insets;
 mod instr;
 mod jniutil;
 mod klang;
+mod kreis_presets;
 mod laub;
 mod layout;
 mod link_support;
@@ -28,6 +29,7 @@ mod session_ui;
 mod slicer;
 mod tasten;
 mod touch;
+mod transport;
 mod video;
 mod wavrec;
 
@@ -288,12 +290,53 @@ impl JamApp {
                 self.player = Some(p);
                 self.meldung.clear();
                 self.last_report = Instant::now();
+                self.tempo_aus_modul();
             }
             Err(e) => {
                 self.status = "Wiedergabe gestartet".to_string();
                 self.meldung = format!("Fehler: {e}");
+                log::info!(
+                    "player: kein Modul geladen ({e}) - App-Tempo bleibt {:.0} BPM",
+                    self.tempo_bpm
+                );
             }
         }
+    }
+
+    /// Tempo und Speed aus dem Modulkopf auf die App-Uhr legen.
+    ///
+    /// Warum beim Laden: die App rechnet Raster, Rendern und Metronom in
+    /// 1/16-Zeilen. Ein IT mit Speed 3 laeuft doppelt so schnell wie eines mit
+    /// Speed 6; ohne Umrechnung liefen Rhythmus, Bild und Klick gegen das
+    /// Modul. Geschrieben wird der zentrale `tempo_bpm` (wie jeder Regler),
+    /// damit Link-Folgen und die Synchronisierung unveraendert bleiben.
+    fn tempo_aus_modul(&mut self) {
+        let Some(spieler) = self.player.as_ref() else {
+            log::info!(
+                "player: kein Modul geladen - App-Tempo bleibt {:.0} BPM",
+                self.tempo_bpm
+            );
+            return;
+        };
+        let (tempo, speed) = spieler.it_tempo_werte();
+        let Some(bpm) = jamcore::modul::bpm_aus_it(f64::from(tempo), f64::from(speed)) else {
+            log::info!(
+                "player: IT-Tempo {tempo} BPM, Speed {speed} ungueltig - App-Tempo bleibt {:.0} BPM",
+                self.tempo_bpm
+            );
+            return;
+        };
+        self.tempo_setzen(bpm as f32);
+        // Die Beispiele aus dem Auftrag: Speed 6 = wie im Kopf, Speed 3 doppelt.
+        let doppelt = if (bpm - 2.0 * f64::from(tempo)).abs() < 0.5 {
+            " (doppelt)"
+        } else {
+            ""
+        };
+        log::info!(
+            "player: IT-Tempo {tempo} BPM, Speed {speed} -> App {:.0} BPM{doppelt}",
+            self.tempo_bpm
+        );
     }
 
     fn stop(&mut self) {
@@ -459,6 +502,20 @@ impl eframe::App for JamApp {
             self.status = format!("Tempo übernommen: {bpm:.1} BPM");
             log::info!("Tempo uebernommen: {bpm:.1} BPM");
         }
+        // Eine Uhr fuer alle: App-Tempo und Rhythmus-Feinheit in den
+        // Transport spiegeln. Das passiert **jeden** Frame, auch wenn ein
+        // anderer Tab sichtbar ist — laufende Erzeuger folgen so einer
+        // Tempoaenderung, und der Bild-Scan tickt auch im Hintergrund.
+        crate::transport::set_bpm(self.tempo_aktuell(), self.rhythm.feinheit());
+        // Der Anhoeren-Thread im Laub-Tab soll beim Tabwechsel weiterklingen;
+        // ohne Lebenszeichen beendet er sich nach zwei Sekunden ohne Frame.
+        self.laub.lebenszeichen();
+        if crate::transport::laeuft() {
+            // Die Uhr laeuft: haeufiger zeichnen, damit versteckte Erzeuger
+            // (Bild-Scan, Laub-Marker) und der Herzschlag aktuell bleiben.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
         // Das Modul des Players an den Rhythmus-Renderer durchreichen
         // (Klangquelle „Modul-Samples").
         self.rhythm
@@ -467,6 +524,19 @@ impl eframe::App for JamApp {
         // so läuft der Dekoder auch nach einem Tab-Wechsel nur seine kurze
         // Bilder-Reihe weiter und wird danach sicher gestoppt.
         self.laub.video_schritt(ui.ctx());
+        // Der Bild-Scan klingt in jedem Tab: ist er angemeldet, aber sein Tab
+        // nicht sichtbar (auch nicht B2/Kombi), tickt ihn die App hier weiter —
+        // ohne Textur-Upload, nur fuer Kamerabild, Noten und Puffer.
+        let bild_sichtbar = matches!(self.tab, Tab::Bild | Tab::Bild2)
+            || (self.tab == Tab::Kombi
+                && (self.kombi_oben == KombiTeil::Bild || self.kombi_unten == KombiTeil::Bild));
+        if !bild_sichtbar
+            && self.bild.scan_aktiv()
+            && crate::transport::teil_aktiv(crate::transport::Teil::Bild)
+        {
+            self.bild
+                .transport_schritt(ui.ctx(), self.rhythm.pattern_mut());
+        }
         match self.tab {
             Tab::Ueberblick => self.view_ueberblick(ui),
             Tab::Player => self.view_player(ui),
@@ -492,9 +562,6 @@ impl eframe::App for JamApp {
         // Der Linien-/Bereichston des Oszillator-Scans klingt nur, wo das Bild
         // sichtbar ist (Bild, B2 oder Kombi mit Bild) — sonst bliebe er beim
         // Tab-Wechsel für immer stehen.
-        let bild_sichtbar = matches!(self.tab, Tab::Bild | Tab::Bild2)
-            || (self.tab == Tab::Kombi
-                && (self.kombi_oben == KombiTeil::Bild || self.kombi_unten == KombiTeil::Bild));
         if !bild_sichtbar {
             self.bild.linienton_aus();
         }
@@ -1073,6 +1140,7 @@ impl JamApp {
         let mut uebernehmen = None;
         egui::CentralPanel::default().show(ui, |ui| {
             uebernehmen = self.kreis.ui(ui);
+            kreis_presets::ui(ui, &mut self.kreis);
         });
         if let Some(klassen) = uebernehmen {
             self.bild

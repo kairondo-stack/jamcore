@@ -52,6 +52,11 @@ pub struct Player {
     shared: Arc<Shared>,
     worker: Option<std::thread::JoinHandle<()>>,
     path: String,
+    /// Tempo (BPM) und Speed (Ticks je Zeile) direkt nach dem Laden, bevor
+    /// der Audio-Thread rendert. Warum dort: so sind es die Kopfdaten des
+    /// Moduls und nicht ein Tempo-Effekt aus einer spaeteren Zeile.
+    it_tempo: i32,
+    it_speed: i32,
 }
 
 /// Klonbarer Zugriff auf das Modul eines Players, damit andere Panels
@@ -141,6 +146,8 @@ impl Player {
     pub fn play(path: &Path, looping: bool, sample_rate: c_int) -> Result<Self, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let module = Mod::from_bytes(bytes)?;
+        let it_tempo = module.current_tempo();
+        let it_speed = module.current_speed();
         info!(
             "jamandroid: Modul {:?} geladen ({} Kanäle, {} Orders, Titel {:?})",
             path.display(),
@@ -193,7 +200,16 @@ impl Player {
             shared,
             worker: Some(worker),
             path: name,
+            it_tempo,
+            it_speed,
         })
+    }
+
+    /// Tempo (BPM) und Speed (Ticks je Zeile) aus dem Modulkopf. 0 heißt,
+    /// dass libopenmpt nichts Verwertbares geliefert hat — dann bleibt das
+    /// App-Tempo unveraendert.
+    pub fn it_tempo_werte(&self) -> (i32, i32) {
+        (self.it_tempo, self.it_speed)
     }
 
     /// Titel, Künstler, Typ und Länge (nicht leere Werte), wie sie libopenmpt
