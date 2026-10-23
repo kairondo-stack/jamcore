@@ -745,7 +745,7 @@ pub fn rampe_zeitpunkte(
         // Keine mittleren Intervalle: die beiden Randlaengen proportional
         // strecken, damit der Abschnitt exakt gefuellt ist.
         let summe = links + rechts;
-        let (l, r) = if summe > 0.0 {
+        let (l, _r) = if summe > 0.0 {
             (links * total / summe, rechts * total / summe)
         } else {
             (total / 2.0, total / 2.0)
@@ -995,6 +995,400 @@ pub fn aufnahme_blockstruktur(
         pause_steps = 0;
     }
     (dauern, pausen)
+}
+
+// ---------------------------------------------------------------------------
+// Tasten `-` / `--`: Schrittweiten-Bereiche und Handbearbeitung
+// ---------------------------------------------------------------------------
+//
+// Die Vorlage kennt fuer Schrittweiten die K+Eingaben (startIndexnum,
+// endIndexnum, schrittweitanz). Hier ersetzen zwei echte Tasten das:
+// - `-`  setzt die Weite fuer die **laufende Wertphase** auf 1/4 ihrer Dauer,
+// - `--` setzt eine **globale** Weite: 1/4 ab dem Tastendruck bis zum Ende.
+//
+// Die Weite wird roh gespeichert (keine stille Begrenzung). Die Anzahl der
+// Schritte ist `round(Dauer/Weite)` und darf **0** sein — dann ist der
+// Abschnitt eine Pause, genau wie Taste 0.
+
+/// Woher die Schrittweite eines Bereichs kommt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeiteArt {
+    /// Keine `-`-Taste: der getippte Wert zaehlt die Schritte.
+    Wert,
+    /// `-`: 1/4 der laufenden Wertphase.
+    Lokal,
+    /// `--`: 1/4 ab dem Tastendruck bis zum Ende.
+    Global,
+}
+
+impl WeiteArt {
+    /// Kurzname fuer Anzeige und Log.
+    pub fn name(self) -> &'static str {
+        match self {
+            WeiteArt::Wert => "Wert",
+            WeiteArt::Lokal => "lokal",
+            WeiteArt::Global => "global",
+        }
+    }
+}
+
+/// Eine `-`/`--`-Taste mit relativem Zeitpunkt (Sekunden ab Aufnahmebeginn).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WeitenEreignis {
+    pub art: WeiteArt,
+    pub zeit_s: f64,
+}
+
+/// Ein bearbeitbarer Bereich der Aufnahme.
+///
+/// `weite_s` und `schritte` sind **roh** aus der Aufnahme gerechnet. Die
+/// Handbearbeitung aendert nur diese Kopie; `roh_bereiche` bleibt daneben
+/// unangetastet (eigene Ebene).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Bereich {
+    pub art: WeiteArt,
+    /// Getippter Wert/Ton (fuer Farbe und Blockdauer).
+    pub wert: i32,
+    pub start_s: f64,
+    pub ende_s: f64,
+    /// Rohe Schrittweite in Sekunden (nicht geklemmt).
+    pub weite_s: f64,
+    /// Rohe Schrittzahl; 0 ist eine Pause.
+    pub schritte: u32,
+    /// Erster/letzter Schritt im Gesamtverlauf (einschliesslich).
+    pub start_schritt: u32,
+    pub ende_schritt: u32,
+    /// Fadergrenzen und -stellung fuer die Handbearbeitung (ms).
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub fader: f64,
+}
+
+/// 1/4 der laufenden Wertphase.
+pub fn weite_lokal_s(start_s: f64, ende_s: f64) -> f64 {
+    ((ende_s - start_s).max(0.0)) / 4.0
+}
+
+/// 1/4 ab dem Tastendruck bis zum Aufnahmeende.
+pub fn weite_global_s(taste_s: f64, ende_s: f64) -> f64 {
+    ((ende_s - taste_s).max(0.0)) / 4.0
+}
+
+/// Rohrechnung Dauer/Weite, **ohne Minimum** und ohne Obergrenze.
+///
+/// `round` ist die kaufmaennische Annaeherung; bei einer Weite groesser als
+/// die doppelte Dauer kommt 0 heraus (Pause). Eine technische Saettigung bei
+/// `u32::MAX` verhindert nur einen Ueberlauf, keine musikalische Begrenzung.
+pub fn schritte_aus_weite(dauer_s: f64, weite_s: f64) -> u32 {
+    if !dauer_s.is_finite() || dauer_s <= 0.0 || !weite_s.is_finite() || weite_s <= 0.0 {
+        return 0;
+    }
+    let roh = (dauer_s / weite_s).round();
+    if !roh.is_finite() || roh <= 0.0 {
+        0
+    } else if roh >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        roh as u32
+    }
+}
+
+/// Nur ein Hinweis, keine Klemmung: ist die rohe Weite groesser als die
+/// Pattern-/Taktzeit? Die App meldet das im Status/Log und laesst den Wert
+/// unveraendert.
+pub fn weite_ueber_pattern(weite_s: f64, pattern_s: f64) -> bool {
+    pattern_s.is_finite() && pattern_s > 0.0 && weite_s.is_finite() && weite_s > pattern_s
+}
+
+/// Wertphasen: aufeinanderfolgende gleiche Werte bilden eine Phase.
+/// Eine Phase endet am naechsten **anderen** Wert oder am Aufnahmeende.
+fn phasen_aus_aufnahme(werte: &[AufnahmeWert], ende_s: f64) -> Vec<(i32, f64, f64)> {
+    let ende = if ende_s.is_finite() {
+        ende_s.max(0.0)
+    } else {
+        0.0
+    };
+    let liste = aufnahme_sortiert(werte, ende);
+    let mut raus = Vec::new();
+    let mut i = 0;
+    while i < liste.len() {
+        let (wert, start) = liste[i];
+        let mut j = i + 1;
+        while j < liste.len() && liste[j].0 == wert {
+            j += 1;
+        }
+        let phase_ende = if j < liste.len() { liste[j].1 } else { ende };
+        raus.push((wert, start, phase_ende.max(start)));
+        i = j;
+    }
+    raus
+}
+
+/// Die passende Weite fuer eine Phase: die **spaeteste** Taste, die auf die
+/// Phase wirkt. Ein globales `--` gilt ab seinem Zeitpunkt auch fuer spaetere
+/// Phasen; ein lokales `-` nur fuer die Phase, in der es gedrueckt wurde.
+/// Eine Taste genau am Phasenende gehoert zur naechsten Phase.
+fn weite_fuer_phase(
+    start_s: f64,
+    ende_s: f64,
+    weiten: &[WeitenEreignis],
+    aufnahme_ende_s: f64,
+) -> (WeiteArt, f64) {
+    let mut best: Option<WeitenEreignis> = None;
+    for e in weiten {
+        if !e.zeit_s.is_finite() || e.art == WeiteArt::Wert {
+            continue;
+        }
+        let applies = match e.art {
+            WeiteArt::Lokal => e.zeit_s >= start_s - 1e-9 && e.zeit_s < ende_s - 1e-9,
+            WeiteArt::Global => e.zeit_s < ende_s - 1e-9,
+            WeiteArt::Wert => false,
+        };
+        if !applies {
+            continue;
+        }
+        let besser = match best {
+            None => true,
+            Some(b) => {
+                e.zeit_s > b.zeit_s + 1e-9
+                    || ((e.zeit_s - b.zeit_s).abs() <= 1e-9
+                        && e.art == WeiteArt::Global
+                        && b.art == WeiteArt::Lokal)
+            }
+        };
+        if besser {
+            best = Some(*e);
+        }
+    }
+    match best {
+        Some(e) if e.art == WeiteArt::Lokal => (WeiteArt::Lokal, weite_lokal_s(start_s, ende_s)),
+        Some(e) => (WeiteArt::Global, weite_global_s(e.zeit_s, aufnahme_ende_s)),
+        None => (WeiteArt::Wert, 0.0),
+    }
+}
+
+/// Bereiche aus Rohaufnahme und `-`/`--`-Tasten. Die Schrittzahlen sind roh;
+/// die Spannen (`start_schritt`/`ende_schritt`) fuellt
+/// [`bereich_schrittspannen`], weil dafuer die Pausenweite gebraucht wird.
+pub fn bereiche_aus_aufnahme(
+    werte: &[AufnahmeWert],
+    ende_s: f64,
+    weiten: &[WeitenEreignis],
+) -> Vec<Bereich> {
+    let ende = if ende_s.is_finite() {
+        ende_s.max(0.0)
+    } else {
+        0.0
+    };
+    let phasen = phasen_aus_aufnahme(werte, ende);
+    let mut raus = Vec::new();
+    for (wert, start, phase_ende) in phasen {
+        let (art, weite) = weite_fuer_phase(start, phase_ende, weiten, ende);
+        let dauer = (phase_ende - start).max(0.0);
+        // Eine 0-Phase bleibt immer Pause — auch wenn eine `-`/`--`-Taste
+        // daneben liegt.
+        let (weite_s, schritte) = if wert <= 0 {
+            (0.0, 0)
+        } else {
+            match art {
+                WeiteArt::Wert => (dauer / wert as f64, wert as u32),
+                _ => {
+                    let w = weite.max(0.0);
+                    (w, schritte_aus_weite(dauer, w))
+                }
+            }
+        };
+        let weite_ms = weite_s * 1000.0;
+        raus.push(Bereich {
+            art,
+            wert,
+            start_s: start,
+            ende_s: phase_ende,
+            weite_s,
+            schritte,
+            start_schritt: 0,
+            ende_schritt: 0,
+            // Der Fader startet in der Mitte der rohen Weite; der Nutzer
+            // kann Min/Max und damit den Bereich selbst setzen.
+            min_ms: weite_ms * 0.5,
+            max_ms: weite_ms * 1.5,
+            fader: 0.5,
+        });
+    }
+    raus
+}
+
+/// Die Schrittweite fuer Pausen: Fader aus den Optionen, sonst Median der
+/// rohen Bereichsweiten. 0 heisst „keine Pausenweite bekannt“.
+pub fn bereich_schritt_ms(bereiche: &[Bereich], optionen: &AufnahmeOptionen) -> f64 {
+    if optionen.step_min_ms > 0.0 && optionen.step_max_ms > 0.0 {
+        return fader_schritt_ms(optionen.step_min_ms, optionen.step_max_ms, optionen);
+    }
+    let laengen: Vec<f64> = bereiche
+        .iter()
+        .filter(|b| b.schritte > 0 && b.weite_s > 0.0)
+        .map(|b| b.weite_s * 1000.0)
+        .collect();
+    median(laengen).unwrap_or(0.0)
+}
+
+/// Die absoluten Schrittspannen je Bereich (einschliesslich) fuellen.
+/// Klingende Bereiche belegen `schritte`; 0-Schritt-Bereiche (Pausen)
+/// ruecken um ihre Dauer in Pausenschritten weiter.
+pub fn bereich_schrittspannen(bereiche: &mut [Bereich], schritt_ms: f64) {
+    let mut schritt: u32 = 0;
+    for b in bereiche.iter_mut() {
+        let dauer = (b.ende_s - b.start_s).max(0.0);
+        if b.schritte > 0 {
+            b.start_schritt = schritt;
+            b.ende_schritt = schritt.saturating_add(b.schritte - 1);
+            schritt = schritt.saturating_add(b.schritte);
+        } else {
+            b.start_schritt = schritt;
+            let pause = if schritt_ms.is_finite() && schritt_ms > 0.0 {
+                (dauer * 1000.0 / schritt_ms).round().max(0.0) as u32
+            } else {
+                0
+            };
+            b.ende_schritt = schritt.saturating_add(pause.saturating_sub(1));
+            schritt = schritt.saturating_add(pause);
+        }
+    }
+}
+
+/// notes3 aus fertigen Bereichen. Mit `optionen.rampe` laeuft die
+/// Schrittweite je Bereich von `step_min_ms` nach `step_max_ms` (wie die
+/// Vorlage); sonst werden die Schritte gleichmaessig ueber den Bereich
+/// verteilt. `schritte == 0` wird eine Pausenmarke.
+pub fn notes3_aus_bereichen(
+    bereiche: &[Bereich],
+    optionen: &AufnahmeOptionen,
+) -> Vec<AufnahmeNote> {
+    let mut raus = Vec::new();
+    for b in bereiche {
+        if b.schritte == 0 {
+            raus.push(AufnahmeNote {
+                zeit_s: b.start_s,
+                wert: 0,
+            });
+            continue;
+        }
+        let dauer = (b.ende_s - b.start_s).max(0.0);
+        if optionen.rampe && optionen.step_min_ms > 0.0 && optionen.step_max_ms > 0.0 {
+            let zeiten = rampe_zeitpunkte(
+                b.start_s,
+                b.ende_s,
+                b.schritte,
+                optionen.step_min_ms,
+                optionen.step_max_ms,
+            );
+            for zeit_s in zeiten.into_iter().take(b.schritte as usize) {
+                raus.push(AufnahmeNote {
+                    zeit_s,
+                    wert: b.wert,
+                });
+            }
+        } else {
+            for k in 0..b.schritte {
+                raus.push(AufnahmeNote {
+                    zeit_s: b.start_s + dauer * k as f64 / b.schritte as f64,
+                    wert: b.wert,
+                });
+            }
+        }
+    }
+    raus
+}
+
+/// Blockdauern/Pausen aus fertigen Bereichen fuer die Bereichs-Ersetzung.
+/// 0-Schritt-Bereiche sind Pausen und werden vor dem naechsten Block
+/// gesammelt.
+pub fn bereich_blockstruktur(bereiche: &[Bereich], schritt_ms: f64) -> (Vec<(i32, u32)>, Vec<u32>) {
+    let mut dauern = Vec::new();
+    let mut pausen = Vec::new();
+    let mut pause_steps: u32 = 0;
+    for b in bereiche {
+        if b.schritte > 0 {
+            dauern.push((b.wert, b.schritte));
+            pausen.push(pause_steps);
+            pause_steps = 0;
+        } else if schritt_ms.is_finite() && schritt_ms > 0.0 {
+            let dauer = (b.ende_s - b.start_s).max(0.0);
+            pause_steps =
+                pause_steps.saturating_add((dauer * 1000.0 / schritt_ms).round().max(0.0) as u32);
+        }
+    }
+    (dauern, pausen)
+}
+
+/// Bereich mit einer anderen rohen Weite (Handbearbeitung). Keine Klemmung
+/// an Min/Max; `0` ergibt 0 Schritte, negative Eingaben werden als 0
+/// behandelt.
+pub fn bereich_mit_weite(bereich: &Bereich, weite_s: f64) -> Bereich {
+    let mut neu = bereich.clone();
+    neu.weite_s = if weite_s.is_finite() && weite_s > 0.0 {
+        weite_s
+    } else {
+        0.0
+    };
+    neu.schritte = schritte_aus_weite((neu.ende_s - neu.start_s).max(0.0), neu.weite_s);
+    if neu.max_ms > neu.min_ms {
+        neu.fader =
+            ((neu.weite_s * 1000.0 - neu.min_ms) / (neu.max_ms - neu.min_ms)).clamp(0.0, 1.0);
+    }
+    neu
+}
+
+/// Fader zwischen den Min/Max-Grenzen eines Bereichs.
+pub fn bereich_mit_fader(bereich: &Bereich, fader: f64) -> Bereich {
+    let f = if fader.is_finite() {
+        fader.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let weite_ms = if bereich.max_ms > bereich.min_ms {
+        bereich.min_ms + f * (bereich.max_ms - bereich.min_ms)
+    } else {
+        bereich.weite_s * 1000.0
+    };
+    let mut neu = bereich_mit_weite(bereich, weite_ms / 1000.0);
+    neu.fader = f;
+    neu
+}
+
+/// Bereich zeitlich setzen (Start/Ende). Die Weite bleibt; die Schrittzahl
+/// wird roh neu gerechnet.
+pub fn bereich_mit_zeit(bereich: &Bereich, start_s: f64, ende_s: f64) -> Bereich {
+    let mut neu = bereich.clone();
+    let start = if start_s.is_finite() {
+        start_s.max(0.0)
+    } else {
+        0.0
+    };
+    let ende = if ende_s.is_finite() {
+        ende_s.max(start)
+    } else {
+        start
+    };
+    neu.start_s = start;
+    neu.ende_s = ende;
+    neu.schritte = schritte_aus_weite((ende - start).max(0.0), neu.weite_s);
+    neu
+}
+
+/// Bereich verschieben (Dauer bleibt) innerhalb der Aufnahme.
+pub fn bereich_verschieben(bereich: &Bereich, delta_s: f64, aufnahme_ende_s: f64) -> Bereich {
+    let dauer = (bereich.ende_s - bereich.start_s).max(0.0);
+    let max_start = (aufnahme_ende_s - dauer).max(0.0);
+    let start = (bereich.start_s + delta_s).clamp(0.0, max_start);
+    bereich_mit_zeit(bereich, start, start + dauer)
+}
+
+/// Bereich am Ende kuerzen (negative Werte verlaengern bis zum Aufnahmeende).
+pub fn bereich_kuerzen(bereich: &Bereich, delta_s: f64, aufnahme_ende_s: f64) -> Bereich {
+    let start = bereich.start_s.clamp(0.0, aufnahme_ende_s.max(0.0));
+    let ende = (bereich.ende_s - delta_s).clamp(start, aufnahme_ende_s.max(start));
+    bereich_mit_zeit(bereich, start, ende)
 }
 
 #[cfg(test)]
@@ -1626,5 +2020,326 @@ mod tests {
         let (dauern, pausen) = aufnahme_blockstruktur(&[(2, 0.0), (0, 1.0), (4, 2.0)], 3.0, &opt);
         assert_eq!(dauern, vec![(2, 2), (4, 4)]);
         assert_eq!(pausen, vec![0, 2], "1 s Pause = 2 Schritte");
+    }
+
+    // ------------------------------------------------------------------
+    // `-` / `--`: Schrittweiten-Bereiche, 0 Schritte, Handbearbeitung
+    // ------------------------------------------------------------------
+
+    fn bereiche_mit_spannen(
+        werte: &[AufnahmeWert],
+        ende_s: f64,
+        weiten: &[WeitenEreignis],
+    ) -> Vec<Bereich> {
+        let mut b = bereiche_aus_aufnahme(werte, ende_s, weiten);
+        let opt = AufnahmeOptionen::default();
+        let ms = bereich_schritt_ms(&b, &opt);
+        bereich_schrittspannen(&mut b, ms);
+        b
+    }
+
+    #[test]
+    fn lokale_weite_ist_ein_viertel_der_phase() {
+        // Wert 4 von 0 bis 2 s, dann 8 (2-3 s) und 1 (3-5 s).
+        let werte = [(4, 0.0), (8, 2.0), (1, 3.0)];
+        let weiten = [WeitenEreignis {
+            art: WeiteArt::Lokal,
+            zeit_s: 0.0,
+        }];
+        let b = bereiche_mit_spannen(&werte, 5.0, &weiten);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0].art, WeiteArt::Lokal);
+        assert!(nah(b[0].weite_s, 0.5), "2 s / 4 = 0,5 s");
+        assert_eq!(b[0].schritte, 4, "2 s / 0,5 s");
+        // Die folgenden Phasen bleiben beim Wert.
+        assert_eq!(b[1].art, WeiteArt::Wert);
+        assert!(nah(b[1].weite_s, 1.0 / 8.0));
+        assert_eq!(b[1].schritte, 8);
+        assert_eq!(b[2].art, WeiteArt::Wert);
+        assert_eq!(b[2].schritte, 1);
+    }
+
+    #[test]
+    fn globale_weite_ist_ein_viertel_bis_zum_ende() {
+        // `--` bei 2 s, Ende 5 s: Weite 0,75 s; die Phase davor bleibt Wert.
+        let werte = [(4, 0.0), (8, 2.0), (1, 3.0)];
+        let weiten = [WeitenEreignis {
+            art: WeiteArt::Global,
+            zeit_s: 2.0,
+        }];
+        let b = bereiche_mit_spannen(&werte, 5.0, &weiten);
+        assert_eq!(b.len(), 3);
+        assert_eq!(b[0].art, WeiteArt::Wert, "vor dem -- unveraendert");
+        assert_eq!(b[0].schritte, 4);
+        assert_eq!(b[1].art, WeiteArt::Global);
+        assert!(nah(b[1].weite_s, 0.75), "3 s / 4 = 0,75 s");
+        assert_eq!(b[1].schritte, 1, "1 s / 0,75 s gerundet 1");
+        assert_eq!(b[2].art, WeiteArt::Global);
+        assert!(nah(b[2].weite_s, 0.75));
+        assert_eq!(b[2].schritte, 3, "2 s / 0,75 s gerundet 3");
+    }
+
+    #[test]
+    fn minus_und_minusminus_wirken_verschieden() {
+        // Gleiche Phase 0-2 s (Wert 4): lokal 0,5 s -> 4 Schritte,
+        // global ab 0 s bis 5 s: 1,25 s -> 2 Schritte.
+        let werte = [(4, 0.0), (8, 2.0), (1, 3.0)];
+        let lokal = bereiche_mit_spannen(
+            &werte,
+            5.0,
+            &[WeitenEreignis {
+                art: WeiteArt::Lokal,
+                zeit_s: 0.0,
+            }],
+        );
+        let global = bereiche_mit_spannen(
+            &werte,
+            5.0,
+            &[WeitenEreignis {
+                art: WeiteArt::Global,
+                zeit_s: 0.0,
+            }],
+        );
+        assert_ne!(lokal[0].schritte, global[0].schritte);
+        assert!(nah(lokal[0].weite_s, 0.5));
+        assert!(nah(global[0].weite_s, 1.25));
+        assert_eq!(lokal[0].schritte, 4);
+        assert_eq!(global[0].schritte, 2);
+    }
+
+    #[test]
+    fn weite_ohne_klemmung_und_null_schritte() {
+        // 1 s Dauer, 2,4 s Weite: roh gespeichert, 0 Schritte (Pause).
+        let b = Bereich {
+            art: WeiteArt::Global,
+            wert: 4,
+            start_s: 0.0,
+            ende_s: 1.0,
+            weite_s: 2.4,
+            schritte: schritte_aus_weite(1.0, 2.4),
+            start_schritt: 0,
+            ende_schritt: 0,
+            min_ms: 1000.0,
+            max_ms: 3000.0,
+            fader: 0.5,
+        };
+        assert_eq!(b.schritte, 0);
+        assert!(nah(b.weite_s, 2.4), "keine stille Begrenzung");
+        // 0,1 s Weite auf 2 s: 20 Schritte, nicht auf ein Maximum geklemmt.
+        assert_eq!(schritte_aus_weite(2.0, 0.1), 20);
+        let fein = bereich_mit_weite(&b, 0.1);
+        assert_eq!(fein.schritte, 10, "1 s / 0,1 s (Bereich ist 1 s)");
+        // Fader darf die rohe Weite direkt auf 2,4 s setzen.
+        let mut b2 = b.clone();
+        b2.min_ms = 1000.0;
+        b2.max_ms = 3000.0;
+        let gefadert = bereich_mit_fader(&b2, 0.7);
+        assert!(nah(gefadert.weite_s, 2.4));
+        assert_eq!(gefadert.schritte, 0);
+    }
+
+    #[test]
+    fn null_schritte_aus_globaler_weite_ist_pause() {
+        // Global bei 0 s bis 10 s => 2,5 s Weite. Die 1-s-Phase 4 bekommt
+        // 0 Schritte; die 9-s-Phase 8 bekommt 4 Schritte.
+        let werte = [(4, 0.0), (8, 1.0)];
+        let weiten = [WeitenEreignis {
+            art: WeiteArt::Global,
+            zeit_s: 0.0,
+        }];
+        let b = bereiche_mit_spannen(&werte, 10.0, &weiten);
+        assert_eq!(b[0].schritte, 0, "1 s / 2,5 s = 0,4 -> 0");
+        assert_eq!(b[1].schritte, 4, "9 s / 2,5 s = 3,6 -> 4");
+        let opt = AufnahmeOptionen::default();
+        let n3 = notes3_aus_bereichen(&b, &opt);
+        assert_eq!(n3[0].wert, 0, "0 Schritte werden zur Pause");
+        assert!(n3.iter().any(|n| n.wert == 8));
+    }
+
+    #[test]
+    fn handaenderung_ist_eigene_ebene() {
+        let roh = Bereich {
+            art: WeiteArt::Lokal,
+            wert: 4,
+            start_s: 1.0,
+            ende_s: 3.0,
+            weite_s: 0.5,
+            schritte: 4,
+            start_schritt: 0,
+            ende_schritt: 3,
+            min_ms: 250.0,
+            max_ms: 750.0,
+            fader: 0.5,
+        };
+        let original = roh.clone();
+        // Weite direkt aendern.
+        let breit = bereich_mit_weite(&roh, 1.0);
+        assert_eq!(breit.schritte, 2);
+        assert_eq!(roh, original, "Rohwert bleibt unangetastet");
+        // Fader aendert nur die Kopie.
+        let gefadert = bereich_mit_fader(&roh, 0.0);
+        assert!(nah(gefadert.weite_s, 0.25));
+        assert_eq!(roh, original);
+        // Verschieben und Kuerzen.
+        let verschoben = bereich_verschieben(&roh, 0.5, 5.0);
+        assert!(nah(verschoben.start_s, 1.5));
+        assert!(nah(verschoben.ende_s, 3.5));
+        let gekuerzt = bereich_kuerzen(&roh, 0.5, 5.0);
+        assert!(nah(gekuerzt.ende_s, 2.5));
+        assert_eq!(gekuerzt.schritte, 3, "1,5 s / 0,5 s");
+        assert_eq!(roh, original);
+    }
+
+    #[test]
+    fn bereich_blockstruktur_und_spannen() {
+        // 4 Schritte, Pause 1 s (500 ms => 2 Schritte), 2 Schritte.
+        let b = vec![
+            Bereich {
+                art: WeiteArt::Wert,
+                wert: 4,
+                start_s: 0.0,
+                ende_s: 2.0,
+                weite_s: 0.5,
+                schritte: 4,
+                start_schritt: 0,
+                ende_schritt: 0,
+                min_ms: 250.0,
+                max_ms: 750.0,
+                fader: 0.5,
+            },
+            Bereich {
+                art: WeiteArt::Wert,
+                wert: 0,
+                start_s: 2.0,
+                ende_s: 3.0,
+                weite_s: 0.0,
+                schritte: 0,
+                start_schritt: 0,
+                ende_schritt: 0,
+                min_ms: 0.0,
+                max_ms: 0.0,
+                fader: 0.5,
+            },
+            Bereich {
+                art: WeiteArt::Wert,
+                wert: 8,
+                start_s: 3.0,
+                ende_s: 4.0,
+                weite_s: 0.5,
+                schritte: 2,
+                start_schritt: 0,
+                ende_schritt: 0,
+                min_ms: 250.0,
+                max_ms: 750.0,
+                fader: 0.5,
+            },
+        ];
+        let (dauern, pausen) = bereich_blockstruktur(&b, 500.0);
+        assert_eq!(dauern, vec![(4, 4), (8, 2)]);
+        assert_eq!(pausen, vec![0, 2]);
+        let mut b2 = b.clone();
+        bereich_schrittspannen(&mut b2, 500.0);
+        assert_eq!((b2[0].start_schritt, b2[0].ende_schritt), (0, 3));
+        assert_eq!((b2[1].start_schritt, b2[1].ende_schritt), (4, 5));
+        assert_eq!((b2[2].start_schritt, b2[2].ende_schritt), (6, 7));
+    }
+
+    #[test]
+    fn bereiche_mappen_in_bereich_mit_pausen() {
+        // 4/2 Schritte, 1 s Pause, 8/3 Schritte; der Bereich 2-8 wird ersetzt.
+        let b = vec![
+            Bereich {
+                art: WeiteArt::Wert,
+                wert: 4,
+                start_s: 0.0,
+                ende_s: 1.0,
+                weite_s: 0.5,
+                schritte: 2,
+                start_schritt: 0,
+                ende_schritt: 1,
+                min_ms: 250.0,
+                max_ms: 750.0,
+                fader: 0.5,
+            },
+            Bereich {
+                art: WeiteArt::Wert,
+                wert: 0,
+                start_s: 1.0,
+                ende_s: 2.0,
+                weite_s: 0.0,
+                schritte: 0,
+                start_schritt: 2,
+                ende_schritt: 3,
+                min_ms: 0.0,
+                max_ms: 0.0,
+                fader: 0.5,
+            },
+            Bereich {
+                art: WeiteArt::Wert,
+                wert: 8,
+                start_s: 2.0,
+                ende_s: 3.0,
+                weite_s: 1.0 / 3.0,
+                schritte: 3,
+                start_schritt: 4,
+                ende_schritt: 6,
+                min_ms: 166.0,
+                max_ms: 500.0,
+                fader: 0.5,
+            },
+        ];
+        let (dauern, pausen) = bereich_blockstruktur(&b, 500.0);
+        assert_eq!(dauern, vec![(4, 2), (8, 3)]);
+        assert_eq!(pausen, vec![0, 2]);
+        let alt: Vec<(u32, i32)> = (0..10).map(|i| (i, 60)).collect();
+        let mut verlauf = alt.clone();
+        let meldung = bereich_ersetzen_mit_pausen(&mut verlauf, 2, 8, &dauern, &pausen)
+            .expect("Bereich 2-8 ist gueltig");
+        assert_eq!(meldung.schritte, 6);
+        assert_eq!(meldung.dauer, 7, "2 + 3 Bloecke + 2 Pausen");
+        assert_eq!(meldung.gesamt, 10);
+        assert_eq!(&verlauf[..2], &alt[..2], "davor unveraendert");
+        assert_eq!(
+            &verlauf[7..],
+            &alt[8..],
+            "danach unveraendert (Schritte 8, 9)"
+        );
+        assert!(
+            verlauf[2..4].iter().all(|(_, ton)| *ton == 4),
+            "4er-Block am Bereichsanfang"
+        );
+        assert!(
+            !verlauf.iter().any(|(s, _)| *s == 4),
+            "die Pause bleibt eine Luecke"
+        );
+        assert!(
+            verlauf[4..7].iter().all(|(_, ton)| *ton == 8),
+            "8er-Block nach der Pause (Schritte 5-7)"
+        );
+    }
+
+    #[test]
+    fn weite_ueber_pattern_ist_nur_ein_hinweis() {
+        assert!(weite_ueber_pattern(2.4, 2.0));
+        assert!(!weite_ueber_pattern(2.0, 2.0));
+        assert!(!weite_ueber_pattern(1.0, 2.0));
+        assert!(!weite_ueber_pattern(f64::NAN, 2.0));
+        assert!(!weite_ueber_pattern(2.4, 0.0));
+    }
+
+    #[test]
+    fn bereiche_ohne_tasten_entsprechen_der_alten_kette() {
+        // 2/4/5/0: ohne -/-- muss die Bereichskette dieselben 11 Schritte
+        // und dieselben Zeiten wie notes3 liefern.
+        let werte = [(2, 0.0), (4, 1.0), (5, 3.0), (0, 7.0)];
+        let b = bereiche_mit_spannen(&werte, 7.0, &[]);
+        let opt = AufnahmeOptionen::default();
+        let n3 = notes3_aus_bereichen(&b, &opt);
+        let zeiten: Vec<f64> = n3.iter().filter(|n| n.wert > 0).map(|n| n.zeit_s).collect();
+        let erwartet = [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.8, 4.6, 5.4, 6.2];
+        assert_eq!(zeiten.len(), erwartet.len());
+        for (ist, soll) in zeiten.iter().zip(erwartet) {
+            assert!(nah(*ist, soll), "Zeit {ist} statt {soll}");
+        }
     }
 }

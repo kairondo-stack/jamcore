@@ -537,8 +537,9 @@ impl MaskePanel {
         ui.label(
             RichText::new(match (zustand.bereich, self.verlauf_anker) {
                 (Some((von, bis)), _) => format!(
-                    "Bereich {von}-{bis} ({} Schritte): in M2 tippen und „Ende“ \
-                     drücken — die neue Gesamtzeit wird auf diese Bereichszeit gemappt.",
+                    "Bereich {von}-{bis} ({} Schritte): Aufnahme läuft in M2 — Werte \
+                     tippen, 0 = Pause, Ende per „Ende“/Enter. `-` setzt die Weite \
+                     lokal, `--` global; das Ergebnis wird auf diese Bereichszeit gemappt.",
                     bis - von
                 ),
                 (None, Some(start)) => {

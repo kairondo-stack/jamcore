@@ -21,7 +21,9 @@ use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
 use jamcore::grid::Pattern;
-use jamcore::maske::{AufnahmeNote, AufnahmeOptionen, RandModus};
+use jamcore::maske::{
+    AufnahmeNote, AufnahmeOptionen, Bereich, RandModus, WeiteArt, WeitenEreignis,
+};
 use log::info;
 
 use crate::maske::{self, Aufzeichnung};
@@ -32,6 +34,9 @@ pub const TASTEN: usize = 10;
 
 /// Zellenzahl je Reihe im Feld (3x3 plus die Null darunter).
 const SPALTEN: usize = 3;
+
+/// Zwei `-` innerhalb dieser Zeit gelten als `--` (globale Weite).
+const DOPPEL_MINUS_MS: u128 = 450;
 
 pub struct Maske2Panel {
     /// Wert je Position; die Positionen liegen in Nummernblock-Anordnung,
@@ -46,6 +51,12 @@ pub struct Maske2Panel {
     start: Option<Instant>,
     /// „Ende“ gedrueckt: der Endzeitpunkt steht fest.
     ende: Option<Instant>,
+    /// `-`/`--`-Tasten der laufenden Aufnahme.
+    weiten: Vec<WeitenEreignis>,
+    /// Zeitpunkt der letzten `-`-Taste fuer die Doppel-Erkennung (`--`).
+    letzte_minus: Option<Instant>,
+    /// Index des zuletzt angelegten Weiten-Ereignisses.
+    letzte_weite: Option<usize>,
     /// notes3 (gleiche Zwischenschritte) fuer Anzeige und Log.
     notes3: Vec<AufnahmeNote>,
     /// notes4/Verlauf: (Schrittnummer, Wert), Pausen als Luecken.
@@ -64,6 +75,24 @@ pub struct Maske2Panel {
     /// Nach einem Pfeiltasten-Modus den Fokus am Frame-Ende zuruecksetzen
     /// (egui verschiebt ihn sonst in die Tab-Leiste).
     fokus_zurueck: Option<Option<egui::Id>>,
+    /// Bereiche nach dem Ende — Handbearbeitungsebene.
+    bereiche: Vec<Bereich>,
+    /// Rohe Bereiche (unveraendert); „Zurücksetzen“ stellt sie wieder her.
+    roh_bereiche: Vec<Bereich>,
+    /// Rückgängig-Stapel der Bereiche (je Schritt eine Kopie).
+    undo: Vec<Vec<Bereich>>,
+    /// Ausgewaehlter Bereich fuer die Handbearbeitung.
+    auswahl: Option<usize>,
+    /// Bereich, in den die letzte Aufnahme gemappt wurde (für Handänderungen).
+    letzter_bereich: Option<(u32, u32)>,
+    /// Zuletzt in Maske 1 gesehener Bereich — ein neuer Bereich macht die
+    /// Aufnahme automatisch scharf.
+    letzter_gesehener_bereich: Option<(u32, u32)>,
+    /// Sichtbarer Hinweis zu `-`/`--` (Weite und Bereich).
+    weite_hinweis: String,
+    /// Patternzeit in Sekunden (aus Rhythmus-Länge/Tempo), fuer den Hinweis
+    /// „Weite > Patternzeit“.
+    pattern_s: f64,
     status: String,
     /// Wann zuletzt etwas aufgenommen wurde — die zuletzt benutzte Maske
     /// speist den gruenen Balken im Bild-Tab.
@@ -83,6 +112,9 @@ impl Maske2Panel {
             aufnahme: Vec::new(),
             start: None,
             ende: None,
+            weiten: Vec::new(),
+            letzte_minus: None,
+            letzte_weite: None,
             notes3: Vec::new(),
             verlauf: Vec::new(),
             folge: Vec::new(),
@@ -91,6 +123,14 @@ impl Maske2Panel {
             grenzen_auto: true,
             fest: false,
             fokus_zurueck: None,
+            bereiche: Vec::new(),
+            roh_bereiche: Vec::new(),
+            undo: Vec::new(),
+            auswahl: None,
+            letzter_bereich: None,
+            letzter_gesehener_bereich: None,
+            weite_hinweis: String::new(),
+            pattern_s: 0.0,
             status: "Tasten tippen: Wert = gleiche Schritte, 0 = Pause, Ende = Enter.".to_string(),
             letzte_aenderung: None,
         }
@@ -167,6 +207,81 @@ impl Maske2Panel {
         ende.min(self.ende_s())
     }
 
+    /// Dauer des aktuellen Rhythmus-Patterns in Sekunden. Nur fuer den
+    /// Hinweis „Weite > Patternzeit“ — gerechnet wird nichts geklemmt.
+    fn pattern_zeit_s(&self, pattern: &Pattern) -> f64 {
+        let step =
+            jamcore::transport::step_dauer(crate::transport::bpm(), crate::transport::feinheit());
+        step * pattern.steps_per_cycle() as f64
+    }
+
+    /// Bereiche aus der aktuellen Rohaufnahme (vorlaeufig waehrend der
+    /// Aufnahme, endgueltig nach „Ende“).
+    fn roh_bereiche_jetzt(&self) -> Vec<Bereich> {
+        let mut b =
+            jamcore::maske::bereiche_aus_aufnahme(&self.rohzeiten(), self.ende_s(), &self.weiten);
+        let ms = jamcore::maske::bereich_schritt_ms(&b, &self.optionen);
+        jamcore::maske::bereich_schrittspannen(&mut b, ms);
+        b
+    }
+
+    /// Die Bereiche, aus denen der Verlauf gebaut wird: nach „Ende“ die
+    /// Handbearbeitungsebene, sonst die rohe Vorschau.
+    fn aktuelle_bereiche(&self) -> Vec<Bereich> {
+        if self.fest && !self.bereiche.is_empty() {
+            self.bereiche.clone()
+        } else {
+            self.roh_bereiche_jetzt()
+        }
+    }
+
+    /// Bereichs-Hinweis fuer die Statuszeile: alle `-`/`--`-Bereiche mit
+    /// Start/Ende in Sekunden und Schritten.
+    fn weiten_hinweis(&self) -> String {
+        let mut teile = Vec::new();
+        for (i, b) in self.bereiche.iter().enumerate() {
+            if b.art != WeiteArt::Wert {
+                teile.push(format!(
+                    "{i}: {} {:.2}–{:.2} s / Schritte {}-{} ({} St.) / Weite {:.0} ms",
+                    b.art.name(),
+                    b.start_s,
+                    b.ende_s,
+                    b.start_schritt,
+                    b.ende_schritt,
+                    b.schritte,
+                    b.weite_s * 1000.0
+                ));
+            }
+        }
+        if teile.is_empty() {
+            "keine -/-- Bereiche".to_string()
+        } else {
+            teile.join(" · ")
+        }
+    }
+
+    /// Hinweis, wenn eine globale rohe Weite die Patternzeit uebersteigt.
+    /// Es wird nichts geklemmt.
+    fn weite_warnung(&self) -> Option<String> {
+        for b in self.bereiche.iter() {
+            if b.art == WeiteArt::Wert {
+                continue;
+            }
+            if jamcore::maske::weite_ueber_pattern(b.weite_s, self.pattern_s) {
+                let adj = match b.art {
+                    WeiteArt::Global => "globale",
+                    WeiteArt::Lokal => "lokale",
+                    WeiteArt::Wert => continue,
+                };
+                return Some(format!(
+                    "{adj} Weite {:.1} s > Patternzeit — Bereich per Hand anpassen",
+                    b.weite_s
+                ));
+            }
+        }
+        None
+    }
+
     /// Das gemessene Min/Max der Rand-Schrittlaengen neu bestimmen und —
     /// solange der Nutzer die Felder nicht angefasst hat — in von/bis
     /// uebernehmen.
@@ -225,16 +340,26 @@ impl Maske2Panel {
         self.aufnahme.clear();
         self.start = None;
         self.ende = None;
+        self.weiten.clear();
+        self.letzte_minus = None;
+        self.letzte_weite = None;
         self.notes3.clear();
         self.verlauf.clear();
         self.folge.clear();
         self.min_max = None;
+        self.bereiche.clear();
+        self.roh_bereiche.clear();
+        self.undo.clear();
+        self.auswahl = None;
+        self.letzter_bereich = None;
+        self.weite_hinweis.clear();
         self.fest = false;
         self.letzte_aenderung = Some(Instant::now());
         if let Ok(mut z) = maske::verlauf_zustand().lock() {
             z.entwurf = maske::Entwurf::default();
         }
         let bereich = maske::verlauf_snapshot().bereich;
+        self.letzter_gesehener_bereich = bereich;
         self.status = match bereich {
             Some((von, bis)) => format!(
                 "neu — Bereich {von}-{bis} ({} Schritte), Rand {}",
@@ -254,7 +379,7 @@ impl Maske2Panel {
     /// Ohne Bereich in Maske 1 wird der ganze Verlauf ersetzt. Mit Bereich
     /// werden die Blockdauern und Pausen proportional auf die Bereichszeit
     /// gemappt; ausserhalb bleibt der alte Verlauf stehen.
-    pub fn ende(&mut self) {
+    pub fn ende(&mut self, pattern: &Pattern) {
         if self.aufnahme.is_empty() {
             self.fest = true;
             self.status = "Ende — keine Schritte aufgenommen".to_string();
@@ -264,11 +389,54 @@ impl Maske2Panel {
         self.ende = Some(Instant::now());
         self.fest = true;
         self.grenzen_aktualisieren();
+        // Rohbereiche einmalig festhalten; die Handbearbeitung arbeitet auf
+        // einer Kopie, `roh_bereiche` bleibt fuer „Zurücksetzen“ stehen.
+        let roh = self.roh_bereiche_jetzt();
+        self.roh_bereiche = roh.clone();
+        self.bereiche = roh;
+        self.undo.clear();
+        self.auswahl = self
+            .bereiche
+            .iter()
+            .position(|b| b.schritte > 0)
+            .or_else(|| (!self.bereiche.is_empty()).then_some(0));
         self.nachziehen();
+        let status = self.bereiche_mappen();
 
-        let werte = self.rohzeiten();
-        let ende = self.ende_s();
-        let (dauern, pausen) = jamcore::maske::aufnahme_blockstruktur(&werte, ende, &self.optionen);
+        // Keine stille Begrenzung: eine globale Weite groesser als die
+        // Patternzeit wird nur gemeldet, nicht geklemmt.
+        self.pattern_s = self.pattern_zeit_s(pattern);
+        let warnung = self.weite_warnung();
+        self.weite_hinweis = match warnung {
+            Some(text) => {
+                info!("maske2: {text}");
+                text
+            }
+            None => {
+                let hint = self.weiten_hinweis();
+                info!("maske2: {hint}");
+                hint
+            }
+        };
+        self.status = status;
+        self.letzte_aenderung = Some(Instant::now());
+        info!(
+            "Maske 2: Ende ({} Tasten, {} Schritte)",
+            self.aufnahme.len(),
+            jamcore::maske::verlauf_laenge(&self.verlauf)
+        );
+    }
+
+    /// Aktuelle Bereiche in den Verlauf schreiben — ganzer Verlauf oder
+    /// (wenn in Maske 1 ein Bereich gewaehlt war) nur dieser Bereich.
+    /// Liefert die Statuszeile.
+    fn bereiche_mappen(&mut self) -> String {
+        let bereiche = self.bereiche.clone();
+        if bereiche.is_empty() {
+            return "keine Bereiche".to_string();
+        }
+        let ms = jamcore::maske::bereich_schritt_ms(&bereiche, &self.optionen);
+        let (dauern, pausen) = jamcore::maske::bereich_blockstruktur(&bereiche, ms);
         let block_summe: u32 = dauern.iter().map(|(_, d)| *d).sum();
         let pausen_summe: u32 = pausen.iter().sum();
         let gesamt = block_summe + pausen_summe;
@@ -281,10 +449,15 @@ impl Maske2Panel {
 
         let mut z = match maske::verlauf_zustand().lock() {
             Ok(z) => z,
-            Err(_) => return,
+            Err(_) => return "Verlauf gesperrt".to_string(),
         };
         z.entwurf = maske::Entwurf::default();
-        match z.bereich.take() {
+        // Beim ersten „Ende“ steht der Bereich noch im Zustand; bei
+        // Handänderungen ist er dort schon abgeraeumt und kommt aus
+        // `letzter_bereich`.
+        let bereich = z.bereich.take().or(self.letzter_bereich);
+        self.letzter_bereich = bereich;
+        match bereich {
             Some((von, bis)) => {
                 let laenge = jamcore::maske::verlauf_laenge(&z.schritte);
                 let von = von.min(laenge);
@@ -307,30 +480,43 @@ impl Maske2Panel {
                             meldung.schritte, meldung.dauer
                         );
                         info!("maske: Verlauf {} Schritte", meldung.gesamt);
-                        self.status = format!(
+                        format!(
                             "Bereich {von}-{bis}: {} Schritte aus {} — Verlauf {} Schritte",
                             meldung.schritte, meldung.dauer, meldung.gesamt
-                        );
+                        )
                     }
                     None => {
                         // Leerer/ungueltiger Bereich: nichts loeschen.
                         info!("maske: Bereich {von}-{bis} ohne neue Schritte — unveraendert");
-                        self.status =
-                            format!("Bereich {von}-{bis}: keine Schritte — Verlauf unveraendert");
+                        format!("Bereich {von}-{bis}: keine Schritte — Verlauf unveraendert")
                     }
                 }
             }
             None => {
                 z.schritte = self.verlauf.clone();
                 info!("maske: Verlauf {gesamt} Schritte");
-                self.status = format!("{gesamt} Schritte festgehalten — „neu“ nimmt wieder auf");
+                format!("{gesamt} Schritte festgehalten — „neu“ nimmt wieder auf")
             }
         }
+    }
+
+    /// Handänderung anwenden: Verlauf neu bauen und (ganz oder im Bereich)
+    /// in die gemeinsame Quelle schreiben.
+    fn verlauf_anwenden(&mut self) {
+        if !self.fest || self.bereiche.is_empty() {
+            return;
+        }
+        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        self.nachziehen();
+        let status = self.bereiche_mappen();
+        self.status = status;
+        self.weite_hinweis = self.weiten_hinweis();
+        if let Some(text) = self.weite_warnung() {
+            info!("maske2: {text}");
+            self.weite_hinweis = text;
+        }
         self.letzte_aenderung = Some(Instant::now());
-        info!(
-            "Maske 2: Ende ({} Tasten, {gesamt} Schritte)",
-            self.aufnahme.len()
-        );
     }
 
     /// Eine Taste des Feldes anschlagen: (Wert, Zeitpunkt) aufnehmen.
@@ -344,9 +530,13 @@ impl Maske2Panel {
         if self.start.is_none() {
             self.start = Some(jetzt);
         }
+        // Ein Wert beendet das Zeitfenster fuer das doppelte `--`.
+        self.letzte_minus = None;
+        self.letzte_weite = None;
         self.aufnahme.push((wert, jetzt));
         self.grenzen_aktualisieren();
         self.nachziehen();
+        self.weite_hinweis_aktualisieren();
         self.letzte_aenderung = Some(jetzt);
         let t = self
             .start
@@ -361,15 +551,143 @@ impl Maske2Panel {
         };
     }
 
+    /// `-` waehrend der Aufnahme: lokale Weite (1/4 der laufenden
+    /// Wertphase). Zweimal `-` innerhalb von [`DOPPEL_MINUS_MS`] macht
+    /// daraus die globale Weite `--` (1/4 ab dem ersten Druck bis zum Ende).
+    fn minus_taste(&mut self) {
+        if self.fest || self.start.is_none() {
+            return;
+        }
+        let jetzt = Instant::now();
+        let doppelt = self
+            .letzte_minus
+            .is_some_and(|t| jetzt.duration_since(t).as_millis() <= DOPPEL_MINUS_MS);
+        if doppelt {
+            if let Some(idx) = self.letzte_weite {
+                if let Some(e) = self.weiten.get_mut(idx) {
+                    e.art = WeiteArt::Global;
+                }
+            }
+            self.letzte_minus = None;
+            self.letzte_weite = None;
+            self.weite_hinweis_global(jetzt);
+        } else {
+            let t = self
+                .start
+                .map(|start| jetzt.duration_since(start).as_secs_f64())
+                .unwrap_or(0.0);
+            self.weiten.push(WeitenEreignis {
+                art: WeiteArt::Lokal,
+                zeit_s: t,
+            });
+            self.letzte_weite = Some(self.weiten.len() - 1);
+            self.letzte_minus = Some(jetzt);
+            self.weite_hinweis_lokal(jetzt);
+        }
+        self.nachziehen();
+    }
+
+    /// Vorlaeufige lokale Weite fuer den Hinweis: 1/4 der aktuellen
+    /// Wertphase bis jetzt. Der endgueltige Wert entsteht beim naechsten
+    /// Tastendruck/Ende und steht dann in der Bereichsliste.
+    fn weite_hinweis_lokal(&mut self, jetzt: Instant) {
+        let Some(start) = self.start else {
+            return;
+        };
+        let t = jetzt.duration_since(start).as_secs_f64();
+        let liste = self.rohzeiten();
+        let Some(&(wert, _)) = liste.iter().rev().find(|(_, z)| *z <= t + 1e-9) else {
+            self.weite_hinweis = "lokal: noch keine Wertphase".to_string();
+            return;
+        };
+        if wert <= 0 {
+            self.weite_hinweis = "lokal: 0 = Pause — keine Schritte".to_string();
+            info!("maske2: {}", self.weite_hinweis);
+            return;
+        }
+        // Anfang der laufenden Wertphase: der erste gleiche Wert in der
+        // letzten ununterbrochenen Folge.
+        let mut phase_start = 0.0;
+        let mut i = liste.len();
+        while i > 0 {
+            i -= 1;
+            let (w, z) = liste[i];
+            if w != wert || z > t + 1e-9 {
+                continue;
+            }
+            phase_start = z;
+            if i == 0 || liste[i - 1].0 != wert {
+                break;
+            }
+        }
+        let dauer = (t - phase_start).max(0.0);
+        let weite = jamcore::maske::weite_lokal_s(phase_start, t);
+        let schritte = jamcore::maske::schritte_aus_weite(dauer, weite);
+        self.weite_hinweis = format!(
+            "lokal: 1/4 von {phase_start:.2}–{t:.2} s = {weite:.2} s, {schritte} Schritte (vorläufig)"
+        );
+        info!("maske2: {}", self.weite_hinweis);
+    }
+
+    /// Vorlaeufige globale Weite `--`: 1/4 ab dem ersten `-` bis jetzt.
+    /// Nach dem Ende wird die endgueltige Weite (bis Aufnahmeende) geloggt
+    /// und bei Überschreitung der Patternzeit gemeldet — ohne Klemmung.
+    fn weite_hinweis_global(&mut self, jetzt: Instant) {
+        let Some(start) = self.start else {
+            return;
+        };
+        let t = self
+            .weiten
+            .last()
+            .map(|e| e.zeit_s)
+            .unwrap_or_else(|| jetzt.duration_since(start).as_secs_f64());
+        // Das Ende steht beim Druecken noch nicht fest. Deshalb hier keine
+        // Scheinweite aus dem Doppeldruck-Abstand, sondern ein ehrlicher
+        // Hinweis; nach dem naechsten Wert/Ende wird die Weite gerechnet.
+        self.weite_hinweis =
+            format!("global: 1/4 ab {t:.2} s bis Ende — Weite folgt beim nächsten Wert/Ende");
+        info!("maske2: {}", self.weite_hinweis);
+    }
+
+    /// Nach jedem Wert die vorlaeufige Weite des letzten `-`/`--`-Bereichs
+    /// aus den aktuellen Bereichen aktualisieren. Die endgueltige Fassung
+    /// steht nach „Ende“ in der Bereichsliste.
+    fn weite_hinweis_aktualisieren(&mut self) {
+        let Some(e) = self.weiten.last().copied() else {
+            return;
+        };
+        if e.art == WeiteArt::Wert {
+            return;
+        }
+        let bereiche = self.roh_bereiche_jetzt();
+        let b = bereiche
+            .iter()
+            .rev()
+            .find(|b| b.art == e.art && b.start_s <= e.zeit_s + 1e-9 && b.ende_s >= e.zeit_s - 1e-9)
+            .or_else(|| bereiche.iter().rev().find(|b| b.art == e.art));
+        if let Some(b) = b {
+            self.weite_hinweis = format!(
+                "{}: {:.2}–{:.2} s = {:.2} s, {} Schritte (vorläufig)",
+                b.art.name(),
+                b.start_s,
+                b.ende_s,
+                b.weite_s,
+                b.schritte
+            );
+            info!("maske2: {}", self.weite_hinweis);
+        }
+    }
+
     /// notes3/notes4 aus der aktuellen Rohaufnahme bauen und in die
     /// gemeinsame Quelle schreiben.
     fn nachziehen(&mut self) {
-        let werte = self.rohzeiten();
         let ende = self.ende_s();
-        self.notes3 = jamcore::maske::zwischenschritte_notes3(&werte, ende, &self.optionen);
+        let bereiche = self.aktuelle_bereiche();
+        self.notes3 = jamcore::maske::notes3_aus_bereichen(&bereiche, &self.optionen);
         self.verlauf =
             jamcore::maske::auf_taktzeit_mappen_notes4(&self.notes3, ende, &self.optionen);
-        let (dauern, pausen) = jamcore::maske::aufnahme_blockstruktur(&werte, ende, &self.optionen);
+        let ms = jamcore::maske::bereich_schritt_ms(&bereiche, &self.optionen);
+        let (dauern, pausen) = jamcore::maske::bereich_blockstruktur(&bereiche, ms);
         let zeiten = maske::verlauf_zeiten(&self.verlauf);
         self.folge = self
             .verlauf
@@ -396,9 +714,9 @@ impl Maske2Panel {
 
     /// Die Anzeige-Zeile „11 Schritte (2+4+5) · Pausen — (0) · gesamt 11“.
     fn zusammenfassung(&self) -> String {
-        let werte = self.rohzeiten();
-        let ende = self.ende_s();
-        let (dauern, pausen) = jamcore::maske::aufnahme_blockstruktur(&werte, ende, &self.optionen);
+        let bereiche = self.aktuelle_bereiche();
+        let ms = jamcore::maske::bereich_schritt_ms(&bereiche, &self.optionen);
+        let (dauern, pausen) = jamcore::maske::bereich_blockstruktur(&bereiche, ms);
         let block_summe: u32 = dauern.iter().map(|(_, d)| *d).sum();
         let pausen_summe: u32 = pausen.iter().sum();
         let dauer_text = if dauern.is_empty() {
@@ -425,6 +743,256 @@ impl Maske2Panel {
              ({pausen_summe}) · gesamt {}",
             block_summe + pausen_summe
         )
+    }
+
+    /// Eine Handänderung anwenden: Undo-Stapel füllen, Spannen und Verlauf
+    /// neu rechnen und in die gemeinsame Quelle schreiben. `roh_bereiche`
+    /// bleibt unangetastet.
+    fn bereich_bearbeiten(&mut self, idx: usize, neu: Bereich) {
+        if idx >= self.bereiche.len() {
+            return;
+        }
+        // Reine Fokus-/Tab-Bewegungen duerfen keine Undo-Stufe und keinen
+        // „geändert“-Status erzeugen: nur echte Aenderungen uebernehmen.
+        let alt = &self.bereiche[idx];
+        if (neu.start_s - alt.start_s).abs() < 1e-4
+            && (neu.ende_s - alt.ende_s).abs() < 1e-4
+            && (neu.weite_s - alt.weite_s).abs() < 1e-4
+            && (neu.min_ms - alt.min_ms).abs() < 1e-4
+            && (neu.max_ms - alt.max_ms).abs() < 1e-4
+            && (neu.fader - alt.fader).abs() < 1e-4
+            && neu.schritte == alt.schritte
+        {
+            return;
+        }
+        if self.undo.len() >= 50 {
+            self.undo.remove(0);
+        }
+        self.undo.push(self.bereiche.clone());
+        self.bereiche[idx] = neu;
+        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        self.nachziehen();
+        self.verlauf_anwenden();
+        self.status = format!("Bereich {idx} geändert — Rückgängig möglich");
+    }
+
+    /// Letzte Handänderung zurücknehmen.
+    fn bereich_undo(&mut self) {
+        let Some(prev) = self.undo.pop() else {
+            self.status = "Rückgängig: nichts zu tun".to_string();
+            return;
+        };
+        self.bereiche = prev;
+        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        self.nachziehen();
+        self.verlauf_anwenden();
+        self.status = "Rückgängig — Rohwerte unverändert".to_string();
+    }
+
+    /// Bereiche auf die Rohwerte zurücksetzen (die Reset selbst ist wieder
+    /// rückgängig zu machen).
+    fn bereich_reset(&mut self) {
+        if self.roh_bereiche.is_empty() {
+            return;
+        }
+        if self.undo.len() >= 50 {
+            self.undo.remove(0);
+        }
+        self.undo.push(self.bereiche.clone());
+        self.bereiche = self.roh_bereiche.clone();
+        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        self.nachziehen();
+        self.verlauf_anwenden();
+        self.status = "Bereiche auf Rohwerte zurückgesetzt".to_string();
+    }
+
+    /// Bereichsliste und Handbearbeitung (nach dem „Ende“).
+    fn bereichs_ui(&mut self, ui: &mut egui::Ui) {
+        if !self.fest || self.bereiche.is_empty() {
+            return;
+        }
+        egui::CollapsingHeader::new("Bereiche / Handbearbeitung")
+            .id_salt("maske2_bereiche")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(self.weiten_hinweis())
+                        .small()
+                        .color(Color32::from_rgb(255, 210, 120)),
+                );
+                for i in 0..self.bereiche.len() {
+                    let b = &self.bereiche[i];
+                    let label = format!(
+                        "{i} · {} {:.2}–{:.2} s · Schritte {}-{} ({} St.) · {:.0} ms",
+                        b.art.name(),
+                        b.start_s,
+                        b.ende_s,
+                        b.start_schritt,
+                        b.ende_schritt,
+                        b.schritte,
+                        b.weite_s * 1000.0
+                    );
+                    if ui
+                        .selectable_label(self.auswahl == Some(i), label)
+                        .clicked()
+                    {
+                        self.auswahl = Some(i);
+                    }
+                }
+                let Some(idx) = self.auswahl else {
+                    return;
+                };
+                if idx >= self.bereiche.len() {
+                    self.auswahl = None;
+                    return;
+                }
+                let b = self.bereiche[idx].clone();
+                let aufnahme_ende = self.ende_s();
+                let effektiv_ms = if b.schritte > 0 {
+                    (b.ende_s - b.start_s) * 1000.0 / b.schritte as f64
+                } else {
+                    0.0
+                };
+                ui.separator();
+                ui.label(format!(
+                    "Start {:.3} s / Schritt {} · Ende {:.3} s / Schritt {}",
+                    b.start_s, b.start_schritt, b.ende_s, b.ende_schritt
+                ));
+                let roh_ms = self
+                    .roh_bereiche
+                    .get(idx)
+                    .map(|r| r.weite_s * 1000.0)
+                    .unwrap_or(b.weite_s * 1000.0);
+                ui.label(format!(
+                    "Weite roh {roh_ms:.1} ms · aktuell {:.1} ms · effektiv {:.1} ms · {} Schritte",
+                    b.weite_s * 1000.0,
+                    effektiv_ms,
+                    b.schritte
+                ));
+
+                let mut basis = b.clone();
+                let mut neu: Option<Bereich> = None;
+
+                let mut min = basis.min_ms;
+                let mut max = basis.max_ms;
+                let mut grenzen_geaendert = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Min");
+                    grenzen_geaendert |= ui
+                        .add(egui::DragValue::new(&mut min).speed(1.0).suffix(" ms"))
+                        .changed();
+                    ui.label("Max");
+                    grenzen_geaendert |= ui
+                        .add(egui::DragValue::new(&mut max).speed(1.0).suffix(" ms"))
+                        .changed();
+                });
+                if grenzen_geaendert {
+                    basis.min_ms = min;
+                    basis.max_ms = max;
+                    neu = Some(basis.clone());
+                }
+
+                let mut f = basis.fader;
+                if ui
+                    .add(egui::Slider::new(&mut f, 0.0..=1.0).text("Fader"))
+                    .changed()
+                {
+                    neu = Some(jamcore::maske::bereich_mit_fader(&basis, f));
+                }
+
+                let mut weite_ms = basis.weite_s * 1000.0;
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut weite_ms)
+                            .speed(1.0)
+                            .suffix(" ms")
+                            .prefix("Weite "),
+                    )
+                    .changed()
+                {
+                    neu = Some(jamcore::maske::bereich_mit_weite(&basis, weite_ms / 1000.0));
+                }
+
+                let mut start = basis.start_s;
+                let mut ende = basis.ende_s;
+                let mut zeit_geaendert = false;
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Start");
+                    zeit_geaendert |= ui
+                        .add(
+                            egui::DragValue::new(&mut start)
+                                .range(0.0..=aufnahme_ende)
+                                .speed(0.01)
+                                .suffix(" s"),
+                        )
+                        .changed();
+                    ui.label("Ende");
+                    zeit_geaendert |= ui
+                        .add(
+                            egui::DragValue::new(&mut ende)
+                                .range(0.0..=aufnahme_ende)
+                                .speed(0.01)
+                                .suffix(" s"),
+                        )
+                        .changed();
+                });
+                if zeit_geaendert {
+                    neu = Some(jamcore::maske::bereich_mit_zeit(&basis, start, ende));
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("◀ 0,1 s").clicked() {
+                        neu = Some(jamcore::maske::bereich_verschieben(
+                            &basis,
+                            -0.1,
+                            aufnahme_ende,
+                        ));
+                    }
+                    if ui.button("▶ 0,1 s").clicked() {
+                        neu = Some(jamcore::maske::bereich_verschieben(
+                            &basis,
+                            0.1,
+                            aufnahme_ende,
+                        ));
+                    }
+                    if ui.button("Kürzen 0,1 s").clicked() {
+                        neu = Some(jamcore::maske::bereich_kuerzen(&basis, 0.1, aufnahme_ende));
+                    }
+                    if ui.button("Verlängern 0,1 s").clicked() {
+                        neu = Some(jamcore::maske::bereich_kuerzen(&basis, -0.1, aufnahme_ende));
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Rückgängig").clicked() {
+                        self.bereich_undo();
+                        return;
+                    }
+                    if ui.button("Zurücksetzen").clicked() {
+                        self.bereich_reset();
+                        return;
+                    }
+                    if ui.button("Übernehmen").clicked() {
+                        self.verlauf_anwenden();
+                        self.status = "Bereiche übernommen".to_string();
+                        return;
+                    }
+                });
+                if let Some(nb) = neu {
+                    self.bereich_bearbeiten(idx, nb);
+                }
+                ui.label(
+                    RichText::new(
+                        "Rohwerte bleiben erhalten; jede Änderung legt eine \
+                         Rückgängig-Stufe an. Min/Max und Fader wirken nur auf \
+                         diesen Bereich.",
+                    )
+                    .small()
+                    .color(Color32::DARK_GRAY),
+                );
+            });
     }
 
     /// Zelle -> Position im Feld: 3x3 fuer 1..9, die Null allein darunter.
@@ -583,7 +1151,7 @@ impl Maske2Panel {
         ui.horizontal_wrapped(|ui| {
             if let Some((min, max)) = self.min_max {
                 ui.label(
-                    RichText::new(format!("Min/Max: {min:.0} / {max:.0} ms"))
+                    RichText::new(format!("Rand-Min/Max: {min:.0} / {max:.0} ms"))
                         .small()
                         .color(Color32::from_rgb(150, 200, 255)),
                 );
@@ -594,7 +1162,7 @@ impl Maske2Panel {
                         .color(Color32::DARK_GRAY),
                 );
             }
-            ui.label("Fader");
+            ui.label("Pausen-Fader");
             let mut f = if self.optionen.haelfte_aus_minmax {
                 0.5
             } else {
@@ -647,18 +1215,52 @@ impl Maske2Panel {
         );
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, _pattern: &mut Pattern) {
+    pub fn ui(&mut self, ui: &mut egui::Ui, pattern: &mut Pattern) {
+        self.pattern_s = self.pattern_zeit_s(pattern);
         ui.heading("Takt-Maske 2");
-        self.pfeiltasten(ui);
-        // Enter ist immer „Ende“ — auch wenn ein Knopf den Fokus hat. Sonst
-        // wuerde Enter z. B. „neu“ ausloesen und die Aufnahme loeschen,
-        // bevor `ende()` sie sieht.
-        let enter = ui
-            .ctx()
-            .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-        if enter && !self.fest {
-            self.ende();
+
+        // Bereich in Maske 1 gewaehlt: die Aufnahme dafuer automatisch
+        // scharf machen. Ein laufender/fester Stand wird verworfen, damit
+        // die neuen Tasten nicht in die alte Aufnahme laufen.
+        let bereich_jetzt = maske::verlauf_snapshot().bereich;
+        if bereich_jetzt != self.letzter_gesehener_bereich {
+            if bereich_jetzt.is_some() && (self.fest || !self.aufnahme.is_empty()) {
+                self.neu();
+            }
+            if let Some((von, bis)) = bereich_jetzt {
+                self.status = format!(
+                    "Bereich {von}-{bis}: Aufnahme läuft — Werte tippen, 0 = Pause, Ende/Enter"
+                );
+            }
+            self.letzter_gesehener_bereich = bereich_jetzt;
         }
+
+        self.pfeiltasten(ui);
+
+        // Echte Tasten: `-` lokal, zweimal `-` global, `/` oder Enter Ende.
+        // Nach dem Ende bleiben die Tasten fuer die Handbearbeitung frei
+        // (Enter bestaetigt dann z. B. ein DragValue).
+        if !self.fest {
+            let minus = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Minus));
+            if minus {
+                self.minus_taste();
+            }
+            let slash = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Slash));
+            if slash {
+                self.ende(pattern);
+            }
+            let enter = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+            if enter {
+                self.ende(pattern);
+            }
+        }
+
         ui.horizontal_wrapped(|ui| {
             if ui
                 .add(egui::Button::new("neu").min_size(egui::vec2(96.0, 44.0)))
@@ -670,7 +1272,7 @@ impl Maske2Panel {
                 .add(egui::Button::new("Ende").min_size(egui::vec2(96.0, 44.0)))
                 .clicked()
             {
-                self.ende();
+                self.ende(pattern);
             }
             ui.label(RichText::new(&self.status).color(if self.fest {
                 Color32::GRAY
@@ -678,6 +1280,15 @@ impl Maske2Panel {
                 Color32::from_rgb(120, 230, 160)
             }));
         });
+
+        // Hinweis zu `-`/`--`: Weite und betroffener Bereich.
+        if !self.weite_hinweis.is_empty() {
+            ui.label(
+                RichText::new(&self.weite_hinweis)
+                    .small()
+                    .color(Color32::from_rgb(255, 210, 120)),
+            );
+        }
 
         // Der in Maske 1 gewaehlte Bereich gilt fuer die naechste Aufnahme.
         if let Some((von, bis)) = maske::verlauf_snapshot().bereich {
@@ -693,9 +1304,12 @@ impl Maske2Panel {
         }
 
         self.einstellungen(ui);
+        // Nach dem Ende steht die Bereichs-/Handbearbeitung oben, damit sie
+        // ohne Scrollen erreichbar ist; waehrend der Aufnahme ist sie leer.
+        self.bereichs_ui(ui);
 
         // Nummernblock: Ziffer trifft den raeumlich gleichen Knopf,
-        // Enter ist „Ende“.
+        // Enter ist „Ende“ (falls es nicht schon oben verbraucht wurde).
         for taste in tasten(ui) {
             match taste {
                 Taste::Ziffer(ziffer) => {
@@ -703,7 +1317,8 @@ impl Maske2Panel {
                         self.anschlagen(position);
                     }
                 }
-                Taste::Enter => self.ende(),
+                Taste::Enter if !self.fest => self.ende(pattern),
+                Taste::Enter => {}
             }
         }
 
@@ -801,10 +1416,12 @@ impl Maske2Panel {
 
         ui.label(
             RichText::new(
-                "Nummernblock: Ziffern treffen die Tasten wie auf dem Block \
-                 (7-8-9 / 4-5-6 / 1-2-3 / 0), Enter ist „Ende“. Die Pfeil-Modi \
-                 Links/Oben/Unten/Rechts waehlen die Randzeitstempel fuer Min/Max; \
-                 der Fader steht in der Mitte, die Rampe laeuft von „von“ nach „bis“.",
+                "Nummernblock: Ziffern treffen die Tasten (7-8-9 / 4-5-6 / 1-2-3 / 0). \
+                 `-` setzt die Weite der laufenden Wertphase auf 1/4, `--` global \
+                 ab hier bis zum Ende; `/` oder Enter beendet. 0 ist die Pause. \
+                 Pfeil-Modi Links/Oben/Unten/Rechts waehlen die Randzeitstempel; \
+                 nach dem Ende lassen sich Weite, Min/Max, Start/Ende je Bereich \
+                 von Hand aendern (Rückgängig inklusive).",
             )
             .small()
             .color(Color32::DARK_GRAY),
