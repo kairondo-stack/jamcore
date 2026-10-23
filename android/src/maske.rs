@@ -47,6 +47,20 @@ pub fn verlauf_farbe(ton: i32) -> Color32 {
     regenbogen(anteil)
 }
 
+/// Die laufende M2-Aufnahme für die Vorschau in Maske 1: Blockdauern und die
+/// Pausen vor jedem Block (gemessene Tippabstaende).
+#[derive(Clone, Debug, Default)]
+pub struct Entwurf {
+    pub dauern: Vec<(i32, u32)>,
+    pub pausen: Vec<u32>,
+}
+
+impl Entwurf {
+    pub fn ist_leer(&self) -> bool {
+        self.dauern.is_empty()
+    }
+}
+
 /// Der gemeinsame Verlauf von Maske 1 und Maske 2 — **eine** Datenquelle,
 /// keine Kopie in den Panels (Nutzerentscheidung 2026-10-22).
 ///
@@ -55,13 +69,14 @@ pub fn verlauf_farbe(ton: i32) -> Color32 {
 /// Zeitpunkte aus derselben Quelle (`Maske2Panel::zeiten`).
 #[derive(Clone, Debug, Default)]
 pub struct VerlaufZustand {
-    /// Festgehaltener Verlauf, ein Eintrag je Schritt: (Schrittnummer, Ton).
+    /// Festgehaltener Verlauf: (Schrittnummer, Ton). Pausen sind Lücken in
+    /// der Schrittnummer, keine Einträge.
     pub schritte: Vec<(u32, i32)>,
     /// Gewählter Bereich `[von, bis)` aus Maske 1 für die nächste M2-Aufnahme.
     pub bereich: Option<(u32, u32)>,
-    /// Laufende M2-Aufnahme als (Ton, Dauer) — für die Vorschau in Maske 1,
-    /// solange der Bereich noch nicht festgeschrieben ist.
-    pub entwurf: Vec<(i32, u32)>,
+    /// Laufende M2-Aufnahme — für die Vorschau in Maske 1, solange der
+    /// Bereich noch nicht festgeschrieben ist.
+    pub entwurf: Entwurf,
 }
 
 static VERLAUF: OnceLock<Mutex<VerlaufZustand>> = OnceLock::new();
@@ -80,15 +95,19 @@ pub fn verlauf_snapshot() -> VerlaufZustand {
         .unwrap_or_default()
 }
 
-/// Zeitpunkte eines Verlaufs für den Bild-Scan: ein Punkt je Schritt,
-/// gleichmäßig von 0 bis 1. Die Bild-Maske normiert die Spanne selbst.
+/// Zeitpunkte eines Verlaufs für den Bild-Scan: ein Punkt je klingendem
+/// Schritt, an seiner Position im **Gesamtverlauf** (Pausen bleiben Lücken).
+/// Die Bild-Maske normiert die Spanne selbst.
 pub fn verlauf_zeiten(verlauf: &[(u32, i32)]) -> Vec<f32> {
-    let n = verlauf.len();
-    if n == 0 {
+    let gesamt = jamcore::maske::verlauf_laenge(verlauf);
+    if gesamt == 0 {
         return Vec::new();
     }
-    let letzte = (n - 1).max(1) as f32;
-    (0..n).map(|i| i as f32 / letzte).collect()
+    let letzte = (gesamt - 1).max(1) as f32;
+    verlauf
+        .iter()
+        .map(|(schritt, _)| *schritt as f32 / letzte)
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -379,14 +398,26 @@ impl MaskePanel {
     fn verlauf_ui(&mut self, ui: &mut egui::Ui, breite: f32) {
         let zustand = verlauf_snapshot();
         let schritte = &zustand.schritte;
+        let gesamt = jamcore::maske::verlauf_laenge(schritte);
         ui.add_space(6.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Verlauf (Maske 2)").strong());
-            if !schritte.is_empty() {
+            if gesamt > 0 {
                 ui.label(
-                    RichText::new(format!("{} Schritte", schritte.len()))
+                    RichText::new(format!("{gesamt} Schritte"))
                         .color(Color32::from_rgb(120, 230, 160)),
                 );
+                if schritte.len() < gesamt as usize {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} klingende, {} Pausen-Schritte",
+                            schritte.len(),
+                            gesamt as usize - schritte.len()
+                        ))
+                        .small()
+                        .color(Color32::from_rgb(150, 200, 255)),
+                    );
+                }
             }
             if zustand.bereich.is_some() && ui.button("Bereich weg").clicked() {
                 self.verlauf_anker = None;
@@ -397,7 +428,7 @@ impl MaskePanel {
             }
         });
 
-        if schritte.is_empty() && zustand.entwurf.is_empty() {
+        if gesamt == 0 && zustand.entwurf.ist_leer() {
             ui.label(
                 RichText::new(
                     "Noch kein M2-Verlauf. In M2 Tasten mit ihrer Dauer tippen \
@@ -409,18 +440,19 @@ impl MaskePanel {
             return;
         }
 
-        // Der Balken: ein Block je Schritt. 18 Schritte = 18 Blöcke, damit
-        // die Summe der Dauern direkt ablesbar ist.
+        // Der Balken: ein Platz je **Gesamtschritt**, Pausen bleiben dunkle
+        // Lücken. 23 Schritte mit 5 Pausen = 18 farbige Blöcke und 5 Lücken.
         let hoehe = 44.0;
         let (leiste, painter) =
             ui.allocate_painter(egui::vec2(breite, hoehe), egui::Sense::click());
         let rect = leiste.rect;
-        let n = schritte.len();
+        let n = gesamt;
         if n > 0 {
             let block = rect.width() / n as f32;
-            for (i, (_, ton)) in schritte.iter().enumerate() {
+            painter.rect_filled(rect, 2.0, Color32::from_rgb(40, 42, 50));
+            for (schritt, ton) in schritte.iter() {
                 let r = egui::Rect::from_min_size(
-                    egui::pos2(rect.left() + i as f32 * block, rect.top()),
+                    egui::pos2(rect.left() + *schritt as f32 * block, rect.top()),
                     egui::vec2((block - 0.5).max(1.0), rect.height()),
                 );
                 painter.rect_filled(r, 0.0, verlauf_farbe(*ton));
@@ -428,37 +460,39 @@ impl MaskePanel {
 
             // Laufende M2-Aufnahme in den gewählten Bereich gemappt zeigen:
             // so sieht man vor dem „Ende“ schon, was den Bereich ersetzt.
-            if let (Some((von, bis)), false) = (zustand.bereich, zustand.entwurf.is_empty()) {
-                let von = von.min(n as u32);
-                let bis = bis.min(n as u32);
+            // Pausen aus dem Entwurf werden dabei wie im Endergebnis gemappt.
+            if let (Some((von, bis)), false) = (zustand.bereich, zustand.entwurf.ist_leer()) {
+                let von = von.min(n);
+                let bis = bis.min(n);
                 if von < bis {
-                    let gemappt = jamcore::maske::dauern_auf_bereich(&zustand.entwurf, bis - von);
-                    let mut k = von as usize;
-                    for (ton, dauer) in gemappt {
-                        for _ in 0..dauer {
-                            if k >= n {
-                                break;
-                            }
-                            let r = egui::Rect::from_min_size(
-                                egui::pos2(rect.left() + k as f32 * block, rect.top()),
-                                egui::vec2((block - 0.5).max(1.0), rect.height()),
-                            );
-                            let c = verlauf_farbe(ton);
-                            painter.rect_filled(
-                                r,
-                                0.0,
-                                Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150),
-                            );
-                            k += 1;
+                    let (dauern, pausen) = jamcore::maske::struktur_auf_bereich(
+                        &zustand.entwurf.dauern,
+                        &zustand.entwurf.pausen,
+                        bis - von,
+                    );
+                    for (schritt, ton) in jamcore::maske::verlauf_mit_pausen(&dauern, &pausen) {
+                        let k = von + schritt;
+                        if k >= n {
+                            break;
                         }
+                        let r = egui::Rect::from_min_size(
+                            egui::pos2(rect.left() + k as f32 * block, rect.top()),
+                            egui::vec2((block - 0.5).max(1.0), rect.height()),
+                        );
+                        let c = verlauf_farbe(ton);
+                        painter.rect_filled(
+                            r,
+                            0.0,
+                            Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), 150),
+                        );
                     }
                 }
             }
 
             // Gewählter Bereich als Rahmen; Start/Ende stehen als Text dabei.
             if let Some((von, bis)) = zustand.bereich {
-                let von = von.min(n as u32);
-                let bis = bis.min(n as u32);
+                let von = von.min(n);
+                let bis = bis.min(n);
                 if von < bis {
                     let r = egui::Rect::from_min_max(
                         egui::pos2(rect.left() + von as f32 * block, rect.top()),

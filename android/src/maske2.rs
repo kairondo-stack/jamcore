@@ -1,18 +1,24 @@
 //! Maske 2: Tastenfeld in Nummernblock-Anordnung mit „Ende“.
 //!
-//! Unterschiede zur alten Maske (Nutzerentscheidungen 2026-10-14/22):
+//! Unterschiede zur alten Maske (Nutzerentscheidungen 2026-10-14/22/23):
 //! - **Zehn** Tasten in Nummernblock-Anordnung (7-8-9 / 4-5-6 / 1-2-3 / 0).
 //! - Der USB-Nummernblock trifft die **raeumlich gleiche** Taste
 //!   (`maske::position_numpad`).
 //! - Die Wertigkeit einer Taste ist eine **Dauer in Schritten**, keine
 //!   Zeitmessung: 8, 4, 6 hintereinander ergeben 8 + 4 + 6 = 18 gleiche
 //!   Schritte (Block 0–7, 8–11, 12–17). Es wird nichts auf die Zahl der
-//!   Drücke normalisiert — das war der Nutzerbefund vom 2026-10-22.
+//!   Drücke normalisiert.
+//! - Zusätzlich werden die **realen Tippabstaende** gemessen und in Schritte
+//!   gemappt; im Modus „beides“ stehen sie als Pausen vor dem jeweiligen
+//!   Block. Ergebnis = Summe(Abstaende) + Summe(Dauern).
 //! - **„Ende“** haelt fest. Ist in Maske 1 ein Bereich gewaehlt, wird die
-//!   neue Gesamtzeit proportional auf die Bereichszeit gemappt und nur
-//!   dieser Bereich ersetzt; sonst ist die Aufnahme der ganze Verlauf.
+//!   neue Gesamtzeit (Bloecke + Pausen) proportional auf die Bereichszeit
+//!   gemappt und nur dieser Bereich ersetzt; sonst ist die Aufnahme der
+//!   ganze Verlauf.
 //! - Der Verlauf liegt im gemeinsamen Speicher von [`crate::maske`]; Maske 1
-//!   zeigt ihn (gleiche Datenquelle, keine Kopie).
+//!   zeigt ihn (gleiche Datenquelle, keine Kopie), Pausen als Luecken.
+
+use std::time::Instant;
 
 use eframe::egui::{self, Color32, RichText};
 use jamcore::grid::Pattern;
@@ -32,17 +38,49 @@ const SPALTEN: usize = 3;
 /// auch wenn der Ton 61 heißt.
 const TON_BASIS: i32 = 60;
 
+/// Was in den Verlauf geschrieben wird.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Takt {
+    /// Nur die Werte der Tasten (Dauern), keine Pausen.
+    Werte,
+    /// Nur die gemessenen Tippabstaende als Blocklaengen (mind. 1 Schritt).
+    Tippzeiten,
+    /// Tippabstaende als Pausen + Wertigkeit als Blockdauer (Standard).
+    Beides,
+}
+
+impl Takt {
+    fn name(self) -> &'static str {
+        match self {
+            Takt::Werte => "Werte",
+            Takt::Tippzeiten => "Tippzeiten",
+            Takt::Beides => "beides",
+        }
+    }
+}
+
 pub struct Maske2Panel {
     /// Wert (Dauer in Schritten) je Position; die Positionen liegen in
     /// Nummernblock-Anordnung, die Vorgabewerte sind 7,8,9 / 4,5,6 / 1,2,3 / 0.
     werte: [i32; TASTEN],
     /// Die laufende Aufnahme als (Ton, Dauer) in Druckreihenfolge.
     dauern: Vec<(i32, u32)>,
-    /// Dieselbe Aufnahme aufgeklappt: (Schrittnummer, Ton), Summe der Dauern.
+    /// Gemessener Abstand zum vorigen Druck in Millisekunden (erster = 0).
+    abstaende_ms: Vec<f64>,
+    /// Derselbe Abstand, beim Druck mit dem damaligen Tempo in Schritte
+    /// gemappt. So aendert eine spaetere Tempoaenderung die Vergangenheit
+    /// nicht.
+    abstand_schritte: Vec<u32>,
+    /// Die aktiven Pausen vor jedem Block (je nach [`Takt`]).
+    pausen: Vec<u32>,
+    /// Aufgeklappter Verlauf: (Schrittnummer, Ton), Pausen als Luecken.
     verlauf: Vec<(u32, i32)>,
-    /// Zeitpunkte für den Bild-Scan (ein Punkt je Schritt). Die Struktur
-    /// bleibt, weil `lib.rs` sie über `folge()`/`zeiten()` abholt.
+    /// Zeitpunkte für den Bild-Scan (ein Punkt je klingendem Schritt).
     folge: Vec<Aufzeichnung>,
+    /// Was der Verlauf gerade zeigt.
+    takt: Takt,
+    /// Zeitpunkt des letzten Drucks fuer den naechsten Abstand.
+    letzter_druck: Option<Instant>,
     /// „Ende“ gedrueckt: die Aufnahme steht, bis „neu“ kommt.
     fest: bool,
     status: String,
@@ -62,10 +100,15 @@ impl Maske2Panel {
         Self {
             werte: [7, 8, 9, 4, 5, 6, 1, 2, 3, 0],
             dauern: Vec::new(),
+            abstaende_ms: Vec::new(),
+            abstand_schritte: Vec::new(),
+            pausen: Vec::new(),
             verlauf: Vec::new(),
             folge: Vec::new(),
+            takt: Takt::Beides,
+            letzter_druck: None,
             fest: false,
-            status: "Tasten tippen: die Wertigkeit ist die Dauer in Schritten.".to_string(),
+            status: "Tasten tippen: Dauer + Tippabstand werden aufgenommen.".to_string(),
             letzte_aenderung: None,
         }
     }
@@ -75,10 +118,12 @@ impl Maske2Panel {
         &self.folge
     }
 
-    /// Zeitpunkte fuer den Bild-Scan: ein Punkt je Schritt, gleichmäßig.
+    /// Zeitpunkte fuer den Bild-Scan: ein Punkt je klingendem Schritt, an
+    /// seiner Stelle im Gesamtverlauf (Pausen bleiben Luecken).
+    ///
     /// Waehrend der Aufnahme zaehlt der Entwurf; danach der festgehaltene
     /// Verlauf (der bei einer Bereichsaufnahme ein anderer ist als der
-    /// Entwurf). Nach „neu“ bleibt die gruene Maske so stehen, statt zu
+    /// Entwurf). Nach „neu“ bleibt die gruene Maske stehen, statt zu
     /// verschwinden.
     pub fn zeiten(&self) -> Vec<f32> {
         if !self.fest && !self.verlauf.is_empty() {
@@ -92,34 +137,70 @@ impl Maske2Panel {
         self.letzte_aenderung
     }
 
+    /// Dauer eines Rasterschritts in ms: `60_000 / bpm / (feinheit/4)`.
+    /// Ueber die Kern-Uhr gerechnet (dieselbe Formel wie Transport/Bild).
+    fn step_ms(&self) -> f64 {
+        jamcore::transport::step_dauer(crate::transport::bpm(), crate::transport::feinheit())
+            * 1000.0
+    }
+
+    /// Die Blockdauern, die der aktuelle Takt in den Verlauf schreibt.
+    fn aktive_dauern(&self) -> Vec<(i32, u32)> {
+        match self.takt {
+            Takt::Werte | Takt::Beides => self.dauern.clone(),
+            Takt::Tippzeiten => self
+                .dauern
+                .iter()
+                .enumerate()
+                .map(|(i, &(ton, _))| {
+                    let schritte = self.abstand_schritte.get(i).copied().unwrap_or(0);
+                    (ton, schritte.max(1))
+                })
+                .collect(),
+        }
+    }
+
+    /// Die Pausen vor den Blocken, die der aktuelle Takt schreibt.
+    fn aktive_pausen(&self) -> Vec<u32> {
+        match self.takt {
+            Takt::Beides => self.abstand_schritte.clone(),
+            Takt::Werte | Takt::Tippzeiten => vec![0; self.dauern.len()],
+        }
+    }
+
     /// „neu“: die laufende Aufnahme verwerfen und wieder aufnehmen. Der
     /// festgehaltene Verlauf bleibt stehen — sonst waere beim Aufnehmen
     /// eines Bereichs der Inhalt ausserhalb sofort weg.
     pub fn neu(&mut self) {
         self.dauern.clear();
+        self.abstaende_ms.clear();
+        self.abstand_schritte.clear();
+        self.pausen.clear();
         self.verlauf.clear();
         self.folge.clear();
+        self.letzter_druck = None;
         self.fest = false;
         self.letzte_aenderung = Some(std::time::Instant::now());
         if let Ok(mut z) = maske::verlauf_zustand().lock() {
-            z.entwurf.clear();
+            z.entwurf = maske::Entwurf::default();
         }
         let bereich = maske::verlauf_snapshot().bereich;
         self.status = match bereich {
             Some((von, bis)) => format!(
-                "neu — Bereich {von}-{bis} ({} Schritte): Tasten tippen",
-                bis - von
+                "neu — Bereich {von}-{bis} ({} Schritte), Takt {}",
+                bis - von,
+                self.takt.name()
             ),
-            None => "neu — Tasten tippen; die Dauern haengen sich aneinander".to_string(),
+            None => format!("neu — Takt {}: Tasten tippen", self.takt.name()),
         };
-        info!("Maske 2: neu");
+        info!("Maske 2: neu (Takt {})", self.takt.name());
     }
 
     /// „Ende“: festhalten und die Aufnahme stoppen, bis „neu“ kommt.
     ///
     /// Ohne Bereich in Maske 1 wird der ganze Verlauf ersetzt. Mit Bereich
-    /// wird die neue Gesamtzeit auf die Bereichszeit gemappt; ausserhalb
-    /// bleibt der alte Verlauf stehen.
+    /// wird die neue Gesamtzeit (Bloecke + Pausen) auf die Bereichszeit
+    /// gemappt; ausserhalb bleibt der alte Verlauf stehen.
     pub fn ende(&mut self) {
         if self.dauern.is_empty() {
             self.fest = true;
@@ -127,17 +208,35 @@ impl Maske2Panel {
             info!("Maske 2: Ende ohne Schritte");
             return;
         }
+        let dauern = self.aktive_dauern();
+        let pausen = self.aktive_pausen();
+        let block_summe: u32 = dauern.iter().map(|(_, d)| *d).sum();
+        let pausen_summe: u32 = pausen.iter().sum();
+        let gesamt = block_summe + pausen_summe;
+        info!("maske2: Verlauf {gesamt} Schritte (Pausen {pausen_summe} + Bloecke {block_summe})");
+
         let mut z = match maske::verlauf_zustand().lock() {
             Ok(z) => z,
             Err(_) => return,
         };
-        z.entwurf.clear();
+        z.entwurf = maske::Entwurf::default();
         match z.bereich.take() {
             Some((von, bis)) => {
-                let laenge = z.schritte.len() as u32;
+                let laenge = jamcore::maske::verlauf_laenge(&z.schritte);
                 let von = von.min(laenge);
                 let bis = bis.min(laenge);
-                match jamcore::maske::bereich_ersetzen(&mut z.schritte, von, bis, &self.dauern) {
+                let ersetzt = if pausen_summe > 0 {
+                    jamcore::maske::bereich_ersetzen_mit_pausen(
+                        &mut z.schritte,
+                        von,
+                        bis,
+                        &dauern,
+                        &pausen,
+                    )
+                } else {
+                    jamcore::maske::bereich_ersetzen(&mut z.schritte, von, bis, &dauern)
+                };
+                match ersetzt {
                     Some(meldung) => {
                         info!(
                             "maske: Bereich {von}-{bis} neu aufgenommen ({} Schritte aus {})",
@@ -159,23 +258,20 @@ impl Maske2Panel {
             }
             None => {
                 z.schritte = self.verlauf.clone();
-                info!("maske: Verlauf {} Schritte", z.schritte.len());
-                self.status = format!(
-                    "{} Schritte festgehalten — „neu“ nimmt wieder auf",
-                    z.schritte.len()
-                );
+                info!("maske: Verlauf {gesamt} Schritte");
+                self.status = format!("{gesamt} Schritte festgehalten — „neu“ nimmt wieder auf");
             }
         }
         self.fest = true;
         self.letzte_aenderung = Some(std::time::Instant::now());
         info!(
-            "Maske 2: Ende ({} Tasten, {} Schritte)",
-            self.dauern.len(),
-            self.verlauf.len()
+            "Maske 2: Ende ({} Tasten, {gesamt} Schritte)",
+            self.dauern.len()
         );
     }
 
-    /// Eine Taste des Feldes anschlagen: die Wertigkeit ist die Dauer.
+    /// Eine Taste des Feldes anschlagen: Wertigkeit = Dauer, dazu den
+    /// Abstand zum vorigen Druck als Pause (je nach Takt-Modus).
     fn anschlagen(&mut self, position: usize) {
         if self.fest || position >= TASTEN {
             return;
@@ -189,54 +285,107 @@ impl Maske2Panel {
             info!("maske2: taste {} ist 0 — Pause, kein Schritt", position + 1);
             return;
         }
+        let jetzt = Instant::now();
+        let abstand_ms = self
+            .letzter_druck
+            .map(|vorher| jetzt.duration_since(vorher).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        self.letzter_druck = Some(jetzt);
+        let schritte = jamcore::maske::schritte_aus_abstaenden(&[abstand_ms], self.step_ms())
+            .first()
+            .copied()
+            .unwrap_or(0);
+        self.abstaende_ms.push(abstand_ms);
+        self.abstand_schritte.push(schritte);
+
         let ton = TON_BASIS + position as i32;
         self.dauern.push((ton, dauer));
         self.nachziehen();
 
-        // Sofort in die gemeinsame Quelle: Maske 1 zeigt den Verlauf live.
-        // Ist ein Bereich gewaehlt, bleibt der festgehaltene Verlauf stehen;
-        // die Vorschau dort kommt aus `entwurf` (proportional gemappt).
-        if let Ok(mut z) = maske::verlauf_zustand().lock() {
-            z.entwurf = self.dauern.clone();
-            if z.bereich.is_none() {
-                z.schritte = self.verlauf.clone();
-            }
-        }
         self.letzte_aenderung = Some(std::time::Instant::now());
-        let dauern_text = self
-            .dauern
-            .iter()
-            .map(|(_, d)| d.to_string())
-            .collect::<Vec<_>>()
-            .join("+");
-        let gesamt = self.verlauf.len();
-        self.status = match maske::verlauf_snapshot().bereich {
-            Some((von, bis)) => {
-                format!("{gesamt} Schritte ({dauern_text}) — Ende mappt auf Bereich {von}-{bis}")
-            }
-            None => format!("{gesamt} Schritte ({dauern_text}) — Ende haelt fest"),
-        };
+        info!("maske2: Abstand {abstand_ms:.0} ms = {schritte} Schritte");
+        info!("maske2: taste {} (dauer {dauer}, ton {ton})", position + 1);
+        let pausen_summe: u32 = self.pausen.iter().sum();
+        let block_summe: u32 = self.aktive_dauern().iter().map(|(_, d)| *d).sum();
         info!(
-            "maske2: taste {} (dauer {dauer}, ton {ton}) -> {gesamt} Schritte ({dauern_text})",
-            position + 1
+            "maske2: Verlauf {} Schritte (Pausen {pausen_summe} + Bloecke {block_summe})",
+            block_summe + pausen_summe
+        );
+        self.status = format!(
+            "{} Schritte · Takt {} — Ende haelt fest",
+            block_summe + pausen_summe,
+            self.takt.name()
         );
     }
 
-    /// Die aufgeklappte Schrittliste und die Zeitpunkte neu bauen.
+    /// Verlauf und Bild-Zeitpunkte aus dem aktuellen Takt-Modus bauen und in
+    /// die gemeinsame Quelle schreiben.
     fn nachziehen(&mut self) {
-        self.verlauf = jamcore::maske::schritte_aus_dauern(&self.dauern);
-        let n = self.verlauf.len();
-        let letzte = (n.saturating_sub(1)).max(1) as f32;
+        let dauern = self.aktive_dauern();
+        let pausen = self.aktive_pausen();
+        self.pausen = pausen.clone();
+        self.verlauf = jamcore::maske::verlauf_mit_pausen(&dauern, &pausen);
+        let zeiten = maske::verlauf_zeiten(&self.verlauf);
         self.folge = self
             .verlauf
             .iter()
-            .enumerate()
-            .map(|(i, (_, ton))| Aufzeichnung {
-                zeit: i as f32 / letzte,
+            .zip(zeiten)
+            .map(|((_, ton), zeit)| Aufzeichnung {
+                zeit,
                 indexnum: *ton as f32,
                 tempo: Vec::new(),
             })
             .collect();
+        if let Ok(mut z) = maske::verlauf_zustand().lock() {
+            z.entwurf = maske::Entwurf {
+                dauern: dauern.clone(),
+                pausen,
+            };
+            // Nach „Ende“ ist der Verlauf festgeschrieben; ein Moduswechsel
+            // zeigt dann nur die Alternative im Entwurf, statt eine bereits
+            // auf einen Bereich gemappte Aufnahme wieder zu ueberschreiben.
+            // Auch ein leerer Entwurf (direkt nach „neu“) darf den alten
+            // Verlauf nicht loeschen.
+            if z.bereich.is_none() && !self.fest && !self.dauern.is_empty() {
+                z.schritte = self.verlauf.clone();
+            }
+        }
+    }
+
+    /// Die Anzeige-Zeile „18 Schritte (8+4+6) · Pausen 2+3 (5)“.
+    fn zusammenfassung(&self) -> String {
+        let dauern = self.aktive_dauern();
+        let pausen = self.aktive_pausen();
+        let block_summe: u32 = dauern.iter().map(|(_, d)| *d).sum();
+        let pausen_summe: u32 = pausen.iter().sum();
+        let dauer_text = dauern
+            .iter()
+            .map(|(_, d)| d.to_string())
+            .collect::<Vec<_>>()
+            .join("+");
+        match self.takt {
+            Takt::Werte => format!("{block_summe} Schritte ({dauer_text}) · Takt: Werte"),
+            Takt::Tippzeiten => {
+                format!("{block_summe} Schritte ({dauer_text}) · Takt: Tippzeiten")
+            }
+            Takt::Beides => {
+                let pausen_text = if pausen_summe == 0 {
+                    "—".to_string()
+                } else {
+                    pausen
+                        .iter()
+                        .filter(|p| **p > 0)
+                        .map(|p| p.to_string())
+                        .collect::<Vec<_>>()
+                        .join("+")
+                };
+                format!(
+                    "{block_summe} Schritte ({dauer_text}) · Pausen {pausen_text} \
+                     ({pausen_summe}) · gesamt {}",
+                    block_summe + pausen_summe
+                )
+            }
+        }
     }
 
     /// Zelle -> Position im Feld: 3x3 fuer 1..9, die Null allein darunter.
@@ -250,19 +399,20 @@ impl Maske2Panel {
         }
     }
 
-    /// Der Verlauf als Blockleiste: ein Block je Schritt, Farbe nach Ton.
+    /// Der Verlauf als Blockleiste: ein Platz je Gesamtschritt, Pausen
+    /// bleiben dunkle Luecken.
     fn verlauf_streifen(&self, ui: &mut egui::Ui, breite: f32) {
         let (leiste, painter) = ui.allocate_painter(egui::vec2(breite, 40.0), egui::Sense::hover());
         let rect = leiste.rect;
         painter.rect_filled(rect, 2.0, Color32::from_rgb(40, 42, 50));
-        let n = self.verlauf.len();
+        let n = jamcore::maske::verlauf_laenge(&self.verlauf);
         if n == 0 {
             return;
         }
         let block = rect.width() / n as f32;
-        for (i, (_, ton)) in self.verlauf.iter().enumerate() {
+        for (schritt, ton) in self.verlauf.iter() {
             let r = egui::Rect::from_min_size(
-                egui::pos2(rect.left() + i as f32 * block, rect.top()),
+                egui::pos2(rect.left() + *schritt as f32 * block, rect.top()),
                 egui::vec2((block - 0.5).max(1.0), rect.height()),
             );
             painter.rect_filled(r, 0.0, maske::verlauf_farbe(*ton));
@@ -296,13 +446,33 @@ impl Maske2Panel {
             ui.label(
                 RichText::new(format!(
                     "Bereich {von}-{bis} ({} Schritte) aus Maske 1 — „Ende“ mappt die neue \
-                     Gesamtzeit darauf.",
+                     Gesamtzeit (Bloecke + Pausen) darauf.",
                     bis - von
                 ))
                 .small()
                 .color(Color32::from_rgb(150, 200, 255)),
             );
         }
+
+        // Takt-Modus: Werte / Tippzeiten / beides.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Takt:");
+            let mut geaendert = false;
+            for takt in [Takt::Werte, Takt::Tippzeiten, Takt::Beides] {
+                geaendert |= ui
+                    .selectable_value(&mut self.takt, takt, takt.name())
+                    .changed();
+            }
+            if geaendert {
+                self.nachziehen();
+                self.status = format!(
+                    "Takt {} — {} Schritte",
+                    self.takt.name(),
+                    jamcore::maske::verlauf_laenge(&self.verlauf)
+                );
+                info!("maske2: Takt {}", self.takt.name());
+            }
+        });
 
         // Nummernblock: Ziffer trifft den raeumlich gleichen Knopf,
         // Enter ist „Ende“.
@@ -347,31 +517,22 @@ impl Maske2Panel {
                 }
             });
 
-        // Der Verlauf: die Summe der Dauern ist direkt als Bloecke sichtbar.
+        // Der Verlauf: Gesamtschritte inklusive Pausen-Luecken.
+        let gesamt = jamcore::maske::verlauf_laenge(&self.verlauf);
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Verlauf").strong());
             ui.label(format!(
-                "{} Schritte aus {} Tasten",
-                self.verlauf.len(),
+                "{gesamt} Schritte aus {} Tasten",
                 self.dauern.len()
             ));
         });
         self.verlauf_streifen(ui, breite);
         if !self.dauern.is_empty() {
-            let dauern_text = self
-                .dauern
-                .iter()
-                .map(|(_, d)| d.to_string())
-                .collect::<Vec<_>>()
-                .join(" + ");
             ui.label(
-                RichText::new(format!(
-                    "{dauern_text} = {} Schritte (keine Normalisierung auf die Zahl der Drücke)",
-                    self.verlauf.len()
-                ))
-                .small()
-                .color(Color32::GRAY),
+                RichText::new(self.zusammenfassung())
+                    .small()
+                    .color(Color32::from_rgb(200, 210, 225)),
             );
         }
 
@@ -410,9 +571,9 @@ impl Maske2Panel {
                     RichText::new(
                         "Der Feldwert ist die Dauer in Schritten (0 = Pause). \
                          Aufeinanderfolgende Tasten haengen an: 8, 4, 6 = 18 \
-                         Schritte. Der Ton kommt aus der Position der Taste \
-                         (60 + Position), damit die Bloecke im Verlauf getrennt \
-                         sichtbar bleiben.",
+                         Schritte. Die Tippabstaende werden mit dem Transport-\
+                         Tempo in Schritte gemappt; „beides“ legt sie als \
+                         Pausen vor die Bloecke.",
                     )
                     .small()
                     .color(Color32::DARK_GRAY),

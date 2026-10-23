@@ -184,34 +184,207 @@ pub fn dauern_auf_bereich(tasten: &[(i32, u32)], ziel: u32) -> Vec<(i32, u32)> {
         .collect()
 }
 
+/// Gemessene Tippabstaende in Schritte umrechnen:
+/// `schritte = (abstand_ms / step_ms).round()`.
+///
+/// Unbrauchbare Werte (0, negativ, NaN/∞) belegen keinen Schritt. Die
+/// Mindestdauer von 1 Schritt gilt erst im Tippzeiten-Modus
+/// ([`tippzeiten_als_dauern`]); hier bleibt `0 ms -> 0`, damit eine Pause
+/// wirklich eine Pause ist.
+pub fn schritte_aus_abstaenden(abstaende_ms: &[f64], step_ms: f64) -> Vec<u32> {
+    if !step_ms.is_finite() || step_ms <= 0.0 {
+        return vec![0; abstaende_ms.len()];
+    }
+    abstaende_ms
+        .iter()
+        .map(|ms| {
+            if !ms.is_finite() || *ms <= 0.0 {
+                0
+            } else {
+                // `as u32` sättigt; ein sehr langer Abstand wird nicht negativ.
+                (ms / step_ms).round().max(0.0) as u32
+            }
+        })
+        .collect()
+}
+
+/// Tippzeiten-Modus: die gemappten Abstaende sind die Blocklaengen, jeder
+/// Block mindestens ein Schritt (auch der erste Druck mit Abstand 0).
+pub fn tippzeiten_als_dauern(abstaende_ms: &[f64], step_ms: f64) -> Vec<u32> {
+    schritte_aus_abstaenden(abstaende_ms, step_ms)
+        .into_iter()
+        .map(|schritte| schritte.max(1))
+        .collect()
+}
+
+/// Verlauf aus Blockdauern und den Pausen **vor** jedem Block.
+///
+/// Die Pausen belegen leere Schritte: sie stehen nicht als Eintrag im
+/// Ergebnis, sondern als Lücke in der Schrittnummer. `pausen[i]` gehört zu
+/// `dauern[i]`; fehlende Angaben sind 0. Ein Block mit Dauer 0 entfällt samt
+/// seiner Pause (es gibt keinen Block, vor dem sie stehen könnte).
+pub fn verlauf_mit_pausen(dauern: &[(i32, u32)], pausen: &[u32]) -> Vec<(u32, i32)> {
+    let mut raus = Vec::new();
+    let mut schritt: u32 = 0;
+    for (i, &(ton, dauer)) in dauern.iter().enumerate() {
+        if dauer == 0 {
+            continue;
+        }
+        schritt = schritt.saturating_add(pausen.get(i).copied().unwrap_or(0));
+        for _ in 0..dauer {
+            raus.push((schritt, ton));
+            schritt += 1;
+        }
+    }
+    raus
+}
+
+/// Gesamtlaenge eines Verlaufs in Schritten — inklusive der Lücken, die
+/// Pausen hinterlassen. Ein kompakter Verlauf hat `len()` Schritte; mit
+/// Pausen ist die Laenge groesser als die Zahl der klingenden Einträge.
+pub fn verlauf_laenge(verlauf: &[(u32, i32)]) -> u32 {
+    verlauf
+        .iter()
+        .map(|(schritt, _)| schritt.saturating_add(1))
+        .max()
+        .unwrap_or(0)
+}
+
+/// Blockdauern und Pausen einer neuen Aufnahme proportional auf eine
+/// Bereichszeit von `ziel` Schritten legen.
+///
+/// Anders als [`dauern_auf_bereich`] zaehlen hier auch die Pausen als
+/// Zeitanteil. Jeder Block bekommt mindestens einen Schritt; der Rest wird
+/// nach dem groessten Rest auf **alle** Segmente (Bloecke und Pausen)
+/// verteilt, damit die Summe exakt `ziel` trifft.
+///
+/// Rueckgabe: `(blockdauern, pausen)` mit gleicher Laenge; die Pausen stehen
+/// wieder vor ihrem Block.
+pub fn struktur_auf_bereich(
+    dauern: &[(i32, u32)],
+    pausen: &[u32],
+    ziel: u32,
+) -> (Vec<(i32, u32)>, Vec<u32>) {
+    // Nur echte Bloecke; ihre Pause gehoert dazu.
+    let aktiv: Vec<(i32, u32, u32)> = dauern
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, dauer))| *dauer > 0)
+        .map(|(i, &(ton, dauer))| (ton, dauer, pausen.get(i).copied().unwrap_or(0)))
+        .collect();
+    if aktiv.is_empty() || ziel == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    let anzahl = aktiv.len() as u32;
+    if ziel <= anzahl {
+        // Zu wenig Platz: die ersten Bloecke bekommen je einen Schritt.
+        return (
+            aktiv
+                .iter()
+                .take(ziel as usize)
+                .map(|&(ton, _, _)| (ton, 1))
+                .collect(),
+            vec![0; ziel as usize],
+        );
+    }
+    let rest = ziel - anzahl;
+    // Segmente in Reihenfolge: Block, Pause, Block, Pause … Nur Segmente mit
+    // Gewicht zaehlen; die Basis 1 je Block ist bereits abgezogen.
+    enum Art {
+        Block(usize),
+        Pause(usize),
+    }
+    let mut segmente: Vec<(Art, u64)> = Vec::new();
+    for (k, &(_, dauer, pause)) in aktiv.iter().enumerate() {
+        segmente.push((Art::Block(k), u64::from(dauer)));
+        if pause > 0 {
+            segmente.push((Art::Pause(k), u64::from(pause)));
+        }
+    }
+    let summe: u64 = segmente.iter().map(|(_, gewicht)| *gewicht).sum();
+    let mut extra = vec![0u32; segmente.len()];
+    for (j, (_, gewicht)) in segmente.iter().enumerate() {
+        extra[j] = (u64::from(rest) * *gewicht / summe) as u32;
+    }
+    let vergeben: u32 = extra.iter().sum();
+    let mut uebrig = rest - vergeben;
+    let mut reste: Vec<(usize, u64)> = segmente
+        .iter()
+        .enumerate()
+        .map(|(j, (_, gewicht))| (j, (u64::from(rest) * *gewicht) % summe))
+        .collect();
+    reste.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let mut k = 0;
+    while uebrig > 0 {
+        extra[reste[k % reste.len()].0] += 1;
+        uebrig -= 1;
+        k += 1;
+    }
+    let mut block_extra = vec![0u32; aktiv.len()];
+    let mut pause_neu = vec![0u32; aktiv.len()];
+    for (j, (art, _)) in segmente.iter().enumerate() {
+        match art {
+            Art::Block(k) => block_extra[*k] = extra[j],
+            Art::Pause(k) => pause_neu[*k] = extra[j],
+        }
+    }
+    (
+        aktiv
+            .iter()
+            .enumerate()
+            .map(|(k, &(ton, _, _))| (ton, 1 + block_extra[k]))
+            .collect(),
+        pause_neu,
+    )
+}
+
 /// Ergebnis von [`bereich_ersetzen`] fuer Status und Log.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BereichErsetzt {
     /// Laenge des Bereichs in Schritten (und damit die Zahl der neuen
     /// Schritte, denn die Bereichszeit wird exakt gefuellt).
     pub schritte: u32,
-    /// Summe der neuen Dauern (die „Gesamtzeit“ der neuen Aufnahme).
+    /// Summe der neuen Dauern (die „Gesamtzeit“ der neuen Aufnahme), inklusive
+    /// der Pausen.
     pub dauer: u32,
-    /// Gesamtlaenge des Verlaufs danach.
+    /// Gesamtlaenge des Verlaufs danach (inklusive Pausen-Luecken).
     pub gesamt: u32,
+}
+
+/// Einen lokalen Verlauf `[0, bereich)` in den Bereich `[von, bis)` setzen.
+/// Ausserhalb bleibt alles stehen; die Schrittnummern sind bereits absolut
+/// und bleiben es (die Bereichslaenge aendert sich nicht).
+fn ersetze_bereich(
+    verlauf: &mut Vec<(u32, i32)>,
+    von: u32,
+    bis: u32,
+    lokal: &[(u32, i32)],
+    dauer: u32,
+) -> BereichErsetzt {
+    verlauf.retain(|(schritt, _)| *schritt < von || *schritt >= bis);
+    verlauf.extend(lokal.iter().map(|(schritt, ton)| (von + *schritt, *ton)));
+    verlauf.sort_by_key(|(schritt, _)| *schritt);
+    BereichErsetzt {
+        schritte: bis - von,
+        dauer,
+        gesamt: verlauf_laenge(verlauf),
+    }
 }
 
 /// Den Bereich `[von, bis)` im Verlauf durch eine neue M2-Aufnahme ersetzen.
 ///
 /// Die neue Gesamtzeit ([`dauern_auf_bereich`]) wird auf die Bereichszeit
-/// gemappt; außerhalb des Bereichs bleibt der Verlauf unangetastet. Die
-/// Schrittnummern werden anschließend neu durchnummeriert, damit der Verlauf
-/// lückenlos bleibt.
+/// gemappt; außerhalb des Bereichs bleibt der Verlauf unangetastet.
 ///
 /// `None`, wenn der Bereich leer/ungueltig ist oder die neue Aufnahme keine
-/// Schritte hat — dann darf einversehentlicher Tastendruck nichts löschen.
+/// Schritte hat — dann darf ein versehentlicher Tastendruck nichts löschen.
 pub fn bereich_ersetzen(
     verlauf: &mut Vec<(u32, i32)>,
     von: u32,
     bis: u32,
     tasten: &[(i32, u32)],
 ) -> Option<BereichErsetzt> {
-    let laenge = verlauf.len() as u32;
+    let laenge = verlauf_laenge(verlauf);
     let von = von.min(laenge);
     let bis = bis.min(laenge);
     if von >= bis {
@@ -221,21 +394,36 @@ pub fn bereich_ersetzen(
     if dauer == 0 {
         return None;
     }
-    let bereich = bis - von;
-    let gemappt = dauern_auf_bereich(tasten, bereich);
-    let mitte: Vec<(u32, i32)> = gemappt
-        .iter()
-        .flat_map(|&(ton, schritte)| (0..schritte).map(move |_| (0, ton)))
-        .collect();
-    verlauf.splice(von as usize..bis as usize, mitte);
-    for (i, eintrag) in verlauf.iter_mut().enumerate() {
-        eintrag.0 = i as u32;
+    let gemappt = dauern_auf_bereich(tasten, bis - von);
+    let lokal = schritte_aus_dauern(&gemappt);
+    Some(ersetze_bereich(verlauf, von, bis, &lokal, dauer))
+}
+
+/// Wie [`bereich_ersetzen`], aber mit Pausen vor den Blocken.
+///
+/// Die neue Aufnahme wird mit ihrer **gesamten** Zeit (Bloecke + Pausen) auf
+/// die Bereichszeit gemappt; die Pausen bleiben als Luecken erhalten.
+pub fn bereich_ersetzen_mit_pausen(
+    verlauf: &mut Vec<(u32, i32)>,
+    von: u32,
+    bis: u32,
+    dauern: &[(i32, u32)],
+    pausen: &[u32],
+) -> Option<BereichErsetzt> {
+    let laenge = verlauf_laenge(verlauf);
+    let von = von.min(laenge);
+    let bis = bis.min(laenge);
+    if von >= bis {
+        return None;
     }
-    Some(BereichErsetzt {
-        schritte: verlauf.len() as u32 - (laenge - bereich),
-        dauer,
-        gesamt: verlauf.len() as u32,
-    })
+    let dauer: u32 =
+        dauern.iter().map(|(_, d)| *d).sum::<u32>() + pausen.iter().take(dauern.len()).sum::<u32>();
+    if dauer == 0 {
+        return None;
+    }
+    let (dauern_neu, pausen_neu) = struktur_auf_bereich(dauern, pausen, bis - von);
+    let lokal = verlauf_mit_pausen(&dauern_neu, &pausen_neu);
+    Some(ersetze_bereich(verlauf, von, bis, &lokal, dauer))
 }
 
 #[cfg(test)]
@@ -457,5 +645,122 @@ mod tests {
         );
         assert_eq!(verlauf, alt);
         assert!(bereich_ersetzen(&mut verlauf, 5, 5, &[(60, 2)]).is_none());
+    }
+
+    #[test]
+    fn abstaende_werden_zu_schritten() {
+        // 240 ms bei 125 ms je Schritt sind genau zwei Schritte.
+        assert_eq!(schritte_aus_abstaenden(&[240.0], 125.0), vec![2]);
+        // 187 ms/125 = 1,496 -> 1; 188 ms/125 = 1,504 -> 2.
+        assert_eq!(
+            schritte_aus_abstaenden(&[187.0, 188.0], 125.0),
+            vec![1, 2],
+            "kaufmaennisch runden"
+        );
+        assert_eq!(
+            schritte_aus_abstaenden(&[62.0], 125.0),
+            vec![0],
+            "unter einem halben Schritt"
+        );
+        assert_eq!(
+            schritte_aus_abstaenden(&[0.0, -10.0, f64::NAN, f64::INFINITY], 125.0),
+            vec![0, 0, 0, 0],
+            "unbrauchbare Abstaende belegen keinen Schritt"
+        );
+        assert_eq!(
+            schritte_aus_abstaenden(&[240.0], 0.0),
+            vec![0],
+            "ohne Schrittlaenge keine Rechnung"
+        );
+        assert!(schritte_aus_abstaenden(&[], 125.0).is_empty());
+    }
+
+    #[test]
+    fn tippzeiten_werden_mindestens_ein_schritt() {
+        // Tippzeiten-Modus: der gemappte Abstand ist die Blocklaenge, auch
+        // beim ersten Druck (Abstand 0) mindestens ein Schritt.
+        assert_eq!(
+            tippzeiten_als_dauern(&[0.0, 240.0, 360.0], 120.0),
+            vec![1, 2, 3]
+        );
+        assert_eq!(tippzeiten_als_dauern(&[0.0], 120.0), vec![1]);
+        assert!(tippzeiten_als_dauern(&[], 120.0).is_empty());
+    }
+
+    #[test]
+    fn pausen_stehen_vor_ihrem_block() {
+        // 8/4/6 mit 2 und 3 Schritten Pause vor dem zweiten/dritten Block:
+        // 18 Block-Schritte plus 5 Pausen = 23 Schritte.
+        let verlauf = verlauf_mit_pausen(&[(60, 8), (62, 4), (64, 6)], &[0, 2, 3]);
+        assert_eq!(verlauf.len(), 18, "18 klingende Schritte");
+        assert_eq!(verlauf_laenge(&verlauf), 23, "inklusive Pausen");
+        assert_eq!(verlauf[8].0, 10, "zweiter Block nach 2 Pausen");
+        assert_eq!(verlauf[12].0, 17, "dritter Block nach weiteren 3 Pausen");
+        assert!(!verlauf.iter().any(|(s, _)| (8..10).contains(s)));
+        assert!(!verlauf.iter().any(|(s, _)| (14..17).contains(s)));
+        // Fehlende Pausenangaben sind 0, ein Block mit Dauer 0 entfaellt
+        // samt seiner Pause.
+        let knapp = verlauf_mit_pausen(&[(60, 2), (62, 2)], &[0]);
+        assert_eq!(verlauf_laenge(&knapp), 4);
+        assert_eq!(
+            verlauf_mit_pausen(&[(60, 0), (62, 2)], &[3, 0]),
+            vec![(0, 62), (1, 62)]
+        );
+        assert_eq!(verlauf_laenge(&[]), 0);
+    }
+
+    #[test]
+    fn bereich_mappt_auch_pausen() {
+        // 8/4/6 mit 2+3 Pausen (23 Schritte) auf 8 Bereichsschritte: die
+        // Bloecke schrumpfen auf 3/2/2, eine Pause bleibt als Luecke.
+        let (dauern, pausen) = struktur_auf_bereich(&[(60, 8), (62, 4), (64, 6)], &[0, 2, 3], 8);
+        assert_eq!(dauern, vec![(60, 3), (62, 2), (64, 2)]);
+        assert_eq!(pausen, vec![0, 0, 1]);
+        assert_eq!(
+            dauern.iter().map(|(_, d)| *d).sum::<u32>() + pausen.iter().sum::<u32>(),
+            8,
+            "Bereich exakt gefuellt"
+        );
+        // Auf die volle Laenge gemappt kommt die Aufnahme unveraendert zurueck.
+        let (dauern, pausen) = struktur_auf_bereich(&[(60, 8), (62, 4), (64, 6)], &[0, 2, 3], 23);
+        assert_eq!(dauern, vec![(60, 8), (62, 4), (64, 6)]);
+        assert_eq!(pausen, vec![0, 2, 3]);
+    }
+
+    #[test]
+    fn bereich_ersetzen_mit_pausen_haelt_die_luecke() {
+        let alt: Vec<(u32, i32)> = (0..20).map(|i| (i, 40 + i as i32)).collect();
+        let mut verlauf = alt.clone();
+        let meldung = bereich_ersetzen_mit_pausen(
+            &mut verlauf,
+            4,
+            12,
+            &[(60, 8), (62, 4), (64, 6)],
+            &[0, 2, 3],
+        )
+        .expect("Bereich ist gueltig");
+        assert_eq!(meldung.schritte, 8);
+        assert_eq!(meldung.dauer, 23, "Pausen zaehlen zur neuen Gesamtzeit");
+        assert_eq!(meldung.gesamt, 20, "Gesamtlaenge bleibt");
+        assert_eq!(&verlauf[..4], &alt[..4], "davor unveraendert");
+        assert_eq!(&verlauf[11..], &alt[12..], "danach unveraendert");
+        assert_eq!(
+            &verlauf[4..11],
+            &[
+                (4, 60),
+                (5, 60),
+                (6, 60),
+                (7, 62),
+                (8, 62),
+                (10, 64),
+                (11, 64)
+            ],
+            "gemappter Bereich mit Pause bei Schritt 9"
+        );
+        assert!(
+            !verlauf.iter().any(|(s, _)| *s == 9),
+            "die Pause ist eine Luecke"
+        );
+        assert_eq!(verlauf_laenge(&verlauf), 20);
     }
 }
