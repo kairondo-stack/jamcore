@@ -405,6 +405,10 @@ pub struct SlicerPanel {
     bereich: Option<(usize, usize)>,
     /// Laufende Aufnahme (None = keine).
     aufnahme: Option<wavrec::Aufnahme>,
+    /// Interne Aufnahme läuft (Mixer-Ringpuffer, kein Mikrofon).
+    intern_aufnahme: bool,
+    /// Gewählte Quelle: true = intern (App/Player), false = Mikrofon.
+    aufnahme_intern: bool,
     status: String,
     /// Beim Ziehen: welcher Schnitt (= Ende der Slice i) wandert gerade?
     zug_kante: Option<usize>,
@@ -446,6 +450,8 @@ impl SlicerPanel {
             auswahl: 0,
             bereich: None,
             aufnahme: None,
+            intern_aufnahme: false,
+            aufnahme_intern: false,
             status: "Audio öffnen oder aufnehmen — dann schneiden.".to_string(),
             zug_kante: None,
             zug_bereich_start: None,
@@ -747,7 +753,23 @@ impl SlicerPanel {
     }
 
     fn aufnahme_starten(&mut self) {
-        if self.aufnahme.is_some() {
+        if self.aufnahme.is_some() || self.intern_aufnahme {
+            return;
+        }
+        // Interne Quelle: der Mixer-Ringpuffer (was die App gerade spielt),
+        // ohne Mikrofon und ohne Berechtigung.
+        if self.aufnahme_intern {
+            match crate::klang::intern_aufnahme_starten() {
+                Ok(()) => {
+                    self.intern_aufnahme = true;
+                    self.status = "Interne Aufnahme läuft … (Stopp übernimmt sie)".to_string();
+                    info!("slicer: interne Aufnahme gestartet");
+                }
+                Err(e) => {
+                    self.status = format!("Interne Aufnahme nicht möglich: {e}");
+                    info!("slicer: interne Aufnahme-Start fehlgeschlagen: {e}");
+                }
+            }
             return;
         }
         match wavrec::Aufnahme::start() {
@@ -764,6 +786,19 @@ impl SlicerPanel {
     }
 
     fn aufnahme_stoppen(&mut self) {
+        if self.intern_aufnahme {
+            self.intern_aufnahme = false;
+            match crate::klang::intern_aufnahme_stoppen() {
+                Some(auf) => {
+                    self.aufnahme_uebernehmen(auf.pcm, auf.rate);
+                }
+                None => {
+                    self.status = "Interne Aufnahme war leer.".to_string();
+                    info!("slicer: interne Aufnahme ohne Proben");
+                }
+            }
+            return;
+        }
         let Some(auf) = self.aufnahme.take() else {
             return;
         };
@@ -777,6 +812,37 @@ impl SlicerPanel {
             }
             Err(e) => self.status = format!("Aufnahme-Fehler: {e}"),
         }
+    }
+
+    /// Interne Aufnahme übernehmen — dieselbe Kette wie `laden`, nur ohne
+    /// Datei (Hüllkurve, Schnitte, Auswahl, Undo zurücksetzen).
+    fn aufnahme_uebernehmen(&mut self, proben: Vec<f32>, rate: u32) {
+        if proben.is_empty() {
+            self.status = "Interne Aufnahme war leer.".to_string();
+            return;
+        }
+        let sekunden = proben.len() as f32 / rate.max(1) as f32;
+        self.huelle = huelle(&proben, HUELLEN_KAESTEN);
+        self.audio = Some((proben, rate));
+        self.pfad = None;
+        self.schnitte = slice::schnitte(
+            self.proben(),
+            self.rate(),
+            self.modus,
+            self.anzahl,
+            self.empfindlichkeit,
+        );
+        self.auswahl = 0;
+        self.bereich = None;
+        self.zug_bereich_start = None;
+        self.rueckgaengig = None;
+        self.raster_schmutzig = true;
+        self.status = format!(
+            "Interne Aufnahme: {sekunden:.1} s, {} Hz, {} Slice(s)",
+            self.rate(),
+            self.schnitte.len()
+        );
+        info!("slicer: interne Aufnahme uebernommen ({sekunden:.1} s)");
     }
 
     /// Auto-Schnitte nach Modus, Anzahl und Empfindlichkeit legen.
@@ -1397,12 +1463,22 @@ impl SlicerPanel {
             if ui.button("Audio öffnen …").clicked() {
                 aktion = Aktion::BrowserOeffnen;
             }
-            if self.aufnahme.is_some() {
+            if self.aufnahme.is_some() || self.intern_aufnahme {
                 if ui.button("Stopp").clicked() {
                     self.aufnahme_stoppen();
                 }
             } else if ui.button("Aufnehmen").clicked() {
                 self.aufnahme_starten();
+            }
+            // Quelle: Mikrofon oder intern (Mixer/Player) — intern braucht
+            // keine Berechtigung und nimmt, was die App gerade spielt.
+            ui.selectable_value(&mut self.aufnahme_intern, false, "Mikrofon");
+            ui.selectable_value(&mut self.aufnahme_intern, true, "Intern");
+            if self.intern_aufnahme {
+                ui.label(
+                    RichText::new(format!("● {:.1} s (intern)", crate::klang::intern_aufnahme_dauer()))
+                        .color(Color32::from_rgb(230, 120, 120)),
+                );
             }
             if let Some(auf) = self.aufnahme.as_ref() {
                 ui.label(
