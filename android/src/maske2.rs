@@ -207,6 +207,12 @@ impl Maske2Panel {
         ende.min(self.ende_s())
     }
 
+    /// Dauer eines Takt-Ticks in ms (dieselbe Uhr wie Transport/Bild).
+    fn tick_ms(&self) -> f64 {
+        jamcore::transport::step_dauer(crate::transport::bpm(), crate::transport::feinheit())
+            * 1000.0
+    }
+
     /// Dauer des aktuellen Rhythmus-Patterns in Sekunden. Nur fuer den
     /// Hinweis „Weite > Patternzeit“ — gerechnet wird nichts geklemmt.
     fn pattern_zeit_s(&self, pattern: &Pattern) -> f64 {
@@ -220,8 +226,8 @@ impl Maske2Panel {
     fn roh_bereiche_jetzt(&self) -> Vec<Bereich> {
         let mut b =
             jamcore::maske::bereiche_aus_aufnahme(&self.rohzeiten(), self.ende_s(), &self.weiten);
-        let ms = jamcore::maske::bereich_schritt_ms(&b, &self.optionen);
-        jamcore::maske::bereich_schrittspannen(&mut b, ms);
+        let tick = self.tick_ms();
+        jamcore::maske::bereich_schrittspannen(&mut b, tick);
         b
     }
 
@@ -446,6 +452,17 @@ impl Maske2Panel {
             self.notes3.len(),
             jamcore::maske::verlauf_laenge(&self.verlauf)
         );
+        let abstaende: Vec<u32> = self
+            .verlauf
+            .windows(2)
+            .map(|w| w[1].0.saturating_sub(w[0].0))
+            .collect();
+        info!(
+            "maske2: notes4 {} Noten, Abstaende {:?} Ticks (Tick {:.3} ms)",
+            self.verlauf.len(),
+            abstaende,
+            self.tick_ms()
+        );
 
         let mut z = match maske::verlauf_zustand().lock() {
             Ok(z) => z,
@@ -506,8 +523,8 @@ impl Maske2Panel {
         if !self.fest || self.bereiche.is_empty() {
             return;
         }
-        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
-        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        let tick = self.tick_ms();
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, tick);
         self.nachziehen();
         let status = self.bereiche_mappen();
         self.status = status;
@@ -681,11 +698,10 @@ impl Maske2Panel {
     /// notes3/notes4 aus der aktuellen Rohaufnahme bauen und in die
     /// gemeinsame Quelle schreiben.
     fn nachziehen(&mut self) {
-        let ende = self.ende_s();
         let bereiche = self.aktuelle_bereiche();
         self.notes3 = jamcore::maske::notes3_aus_bereichen(&bereiche, &self.optionen);
         self.verlauf =
-            jamcore::maske::auf_taktzeit_mappen_notes4(&self.notes3, ende, &self.optionen);
+            jamcore::maske::auf_taktzeit_mappen_notes4(&self.notes3, self.tick_ms());
         let ms = jamcore::maske::bereich_schritt_ms(&bereiche, &self.optionen);
         let (dauern, pausen) = jamcore::maske::bereich_blockstruktur(&bereiche, ms);
         let zeiten = maske::verlauf_zeiten(&self.verlauf);
@@ -770,8 +786,8 @@ impl Maske2Panel {
         }
         self.undo.push(self.bereiche.clone());
         self.bereiche[idx] = neu;
-        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
-        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        let tick = self.tick_ms();
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, tick);
         self.nachziehen();
         self.verlauf_anwenden();
         self.status = format!("Bereich {idx} geändert — Rückgängig möglich");
@@ -784,8 +800,8 @@ impl Maske2Panel {
             return;
         };
         self.bereiche = prev;
-        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
-        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        let tick = self.tick_ms();
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, tick);
         self.nachziehen();
         self.verlauf_anwenden();
         self.status = "Rückgängig — Rohwerte unverändert".to_string();
@@ -802,8 +818,8 @@ impl Maske2Panel {
         }
         self.undo.push(self.bereiche.clone());
         self.bereiche = self.roh_bereiche.clone();
-        let ms = jamcore::maske::bereich_schritt_ms(&self.bereiche, &self.optionen);
-        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, ms);
+        let tick = self.tick_ms();
+        jamcore::maske::bereich_schrittspannen(&mut self.bereiche, tick);
         self.nachziehen();
         self.verlauf_anwenden();
         self.status = "Bereiche auf Rohwerte zurückgesetzt".to_string();
@@ -1321,6 +1337,63 @@ impl Maske2Panel {
                 Taste::Enter => {}
             }
         }
+
+        // Tastenleiste direkt ueber dem Nummernfeld: dieselben Pfade wie
+        // `-`, Doppel-`-`, `/`, Enter und „Ende“ auf der Tastatur. Sie
+        // steht vor dem grossen Feld, damit sie ohne Scrollen sichtbar ist.
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            let groesse = egui::vec2(52.0, 40.0);
+            let minus = ui.add_enabled(
+                !self.fest,
+                egui::Button::new(RichText::new("-").size(22.0)).min_size(groesse),
+            );
+            if minus
+                .on_hover_text("lokale Weite: 1/4 der laufenden Wertphase")
+                .clicked()
+            {
+                self.minus_taste();
+            }
+            let doppelt = ui.add_enabled(
+                !self.fest,
+                egui::Button::new(RichText::new("--").size(22.0)).min_size(groesse),
+            );
+            if doppelt
+                .on_hover_text("globale Weite: 1/4 ab hier bis zum Ende (zwei Tipps)")
+                .clicked()
+            {
+                // Genau der Tastenpfad „zweimal -“: der zweite Tipp macht
+                // daraus die globale Weite.
+                self.minus_taste();
+                self.minus_taste();
+            }
+            let slash = ui.add_enabled(
+                !self.fest,
+                egui::Button::new(RichText::new("/").size(22.0)).min_size(groesse),
+            );
+            if slash.on_hover_text("Aufnahme beenden").clicked() {
+                self.ende(pattern);
+            }
+            let enter = ui.add_enabled(
+                !self.fest,
+                egui::Button::new(RichText::new("Enter").size(16.0)).min_size(groesse),
+            );
+            if enter.on_hover_text("Aufnahme beenden").clicked() {
+                self.ende(pattern);
+            }
+            if ui
+                .add(egui::Button::new("Ende").min_size(groesse))
+                .on_hover_text("Aufnahme beenden und festhalten")
+                .clicked()
+            {
+                self.ende(pattern);
+            }
+        });
+        ui.label(
+            RichText::new("- lokal · -- global · / oder Enter/Ende hält fest · 0 = Pause")
+                .small()
+                .color(Color32::from_rgb(160, 170, 185)),
+        );
 
         // Das Feld: grosse Knoepfe, damit sie mit dem Finger sicher treffen.
         let breite = ui.available_width();

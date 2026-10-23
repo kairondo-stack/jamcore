@@ -873,55 +873,45 @@ pub fn zwischenschritte_notes3(
     raus
 }
 
-/// notes3 -> notes4: die Schrittfolge auf die Taktzeit legen.
+/// notes3 -> notes4: jede klingende Note auf das Takt-Raster legen.
 ///
-/// Ein klingender notes3-Eintrag wird **ein** Takt-Schritt; eine Pause
-/// rueckt den Schrittzaehler um ihre Dauer in Schritten weiter (Luecke im
-/// Verlauf). Die Pausenlaenge kommt aus dem Fader (`step_min_ms`/
-/// `step_max_ms`); ohne feste Grenzen aus dem Median der klingenden
-/// Schrittlaengen. So bleibt „0 = Pause“ sichtbar, ohne die Taktzeit zu
-/// verbiegen.
-pub fn auf_taktzeit_mappen_notes4(
-    notes3: &[AufnahmeNote],
-    ende_s: f64,
-    optionen: &AufnahmeOptionen,
-) -> Vec<(u32, i32)> {
-    let mut schritt_ms = 0.0;
-    if optionen.step_min_ms > 0.0 && optionen.step_max_ms > 0.0 {
-        schritt_ms = fader_schritt_ms(optionen.step_min_ms, optionen.step_max_ms, optionen);
-    }
-    if schritt_ms <= 0.0 {
-        // Fallback: Median der klingenden Schrittlaengen.
-        let mut laengen = Vec::new();
-        for paar in notes3.windows(2) {
-            if paar[0].wert > 0 && paar[1].wert > 0 {
-                let d = paar[1].zeit_s - paar[0].zeit_s;
-                if d > 0.0 {
-                    laengen.push(d * 1000.0);
-                }
-            }
-        }
-        schritt_ms = median(laengen).unwrap_or(0.0);
-    }
+/// `tick_ms` ist die Dauer eines Rasterticks (aus `transport::step_dauer`,
+/// bei 128 BPM/16 z. B. 117,1875 ms). Die Note landet bei
+/// `round(zeit_s * 1000 / tick_ms)`. Runden zwei Noten auf denselben Tick,
+/// rueckt die spaetere auf den naechsten — die Folge bleibt monoton.
+///
+/// Pausen brauchen keine eigenen Ticks mehr: sie sind die **Luecken**
+/// zwischen den Noten-Ticks. Damit respektiert notes4 die in notes3
+/// berechnete Phasenweite (0,5 s / 0,8 s) statt jeder Note nur einen Tick
+/// zu geben. `tick_ms <= 0` faellt auf „ein Tick je Note“ zurueck.
+pub fn auf_taktzeit_mappen_notes4(notes3: &[AufnahmeNote], tick_ms: f64) -> Vec<(u32, i32)> {
+    let tick = if tick_ms.is_finite() && tick_ms > 0.0 {
+        tick_ms
+    } else {
+        0.0
+    };
     let mut raus = Vec::new();
-    let mut schritt: u32 = 0;
-    for (i, note) in notes3.iter().enumerate() {
-        if note.wert > 0 {
-            raus.push((schritt, note.wert));
-            schritt = schritt.saturating_add(1);
-        } else {
-            let bis = notes3
-                .get(i + 1)
-                .map(|n| n.zeit_s)
-                .unwrap_or(ende_s.max(note.zeit_s));
-            let dauer_ms = ((bis - note.zeit_s).max(0.0)) * 1000.0;
-            let pause = if schritt_ms > 0.0 {
-                (dauer_ms / schritt_ms).round().max(0.0) as u32
-            } else {
-                0
-            };
-            schritt = schritt.saturating_add(pause);
+    let mut letzter: Option<u32> = None;
+    for note in notes3 {
+        if note.wert <= 0 {
+            continue;
         }
+        let roh = if tick > 0.0 {
+            let t = (note.zeit_s.max(0.0) * 1000.0 / tick).round();
+            if t >= u32::MAX as f64 {
+                u32::MAX
+            } else {
+                t as u32
+            }
+        } else {
+            letzter.map_or(0, |l| l.saturating_add(1))
+        };
+        let schritt = match letzter {
+            Some(l) if roh <= l => l.saturating_add(1),
+            _ => roh,
+        };
+        raus.push((schritt, note.wert));
+        letzter = Some(schritt);
     }
     raus
 }
@@ -936,19 +926,20 @@ pub fn schritte_aus_aufnahme(
     werte: &[AufnahmeWert],
     ende_s: f64,
     optionen: &AufnahmeOptionen,
+    tick_ms: f64,
 ) -> Vec<(u32, i32)> {
     let notes3 = zwischenschritte_notes3(werte, ende_s, optionen);
-    auf_taktzeit_mappen_notes4(&notes3, ende_s, optionen)
+    auf_taktzeit_mappen_notes4(&notes3, tick_ms)
 }
 
 /// Blockdauern und Pausen einer Rohaufnahme fuer die Maske-1-Vorschau und
 /// das Bereichs-Mappen.
 ///
 /// `dauern` ist `(Wert, Wert)` je klingendem Druck (der Wert ist die Dauer
-/// in Schritten), `pausen` die Pausen **vor** dem jeweiligen Block. Die
-/// Pausenlaenge wird mit derselben Schrittweite wie in
-/// [`auf_taktzeit_mappen_notes4`] gerechnet; ohne feste Grenzen mit dem
-/// Median der Abschnitts-Schrittlaengen.
+/// in Block-Schritten), `pausen` die Pausen **vor** dem jeweiligen Block.
+/// Die Pausenlaenge kommt aus dem Fader (`step_min_ms`/`step_max_ms`) oder
+/// aus dem Median der Abschnitts-Schrittlaengen. Das ist die Groesse fuer
+/// das Bereichs-Mappen, nicht das Takt-Raster von `notes4`.
 pub fn aufnahme_blockstruktur(
     werte: &[AufnahmeWert],
     ende_s: f64,
@@ -1232,26 +1223,57 @@ pub fn bereich_schritt_ms(bereiche: &[Bereich], optionen: &AufnahmeOptionen) -> 
     median(laengen).unwrap_or(0.0)
 }
 
-/// Die absoluten Schrittspannen je Bereich (einschliesslich) fuellen.
-/// Klingende Bereiche belegen `schritte`; 0-Schritt-Bereiche (Pausen)
-/// ruecken um ihre Dauer in Pausenschritten weiter.
-pub fn bereich_schrittspannen(bereiche: &mut [Bereich], schritt_ms: f64) {
-    let mut schritt: u32 = 0;
+/// Eine Zeit in Ticks (gerundet, nicht negativ).
+fn tick_position(zeit_s: f64, tick_ms: f64) -> u32 {
+    if !tick_ms.is_finite() || tick_ms <= 0.0 {
+        return 0;
+    }
+    let t = (zeit_s.max(0.0) * 1000.0 / tick_ms).round();
+    if t >= u32::MAX as f64 {
+        u32::MAX
+    } else {
+        t as u32
+    }
+}
+
+/// Die absoluten Tick-Spannen je Bereich (einschliesslich) fuellen.
+///
+/// Klingende Bereiche bekommen die Ticks ihrer ersten und letzten Note —
+/// genau nach derselben Rechnung wie [`auf_taktzeit_mappen_notes4`].
+/// 0-Noten-Bereiche (Pausen) zeigen die Tick-Luecke zwischen den Noten.
+pub fn bereich_schrittspannen(bereiche: &mut [Bereich], tick_ms: f64) {
+    let mut letzter_note: Option<u32> = None;
     for b in bereiche.iter_mut() {
         let dauer = (b.ende_s - b.start_s).max(0.0);
         if b.schritte > 0 {
-            b.start_schritt = schritt;
-            b.ende_schritt = schritt.saturating_add(b.schritte - 1);
-            schritt = schritt.saturating_add(b.schritte);
+            let mut start = 0u32;
+            let mut ende = 0u32;
+            for k in 0..b.schritte {
+                let zeit_s = b.start_s + dauer * k as f64 / b.schritte as f64;
+                let roh = tick_position(zeit_s, tick_ms);
+                let tick = match letzter_note {
+                    Some(l) if roh <= l => l.saturating_add(1),
+                    _ => roh,
+                };
+                if k == 0 {
+                    start = tick;
+                }
+                ende = tick;
+                letzter_note = Some(tick);
+            }
+            b.start_schritt = start;
+            b.ende_schritt = ende;
         } else {
-            b.start_schritt = schritt;
-            let pause = if schritt_ms.is_finite() && schritt_ms > 0.0 {
-                (dauer * 1000.0 / schritt_ms).round().max(0.0) as u32
-            } else {
-                0
-            };
-            b.ende_schritt = schritt.saturating_add(pause.saturating_sub(1));
-            schritt = schritt.saturating_add(pause);
+            let start = tick_position(b.start_s, tick_ms).max(
+                letzter_note
+                    .map(|l| l.saturating_add(1))
+                    .unwrap_or(0),
+            );
+            let ende = tick_position(b.ende_s, tick_ms)
+                .saturating_sub(1)
+                .max(start);
+            b.start_schritt = start;
+            b.ende_schritt = ende;
         }
     }
 }
@@ -1762,20 +1784,50 @@ mod tests {
         for (i, (ist, soll)) in zeiten.iter().zip(erwartet).enumerate() {
             assert!(nah(*ist, soll), "Zeit {i}: {ist} statt {soll}");
         }
-        let verlauf = schritte_aus_aufnahme(&werte, 7.0, &opt);
+        // 128 BPM / 16 = 117,1875 ms je Tick. Die Phasenweiten 0,5 s und
+        // 0,8 s muessen als 4-5 bzw. 7 Ticks Abstand sichtbar bleiben.
+        let tick_ms = 60_000.0 / 128.0 / 4.0;
+        let verlauf = schritte_aus_aufnahme(&werte, 7.0, &opt, tick_ms);
         assert_eq!(verlauf.len(), 11);
-        assert_eq!(&verlauf[0..2], &[(0, 2), (1, 2)], "0-1 s: Wert 2");
+        assert_eq!(
+            verlauf.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![0, 4, 9, 13, 17, 21, 26, 32, 39, 46, 53]
+        );
+        assert_eq!(&verlauf[0..2], &[(0, 2), (4, 2)], "0-1 s: Wert 2");
         assert_eq!(
             &verlauf[2..6],
-            &[(2, 4), (3, 4), (4, 4), (5, 4)],
+            &[(9, 4), (13, 4), (17, 4), (21, 4)],
             "1-3 s: Wert 4"
         );
         assert_eq!(
             &verlauf[6..11],
-            &[(6, 5), (7, 5), (8, 5), (9, 5), (10, 5)],
+            &[(26, 5), (32, 5), (39, 5), (46, 5), (53, 5)],
             "3-7 s: Wert 5"
         );
-        assert_eq!(verlauf_laenge(&verlauf), 11);
+        assert_eq!(verlauf_laenge(&verlauf), 54, "7 s / 117,1875 ms");
+    }
+
+    #[test]
+    fn notes4_respektiert_die_phasenweite() {
+        // Der gemeldete Fehler: notes4 gab jeder Note nur einen Tick. Jetzt
+        // liegen die 11 Noten auf dem Takt-Raster; die Phasenweite 0,5 s
+        // ergibt ~4 Ticks, 0,8 s ~7 Ticks (nicht 1,2,3...).
+        let werte = [(2, 0.0), (4, 1.0), (5, 3.0), (0, 7.0)];
+        let notes3 = zwischenschritte_notes3(&werte, 7.0, &AufnahmeOptionen::default());
+        let tick_ms = 60_000.0 / 128.0 / 4.0; // 117,1875 ms
+        let notes4 = auf_taktzeit_mappen_notes4(&notes3, tick_ms);
+        let ticks: Vec<u32> = notes4.iter().map(|(s, _)| *s).collect();
+        assert_eq!(ticks, vec![0, 4, 9, 13, 17, 21, 26, 32, 39, 46, 53]);
+        let abstaende: Vec<u32> = ticks.windows(2).map(|w| w[1] - w[0]).collect();
+        assert_eq!(abstaende, vec![4, 5, 4, 4, 4, 5, 6, 7, 7, 7]);
+        assert!(
+            (4..=5).contains(&abstaende[0]),
+            "0,5 s ≈ 4,3 Ticks -> 4/5: {abstaende:?}"
+        );
+        assert!(
+            (6..=8).contains(&abstaende[abstaende.len() - 1]),
+            "0,8 s ≈ 6,8 Ticks -> 6-8: {abstaende:?}"
+        );
     }
 
     #[test]
@@ -1786,11 +1838,11 @@ mod tests {
         let mut opt = AufnahmeOptionen::default();
         opt.step_min_ms = 500.0;
         opt.step_max_ms = 500.0;
-        let verlauf = schritte_aus_aufnahme(&werte, 5.0, &opt);
+        let verlauf = schritte_aus_aufnahme(&werte, 5.0, &opt, 500.0);
         assert_eq!(
             verlauf,
             vec![(0, 2), (1, 2), (8, 3), (9, 3), (10, 3)],
-            "3 s Pause bei 500 ms = 6 Schritte Luecke"
+            "3 s Pause bei 500 ms = 6 Ticks Luecke"
         );
         assert_eq!(verlauf_laenge(&verlauf), 11);
         assert!(
@@ -1803,12 +1855,14 @@ mod tests {
     fn ende_kommt_von_aussen_nicht_von_der_null() {
         // Nur ein Druck (4), Ende nach 2 s: der Wert gilt bis zum Ende.
         let werte = [(4, 0.0)];
-        let verlauf = schritte_aus_aufnahme(&werte, 2.0, &AufnahmeOptionen::default());
+        let verlauf =
+            schritte_aus_aufnahme(&werte, 2.0, &AufnahmeOptionen::default(), 500.0);
         assert_eq!(verlauf, vec![(0, 4), (1, 4), (2, 4), (3, 4)]);
         // Die Null ist eine Pause, kein Ende: sie belegt keinen klingenden
         // Schritt, das Ende setzt `ende_s`.
         let werte = [(2, 0.0), (0, 1.0)];
-        let verlauf = schritte_aus_aufnahme(&werte, 2.0, &AufnahmeOptionen::default());
+        let verlauf =
+            schritte_aus_aufnahme(&werte, 2.0, &AufnahmeOptionen::default(), 500.0);
         assert_eq!(verlauf, vec![(0, 2), (1, 2)]);
     }
 
@@ -1907,8 +1961,12 @@ mod tests {
         for (ist, soll) in zeiten.iter().zip([0.0, 0.75, 2.625]) {
             assert!(nah(*ist, soll), "notes3: {ist} statt {soll}");
         }
-        let verlauf = schritte_aus_aufnahme(&werte, 3.0, &opt);
-        assert_eq!(verlauf, vec![(0, 3), (1, 3), (2, 3)]);
+        let verlauf = schritte_aus_aufnahme(&werte, 3.0, &opt, 375.0);
+        assert_eq!(
+            verlauf,
+            vec![(0, 3), (2, 3), (7, 3)],
+            "0 / 0,75 / 2,625 s bei 375 ms Tick"
+        );
     }
 
     #[test]
@@ -1933,9 +1991,11 @@ mod tests {
         assert_eq!(randzone(3.0, 1.0 / 8.0), (2.625, 3.0));
         assert_eq!(randzone(3.0, 0.5), (1.5, 3.0));
         assert_eq!(randzone(3.0, 2.0), (1.5, 3.0), "auf 1/2 begrenzt");
-        assert!(schritte_aus_aufnahme(&[], 2.0, &AufnahmeOptionen::default()).is_empty());
+        assert!(
+            schritte_aus_aufnahme(&[], 2.0, &AufnahmeOptionen::default(), 100.0).is_empty()
+        );
         assert!(zwischenschritte_notes3(&[], 2.0, &AufnahmeOptionen::default()).is_empty());
-        assert!(auf_taktzeit_mappen_notes4(&[], 2.0, &AufnahmeOptionen::default()).is_empty());
+        assert!(auf_taktzeit_mappen_notes4(&[], 100.0).is_empty());
         assert!(rand_schritt_ms(&[], 3.0, RandModus::Oben, 0.125).is_none());
         assert!(rand_schritt_ms(&[1.0], 3.0, RandModus::Oben, 0.125).is_none());
     }
@@ -1946,9 +2006,12 @@ mod tests {
         // wird sortiert und auf [0, ende] geklemmt, damit die Schritte
         // monoton bleiben.
         let werte = [(5, 3.0), (2, 0.0)];
-        let verlauf = schritte_aus_aufnahme(&werte, 5.0, &AufnahmeOptionen::default());
-        assert_eq!(&verlauf[0..2], &[(0, 2), (1, 2)]);
-        assert_eq!(&verlauf[2..], &[(2, 5), (3, 5), (4, 5), (5, 5), (6, 5)]);
+        let verlauf =
+            schritte_aus_aufnahme(&werte, 5.0, &AufnahmeOptionen::default(), 500.0);
+        assert_eq!(
+            verlauf,
+            vec![(0, 2), (3, 2), (6, 5), (7, 5), (8, 5), (9, 5), (10, 5)]
+        );
     }
 
     #[test]
@@ -2032,9 +2095,8 @@ mod tests {
         weiten: &[WeitenEreignis],
     ) -> Vec<Bereich> {
         let mut b = bereiche_aus_aufnahme(werte, ende_s, weiten);
-        let opt = AufnahmeOptionen::default();
-        let ms = bereich_schritt_ms(&b, &opt);
-        bereich_schrittspannen(&mut b, ms);
+        // Tick nur fuer die Spannen; die Tests pruefen Weite/Schrittzahl.
+        bereich_schrittspannen(&mut b, 500.0);
         b
     }
 
