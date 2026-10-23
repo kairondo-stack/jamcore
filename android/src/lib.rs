@@ -72,6 +72,9 @@ enum Tab {
 
 struct JamApp {
     tab: Tab,
+    /// Vollbild: Kopfzeile/Tab-Leiste ausblenden (Bild/B2) — Ausstieg über
+    /// den schwebenden Knopf oben rechts.
+    vollbild: bool,
     status: String,
     meldung: String,
     insets_px: Option<insets::InsetsPx>,
@@ -155,6 +158,7 @@ impl Default for JamApp {
     fn default() -> Self {
         JamApp {
             tab: Tab::Ueberblick,
+            vollbild: false,
             status: "Bereit".to_string(),
             meldung: String::new(),
             insets_px: None,
@@ -457,8 +461,15 @@ impl eframe::App for JamApp {
         let top = px.map(|p| p.0 / ppp).unwrap_or(0.0);
         let bottom = px.map(|p| p.1 / ppp).unwrap_or(0.0);
 
+        // Vollbild (Bild/B2): die Kopfzeile mit den Tabs ausblenden — der
+        // Ausstieg steht als schwebender Knopf oben rechts.
         egui::Panel::top("kopf").show(ui, |ui| {
             ui.add_space(top);
+            // Vollbild: nur der Statusleisten-Abstand bleibt, die Tabs gehen
+            // aus (sonst läge der Inhalt unter Uhr/Cutout).
+            if self.vollbild {
+                return;
+            }
             // Titel **und** Tabs in einer umbrechenden Zeile: die frühere
             // Verschachtelung („horizontal" um „horizontal_wrapped") ließ das
             // Panel nur zwei Zeilen hoch werden — die dritte Tab-Zeile ragte
@@ -469,20 +480,53 @@ impl eframe::App for JamApp {
                 ui.selectable_value(&mut self.tab, Tab::Ueberblick, "Überblick");
                 ui.selectable_value(&mut self.tab, Tab::Player, "Player");
                 ui.selectable_value(&mut self.tab, Tab::Instr, "Instr");
-                ui.selectable_value(&mut self.tab, Tab::Osc, "OSC");
+                ui.selectable_value(&mut self.tab, Tab::Osc, "Tempo/OSC");
                 ui.selectable_value(&mut self.tab, Tab::Rhythmus, "Rhythmus");
-                ui.selectable_value(&mut self.tab, Tab::Tempo, "Tempo");
                 ui.selectable_value(&mut self.tab, Tab::Bild, "Bild");
                 ui.selectable_value(&mut self.tab, Tab::Laub, "Laub");
                 ui.selectable_value(&mut self.tab, Tab::Kreis, "Kreis");
-                ui.selectable_value(&mut self.tab, Tab::Tagebuch, "Tagebuch");
                 ui.selectable_value(&mut self.tab, Tab::Maske, "Maske");
-                ui.selectable_value(&mut self.tab, Tab::Maske2, "M2");
                 ui.selectable_value(&mut self.tab, Tab::Bild2, "B2");
                 ui.selectable_value(&mut self.tab, Tab::Lissa, "Lissa");
                 ui.selectable_value(&mut self.tab, Tab::Slicer, "Slicer");
                 ui.selectable_value(&mut self.tab, Tab::Kombi, "Kombi");
             });
+            // Zusammengelegte Tabs (Nutzerentscheidung 2026-10-22): ein Eintrag
+            // in der Leiste, die Umschaltung steht direkt darunter — so bleibt
+            // die Leiste kurz und beide Ansichten sind einen Tipp entfernt.
+            let umschalter = match self.tab {
+                Tab::Ueberblick | Tab::Tagebuch => {
+                    Some((Tab::Ueberblick, "Überblick", Tab::Tagebuch, "Tagebuch"))
+                }
+                Tab::Osc | Tab::Tempo => Some((Tab::Osc, "OSC", Tab::Tempo, "Tempo")),
+                Tab::Maske | Tab::Maske2 => Some((Tab::Maske, "Maske", Tab::Maske2, "M2")),
+                _ => None,
+            };
+            if let Some((links, links_text, rechts, rechts_text)) = umschalter {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.tab == links, links_text).clicked() {
+                        self.tab = links;
+                    }
+                    if ui
+                        .selectable_label(self.tab == rechts, rechts_text)
+                        .clicked()
+                    {
+                        self.tab = rechts;
+                    }
+                });
+            }
+            // Vollbild für Bild/B2: mehr Platz, Kopfzeile geht aus.
+            if matches!(self.tab, Tab::Bild | Tab::Bild2) {
+                ui.horizontal(|ui| {
+                    if ui
+                        .button("⛶ Vollbild")
+                        .on_hover_text("Kopfzeile ausblenden — mehr Platz fürs Bild")
+                        .clicked()
+                    {
+                        self.vollbild = true;
+                    }
+                });
+            }
             ui.add_space(4.0);
         });
 
@@ -554,6 +598,17 @@ impl eframe::App for JamApp {
             Tab::Lissa => self.view_lissa(ui),
             Tab::Slicer => self.view_slicer(ui),
             Tab::Kombi => self.view_kombi(ui),
+        }
+        // Vollbild-Ausstieg: schwebt oben rechts über dem Bild, damit man auch
+        // ohne Kopfzeile jederzeit zurückkommt.
+        if self.vollbild {
+            egui::Area::new(egui::Id::new("vollbild_aus"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, top + 10.0))
+                .show(ui.ctx(), |ui| {
+                    if ui.button("⛶ aus").clicked() {
+                        self.vollbild = false;
+                    }
+                });
         }
         // Der Dauerton des Lissa-Tabs klingt nur dort (sonst weiter im Hintergrund).
         if self.tab != Tab::Lissa {
