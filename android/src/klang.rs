@@ -22,7 +22,7 @@
 
 use std::collections::VecDeque;
 use std::os::raw::c_int;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Mutex, OnceLock};
 
@@ -47,6 +47,12 @@ const PUFFER_MAX: usize = 16;
 const PUFFER_HART: usize = PUFFER_MAX + 8;
 /// Ausblendzeit einer verdraengten Stimme.
 const AUSBLEND_MS: f64 = 5.0;
+/// Laenge des Ringpuffers fuer die interne Aufnahme. Acht Sekunden reichen
+/// fuer ein paar Motive und belegen nur ~1,4 MB (mono f32); laengere
+/// Aufnahmen behalten die letzten acht Sekunden.
+const AUFNAHME_SEKUNDEN: usize = 8;
+/// So viele Proben passen in den Ring (bei [`RATE`]).
+const AUFNAHME_MAX: usize = AUFNAHME_SEKUNDEN * RATE as usize;
 
 /// Ein Auftrag an den Klang-Thread.
 enum Auftrag {
@@ -209,6 +215,112 @@ pub fn slices_lautstaerke_setzen(prozent: f32) -> bool {
     }
 }
 
+/// Eine interne Aufnahme des Mixer-Ausgangs (mono, ohne Mikrofon).
+pub struct Aufnahme {
+    pub pcm: Vec<f32>,
+    pub rate: u32,
+    /// Tatsächlich aufgenommene Zeit. Kann größer als der Ringpuffer sein,
+    /// wenn die Aufnahme länger als [`AUFNAHME_SEKUNDEN`] lief.
+    pub dauer_s: f32,
+}
+
+/// Ringpuffer der internen Aufnahme. Warum ein Ring: Die Aufnahme soll auch
+/// bei längerem Laufen nur die letzten Sekunden behalten, ohne den Speicher
+/// unbegrenzt wachsen zu lassen.
+struct Ring {
+    pcm: VecDeque<f32>,
+    /// So viele Proben wurden insgesamt geschrieben (für die Daueranzeige).
+    geschrieben: u64,
+}
+
+impl Ring {
+    fn neu() -> Self {
+        Self {
+            pcm: VecDeque::with_capacity(AUFNAHME_MAX),
+            geschrieben: 0,
+        }
+    }
+}
+
+static AUFNAHME_AKTIV: AtomicBool = AtomicBool::new(false);
+static AUFNAHME: OnceLock<Mutex<Ring>> = OnceLock::new();
+
+fn aufnahme_slot() -> &'static Mutex<Ring> {
+    AUFNAHME.get_or_init(|| Mutex::new(Ring::neu()))
+}
+
+/// Interne Aufnahme starten: zeichnet den Mixer-Ausgang auf (kein Mikrofon,
+/// keine Berechtigung). Startet den Klang-Thread, damit auch bei Stille
+/// Blöcke ankommen und die Zeitachse stimmt.
+pub fn intern_aufnahme_starten() -> Result<(), String> {
+    let mut guard = spieler_slot()
+        .lock()
+        .map_err(|_| "Klang-Sperre vergiftet".to_string())?;
+    if !sicherstellen(&mut guard) {
+        return Err("Klang-Thread startet nicht".to_string());
+    }
+    let mut ring = aufnahme_slot()
+        .lock()
+        .map_err(|_| "Aufnahme-Sperre vergiftet".to_string())?;
+    ring.pcm.clear();
+    ring.geschrieben = 0;
+    AUFNAHME_AKTIV.store(true, Ordering::Relaxed);
+    info!(
+        "klang: interne Aufnahme an (Mixer, Ringpuffer {AUFNAHME_SEKUNDEN} s)"
+    );
+    Ok(())
+}
+
+/// Interne Aufnahme stoppen und die letzten Sekunden zurückgeben. `None`,
+/// wenn keine Aufnahme lief.
+pub fn intern_aufnahme_stoppen() -> Option<Aufnahme> {
+    if !AUFNAHME_AKTIV.swap(false, Ordering::Relaxed) {
+        return None;
+    }
+    let mut ring = aufnahme_slot().lock().ok()?;
+    let pcm: Vec<f32> = ring.pcm.drain(..).collect();
+    let dauer_s = ring.geschrieben as f32 / RATE as f32;
+    info!(
+        "klang: interne Aufnahme aus ({dauer_s:.1} s, {} Proben im Ring)",
+        pcm.len()
+    );
+    Some(Aufnahme {
+        pcm,
+        rate: RATE as u32,
+        dauer_s,
+    })
+}
+
+/// Läuft gerade eine interne Aufnahme?
+pub fn intern_aufnahme_laeuft() -> bool {
+    AUFNAHME_AKTIV.load(Ordering::Relaxed)
+}
+
+/// Bisher aufgenommene Zeit in Sekunden (für die Anzeige im Kreis-Tab).
+pub fn intern_aufnahme_dauer() -> f32 {
+    aufnahme_slot()
+        .lock()
+        .map(|r| r.geschrieben as f32 / RATE as f32)
+        .unwrap_or(0.0)
+}
+
+/// Einen fertig gemischten Block in den Ring schreiben. Der Mixer ist mono
+/// (beim Schreiben auf Stereo dupliziert); deshalb reicht eine Spur.
+fn aufnahme_schreiben(puffer: &[i16]) {
+    if !AUFNAHME_AKTIV.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Ok(mut ring) = aufnahme_slot().lock() {
+        for &s in puffer {
+            if ring.pcm.len() >= AUFNAHME_MAX {
+                ring.pcm.pop_front();
+            }
+            ring.pcm.push_back(s as f32 / 32768.0);
+            ring.geschrieben += 1;
+        }
+    }
+}
+
 /// Zwei Dauertöne (Lissa-Tab: X- und Y-Stimme der Figur). `None` = aus.
 static DAUERTON: OnceLock<Mutex<Option<[f32; 2]>>> = OnceLock::new();
 
@@ -345,14 +457,19 @@ fn spieler_slot() -> &'static Mutex<Option<Spieler>> {
     SPIELER.get_or_init(|| Mutex::new(None))
 }
 
-/// Den Klang-Thread starten, falls er noch nicht läuft.
-fn sicherstellen(guard: &mut Option<Spieler>) {
+/// Den Klang-Thread starten, falls er noch nicht läuft. `false`, wenn der
+/// Start scheitert (die Aufnahme meldet das dem Aufrufer).
+fn sicherstellen(guard: &mut Option<Spieler>) -> bool {
     if guard.is_none() {
         match starten() {
             Ok(neu) => *guard = Some(neu),
-            Err(e) => info!("klang: Start fehlgeschlagen: {e}"),
+            Err(e) => {
+                info!("klang: Start fehlgeschlagen: {e}");
+                return false;
+            }
         }
     }
+    true
 }
 
 /// Spielt eine MIDI-Note mit gewaehlter Wellenform an.
@@ -486,11 +603,15 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
             _ => {}
         }
         // Klingt nichts, wird gewartet statt gedreht; klingt etwas, werden
-        // alle wartenden Auftraege sofort aufgenommen.
+        // alle wartenden Auftraege sofort aufgenommen. Während einer internen
+        // Aufnahme wird auch bei Stille weitergeschrieben, damit Pausen auf
+        // der Zeitachse bleiben.
+        let aufnahme_an = intern_aufnahme_laeuft();
         let leer = stimmen.is_empty()
             && dauerton.is_none()
             && linienton.is_none()
-            && puffer_schlange.is_empty();
+            && puffer_schlange.is_empty()
+            && !aufnahme_an;
         let erster = if leer {
             match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(auftrag) => Some(auftrag),
@@ -552,6 +673,7 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
             && dauerton.is_none()
             && linienton.is_none()
             && puffer_schlange.is_empty()
+            && !aufnahme_an
         {
             continue;
         }
@@ -584,6 +706,8 @@ fn schleife(vm: &std::sync::Arc<jni::JavaVM>, rx: Receiver<Auftrag>) -> Result<(
                 k += 1;
             }
         }
+        // Intern aufnehmen: den fertigen Mix (nach allen Stimmen) mitschreiben.
+        aufnahme_schreiben(&puffer);
         if !block_schreiben(&mut env, &track, &array, &puffer) {
             return Ok(());
         }

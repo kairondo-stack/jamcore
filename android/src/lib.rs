@@ -1194,8 +1194,20 @@ impl JamApp {
         self.kreis.set_target(&host, &port);
         let mut uebernehmen = None;
         egui::CentralPanel::default().show(ui, |ui| {
-            uebernehmen = self.kreis.ui(ui);
-            kreis_presets::ui(ui, &mut self.kreis);
+            // Scrollbar, weil der Preset-Editor (Wellenform + Werkzeuge) auf
+            // dem Handy sonst unter dem Bildschirmrand liegt.
+            egui::ScrollArea::vertical()
+                // Kein Drag-Scrollen: egui greift den Drag vor den Widgets ab,
+                // sonst ließen sich die Start/Ende-Marker im Preset-Editor
+                // nicht ziehen. Gescrollt wird über die Leiste/den Rad-Impuls.
+                .scroll_source(egui::scroll_area::ScrollSource {
+                    drag: egui::scroll_area::DragScroll::Never,
+                    ..egui::scroll_area::ScrollSource::default()
+                })
+                .show(ui, |ui| {
+                    uebernehmen = self.kreis.ui(ui);
+                    kreis_presets::ui(ui, &mut self.kreis);
+                });
         });
         if let Some(klassen) = uebernehmen {
             self.bild

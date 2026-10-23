@@ -215,6 +215,20 @@ fn abschnitte(noten: &[(f32, i32)]) -> Vec<Abschnitt> {
     seg
 }
 
+/// Gehaltene Notenabschnitte aus PCM: (MIDI-Note, Start, Ende) in Sekunden.
+///
+/// Warum öffentlich: Der Kreis-Tab legt eine interne Aufnahme auch dann als
+/// Preset ab, wenn sie kein wiederkehrendes Motiv enthält (z. B. ein einzelner
+/// gehaltener Akkord). Dafür braucht er die Abschnitte, nicht nur Motive.
+pub fn noten_segmente(pcm: &[f32], rate: u32) -> Vec<(i32, f32, f32)> {
+    let spur = tonhoehen(pcm, rate);
+    let noten: Vec<(f32, i32)> = spur.iter().map(|(t, f)| (*t, midi(*f))).collect();
+    abschnitte(&noten)
+        .into_iter()
+        .map(|a| (a.note, a.start, a.ende))
+        .collect()
+}
+
 /// Kleinste Periode einer Notenfolge (für „ABCABC" → 3).
 fn periode(noten: &[i32]) -> usize {
     let n = noten.len();
@@ -371,6 +385,84 @@ pub fn finde_motive(noten: &[(f32, i32)], laenge: usize) -> Vec<Motiv> {
     ergebnis
 }
 
+/// Cent-Schritt der Thai-7-Ton-Gleichschwebung: sieben gleiche Schritte je
+/// Oktave. Die klassische Thai-Musik nutzt diese Stimmung mit pentatonischen
+/// Ausschnitten; 171 Cent liegt zwischen einem Halbton und einem
+/// Ganztonschritt, deshalb klingt die 12-TET-Näherung absichtlich „schwebend“.
+pub const THAI_CENT: f32 = 1200.0 / 7.0;
+
+/// Grundton der eingebauten Thai-Motive (MIDI-Näherung der 7-TET-Stufe 0).
+pub const THAI_GRUNDTON: i32 = 60;
+
+/// Namen der sechs eingebauten Thai-Motive, gleiche Reihenfolge wie
+/// [`thai_motive`]. Warum getrennt: `Motiv` bleibt reine Daten für die
+/// Analyse; die Anzeige braucht keine zusätzlichen Felder.
+pub const THAI_NAMEN: [&str; 6] = [
+    "aufwärts 3",
+    "abwärts 3",
+    "3+1 auf",
+    "3+1 ab",
+    "5-Ton auf",
+    "5-Ton ab",
+];
+
+/// 7-TET-Stufe → MIDI-Note (gerundet). Nur für Anzeige/Vergleich; die
+/// eigentliche Stimmung liegt in [`thai_frequenz`].
+pub fn thai_midi(stufe: i32, grundton: i32) -> i32 {
+    (grundton as f32 + stufe as f32 * 12.0 / 7.0)
+        .round()
+        .clamp(0.0, 127.0) as i32
+}
+
+/// Frequenz einer 7-TET-Stufe über `grundton` (MIDI). Damit kann die App die
+/// Thai-Motive auch ohne Audiodatei hörbar machen, ohne die 171-Cent-Schritte
+/// auf 12-TET zu verbiegen.
+pub fn thai_frequenz(stufe: i32, grundton: i32) -> f32 {
+    let basis = 440.0 * 2f32.powf((grundton.clamp(0, 127) as f32 - 69.0) / 12.0);
+    basis * 2f32.powf(stufe as f32 / 7.0)
+}
+
+/// Sechs feste Thai-Motive: drei- und fünftönige Auf-/Absteiger sowie je ein
+/// „3+1“-Motiv mit Sprung. Sie brauchen keine Audiodatei — der Kreis-Tab
+/// synthetisiert daraus PCM (7-TET) und bietet sie wie analysierte Motive an.
+pub fn thai_motive() -> Vec<Motiv> {
+    // Pentatonische Ausschnitte aus den sieben Stufen (0..7) plus die Oktave.
+    // Auf-/Absteiger stehen paarweise, damit die Umkehrung offensichtlich ist.
+    const STUFEN: [&[i32]; 6] = [
+        &[0, 2, 4],
+        &[4, 2, 0],
+        &[0, 2, 4, 7],
+        &[7, 4, 2, 0],
+        &[0, 2, 4, 6, 8],
+        &[8, 6, 4, 2, 0],
+    ];
+    STUFEN
+        .iter()
+        .map(|stufen| Motiv {
+            noten: stufen
+                .iter()
+                .map(|&stufe| thai_midi(stufe, THAI_GRUNDTON))
+                .collect(),
+            starts: vec![0.0],
+            // 0,25 s je Ton: die x-Bereiche werden dadurch gleich breit.
+            dauer_s: stufen.len() as f32 * 0.25,
+        })
+        .collect()
+}
+
+/// Gleich breite x-Bereiche für `anzahl` Noten (0..1). Für Presets ohne
+/// Einzeldauern (Thai, Akkorde) und als Rückfall, wenn eine Bearbeitung keine
+/// brauchbaren Zeitmarken mehr übrig lässt.
+pub fn gleich_bereiche(anzahl: usize) -> Vec<(f32, f32)> {
+    if anzahl == 0 {
+        return Vec::new();
+    }
+    let schritt = 1.0 / anzahl as f32;
+    (0..anzahl)
+        .map(|i| (i as f32 * schritt, (i + 1) as f32 * schritt))
+        .collect()
+}
+
 /// Motiv → x-Bereiche (0..1) je Note für den Kreis-Tab.
 ///
 /// Warum gleichmäßig: Das Motiv kennt nur seine Gesamtdauer, keine
@@ -390,6 +482,130 @@ pub fn x_bereiche(motiv: &Motiv, gesamt_s: f32) -> Vec<(f32, f32)> {
             (von.min(bis), von.max(bis))
         })
         .collect()
+}
+
+/// Notenabschnitte → x-Bereiche (0..1), ohne gleichmäßige Aufteilung: die
+/// erkannten Start-/Endzeiten bestimmen die Breite. Wird für den
+/// Aufnahme-Fallback gebraucht (eine Aufnahme ohne wiederkehrendes Motiv).
+pub fn x_bereiche_aus_segmenten(
+    segmente: &[(i32, f32, f32)],
+    gesamt_s: f32,
+) -> Vec<(f32, f32)> {
+    if !gesamt_s.is_finite() || gesamt_s <= 0.0 {
+        return Vec::new();
+    }
+    segmente
+        .iter()
+        .filter_map(|&(_, von, bis)| {
+            let von = (von / gesamt_s).clamp(0.0, 1.0);
+            let bis = (bis / gesamt_s).clamp(0.0, 1.0);
+            (bis > von).then_some((von, bis))
+        })
+        .collect()
+}
+
+/// x-Bereiche umkehren: Notenreihenfolge und Lage spiegeln.
+///
+/// Rückgabe mit dem alten Index, damit der Aufrufer `noten` und `x_bereiche`
+/// synchron halten kann (der Editor im Kreis-Tab braucht beides).
+pub fn bereiche_umkehren(bereiche: &[(f32, f32)]) -> Vec<(usize, (f32, f32))> {
+    bereiche
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(i, &(a, b))| {
+            let a = a.clamp(0.0, 1.0);
+            let b = b.clamp(0.0, 1.0);
+            let (a, b) = (a.min(b), a.max(b));
+            (i, ((1.0 - b).clamp(0.0, 1.0), (1.0 - a).clamp(0.0, 1.0)))
+        })
+        .collect()
+}
+
+/// x-Bereiche auf `[von, bis]` zuschneiden und auf 0..1 normieren.
+///
+/// Angeschnittene Bereiche werden geklemmt, ganz außerhalb liegende fallen
+/// weg. So bleiben Noten und x-Bereiche nach `audioedit::zuschneiden` synchron.
+pub fn bereiche_zuschneiden(
+    bereiche: &[(f32, f32)],
+    von: f32,
+    bis: f32,
+) -> Vec<(usize, (f32, f32))> {
+    let von = von.clamp(0.0, 1.0);
+    let bis = bis.clamp(0.0, 1.0);
+    if !(bis > von) {
+        return Vec::new();
+    }
+    let spanne = bis - von;
+    bereiche
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &(a, b))| {
+            let a = a.clamp(0.0, 1.0);
+            let b = b.clamp(0.0, 1.0);
+            let (a, b) = (a.min(b), a.max(b));
+            let a = a.max(von);
+            let b = b.min(bis);
+            (b > a).then_some((i, ((a - von) / spanne, (b - von) / spanne)))
+        })
+        .collect()
+}
+
+/// x-Bereiche nach dem Löschen von `[von, bis)` neu verteilen.
+///
+/// Noten im Loch fallen weg, Bereiche davor/dahinter rücken zusammen; ein
+/// Bereich, der das Loch überlappt, wird zu einem Bereich (die zwei übrigen
+/// Teile stoßen nach dem Löschen aneinander). Rückgabe mit altem Index.
+pub fn bereiche_loeschen(
+    bereiche: &[(f32, f32)],
+    von: f32,
+    bis: f32,
+) -> Vec<(usize, (f32, f32))> {
+    let von = von.clamp(0.0, 1.0);
+    let bis = bis.clamp(0.0, 1.0);
+    if !(bis > von) {
+        return bereiche.iter().copied().enumerate().collect();
+    }
+    let loch = bis - von;
+    let rest = 1.0 - loch;
+    if rest <= 1e-6 {
+        return Vec::new();
+    }
+    let mut ergebnis = Vec::new();
+    for (i, &(a, b)) in bereiche.iter().enumerate() {
+        let a = a.clamp(0.0, 1.0);
+        let b = b.clamp(0.0, 1.0);
+        let (a, b) = (a.min(b), a.max(b));
+        if b <= a {
+            continue;
+        }
+        let neu = if b <= von {
+            // Ganz vor dem Loch: nur die kürzere Gesamtdauer staucht.
+            Some((a / rest, b / rest))
+        } else if a >= bis {
+            // Ganz dahinter: um die Lochbreite nach vorn.
+            Some(((a - loch) / rest, (b - loch) / rest))
+        } else if a < von && b > bis {
+            // Beide Seiten bleiben und stoßen zusammen.
+            Some((a / rest, (b - loch) / rest))
+        } else if a < von {
+            // Ende liegt im Loch.
+            Some((a / rest, von / rest))
+        } else if b > bis {
+            // Anfang liegt im Loch.
+            Some((von / rest, (b - loch) / rest))
+        } else {
+            None // vollständig im Loch
+        };
+        if let Some((na, nb)) = neu {
+            let na = na.clamp(0.0, 1.0);
+            let nb = nb.clamp(0.0, 1.0);
+            if nb > na {
+                ergebnis.push((i, (na, nb)));
+            }
+        }
+    }
+    ergebnis
 }
 
 #[cfg(test)]
@@ -537,5 +753,151 @@ mod tests {
         assert_eq!(bereiche.len(), 3);
         assert!((bereiche[2].1 - 1.0).abs() < 1e-6);
         assert!(bereiche.iter().all(|(a, b)| a <= b));
+    }
+
+    #[test]
+    fn thai_motive_sind_sieben_ton_gleichschwebung() {
+        let motive = thai_motive();
+        assert_eq!(motive.len(), 6);
+        assert_eq!(motive.len(), THAI_NAMEN.len());
+        let laengen: Vec<usize> = motive.iter().map(|m| m.noten.len()).collect();
+        assert_eq!(laengen, vec![3, 3, 4, 4, 5, 5]);
+
+        // Auf- und Absteiger sind exakte Umkehrungen.
+        for paar in motive.chunks(2) {
+            let mut umgekehrt = paar[0].noten.clone();
+            umgekehrt.reverse();
+            assert_eq!(umgekehrt, paar[1].noten, "kein Umkehrer: {paar:?}");
+        }
+
+        // 7-TET: eine Stufe ist 1200/7 Cent; die MIDI-Näherung darf davon
+        // höchstens einen halben Halbton abweichen.
+        assert!((THAI_CENT - 171.428_57).abs() < 1e-3, "{THAI_CENT}");
+        assert_eq!(thai_midi(0, THAI_GRUNDTON), 60);
+        assert_eq!(thai_midi(2, THAI_GRUNDTON), 63);
+        assert_eq!(thai_midi(7, THAI_GRUNDTON), 72);
+        let verhaeltnis = thai_frequenz(1, THAI_GRUNDTON) / thai_frequenz(0, THAI_GRUNDTON);
+        let cent = 1200.0 * verhaeltnis.log2();
+        assert!((cent - THAI_CENT).abs() < 0.01, "{cent} Cent");
+
+        // „3+1“ endet mit einem Sprung (mindestens vier Halbtöne).
+        for motiv in [&motive[2], &motive[3]] {
+            assert!(
+                motiv
+                    .noten
+                    .windows(2)
+                    .any(|w| (w[1] - w[0]).abs() >= 4),
+                "kein Sprung: {:?}",
+                motiv.noten
+            );
+        }
+    }
+
+    #[test]
+    fn thai_motive_x_bereiche_sind_aufsteigend_im_bereich() {
+        for motiv in thai_motive() {
+            let bereiche = x_bereiche(&motiv, motiv.dauer_s);
+            assert_eq!(bereiche.len(), motiv.noten.len());
+            assert!((bereiche[0].0 - 0.0).abs() < 1e-6, "{bereiche:?}");
+            assert!(
+                (bereiche.last().unwrap().1 - 1.0).abs() < 1e-6,
+                "{bereiche:?}"
+            );
+            for (von, bis) in &bereiche {
+                assert!((0.0..=1.0).contains(von) && (0.0..=1.0).contains(bis));
+                assert!(von < bis, "leerer Bereich: {bereiche:?}");
+            }
+            for w in bereiche.windows(2) {
+                assert!(w[0].1 <= w[1].0 + 1e-6, "nicht aufsteigend: {bereiche:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn noten_segmente_liefern_start_und_ende() {
+        let pcm = sinusfolge(&[(440.0, 0.2), (494.0, 0.2), (523.0, 0.2)]);
+        let segmente = noten_segmente(&pcm, RATE);
+        assert_eq!(segmente.len(), 3, "{segmente:?}");
+        assert_eq!(
+            segmente.iter().map(|(n, _, _)| *n).collect::<Vec<_>>(),
+            vec![69, 71, 72]
+        );
+        assert!((segmente[0].1 - 0.0).abs() < 0.06);
+        // Das Ende der letzten Note schätzt `abschnitte` aus dem Median-
+        // abstand; es liegt deshalb eher zu weit hinten als zu kurz.
+        assert!(segmente[2].2 > segmente[2].1);
+        let bereiche = x_bereiche_aus_segmenten(&segmente, 0.6);
+        assert_eq!(bereiche.len(), 3);
+        assert!((bereiche[0].0 - 0.0).abs() < 1e-6);
+        assert!((bereiche[2].1 - 1.0).abs() < 1e-6);
+        assert!(bereiche.windows(2).all(|w| w[0].1 <= w[1].0 + 1e-6));
+    }
+
+    #[test]
+    fn bereiche_zuschneiden_normiert_und_behaelt_indizes() {
+        let bereiche = [
+            (0.0, 0.2),
+            (0.2, 0.4),
+            (0.4, 0.6),
+            (0.6, 0.8),
+            (0.8, 1.0),
+        ];
+        let neu = bereiche_zuschneiden(&bereiche, 0.2, 0.7);
+        assert_eq!(neu.len(), 3, "{neu:?}");
+        assert_eq!(neu[0].0, 1);
+        assert!(((neu[0].1).0 - 0.0).abs() < 1e-6);
+        assert!(((neu[0].1).1 - 0.4).abs() < 1e-6);
+        assert_eq!(neu[1].0, 2);
+        assert!(((neu[1].1).0 - 0.4).abs() < 1e-6);
+        assert!(((neu[1].1).1 - 0.8).abs() < 1e-6);
+        assert_eq!(neu[2].0, 3);
+        assert!(((neu[2].1).0 - 0.8).abs() < 1e-6);
+        assert!(((neu[2].1).1 - 1.0).abs() < 1e-6);
+        // Ungültiger/leerer Bereich ändert nichts.
+        assert!(bereiche_zuschneiden(&bereiche, 0.5, 0.5).is_empty());
+    }
+
+    #[test]
+    fn bereiche_loeschen_rueckt_zusammen() {
+        let bereiche = [
+            (0.0, 0.2),
+            (0.2, 0.4),
+            (0.4, 0.6),
+            (0.6, 0.8),
+            (0.8, 1.0),
+        ];
+        let neu = bereiche_loeschen(&bereiche, 0.4, 0.6);
+        assert_eq!(neu.len(), 4, "{neu:?}");
+        // 0,2 / 0,8 = 0,25 usw.; der geloeschte Bereich faellt weg.
+        assert_eq!(neu.iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![0, 1, 3, 4]);
+        assert!(((neu[1].1).1 - 0.5).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[2].1).0 - 0.5).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[3].1).1 - 1.0).abs() < 1e-6, "{neu:?}");
+
+        // Ein Bereich, der das Loch überlappt, wird zusammengezogen.
+        let neu = bereiche_loeschen(&[(0.3, 0.7)], 0.4, 0.6);
+        assert_eq!(neu.len(), 1, "{neu:?}");
+        assert!(((neu[0].1).0 - 0.375).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[0].1).1 - 0.625).abs() < 1e-6, "{neu:?}");
+
+        // Alles löschen ergibt keine Bereiche; leerer Bereich ist ein No-op.
+        assert!(bereiche_loeschen(&bereiche, 0.0, 1.0).is_empty());
+        assert_eq!(bereiche_loeschen(&bereiche, 0.3, 0.3).len(), 5);
+    }
+
+    #[test]
+    fn bereiche_umkehren_spiegelt_und_dreht() {
+        let bereiche = [(0.0, 0.2), (0.3, 0.5), (0.8, 1.0)];
+        let neu = bereiche_umkehren(&bereiche);
+        assert_eq!(
+            neu.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![2, 1, 0]
+        );
+        assert!(((neu[0].1).0 - 0.0).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[0].1).1 - 0.2).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[1].1).0 - 0.5).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[1].1).1 - 0.7).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[2].1).0 - 0.8).abs() < 1e-6, "{neu:?}");
+        assert!(((neu[2].1).1 - 1.0).abs() < 1e-6, "{neu:?}");
     }
 }
