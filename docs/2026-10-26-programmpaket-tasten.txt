@@ -1,0 +1,100 @@
+JAMCORE — DESKTOP-PAKET: PROGRAMME + TASTEN (Stand 2026-10-26)
+================================================================
+
+Start (Wayland):        tools/jamdesk.sh            (Arbeitsfläche 9, Renoise 27 %)
+Start (Konsole/TTY):    tools/jamdesk-tty.sh rrn5 --size 1280x720
+Beenden (Wayland):      tools/jamdesk.sh --stop
+Beenden (Programm):     Esc bzw. Q (steht jeweils unten)
+
+Auf der Konsole (KMSDRM): keine Fensterverwaltung, kein Maus-Zeiger
+garantiert — alles per Tastatur. Zurück zur Sitzung: Strg+Alt+F1/F2.
+
+
+1) rrn5  —  Bild/Farben -> Noten (SDL2)
+----------------------------------------------------------------
+Z                 Kamera an/aus
+8                 SHM-Modus (Bild an imgsh/andere Programme)
+o                 Datei-Browser
+a                 OSC aus/an
+F9                Stroboskop an/aus
+F10               Stroboskop-Richtung
+F11 / F12         Umdrehungen ÷ / ×
+− / +             Takte ÷ / ×
+Shift+F8          Scan: Linie / Spirale
+Alt+− / Alt++     Spirale: Schrittweite ÷ / ×
+Strg+o            Pattern-Ausgabe (Text)
+Esc               Ende
+
+Oszillator-Scan:
+Shift+F1          Anzeige: grün ⇄ echte Farben
+Shift+F2          Linie an/aus
+Shift+F3          Linie verschieben (Klick setzt, ←/→ schieben)
+Shift+F4          Bereich statt Linie
+Shift+F5          Sweep / alle Spalten
+Shift+F6          Takt-Maske / alle y
+Shift+F7          Harmonie-x: Gesamt / Bereich
+Alt+− / Alt++     Bereichs-Dauer ÷ / × (1/64 … 4 Takt)
+
+
+2) pattern_recorder  —  Rhythmus aufnehmen (SDL2)
+----------------------------------------------------------------
+0                 Stop (Aufnahme beenden)
+1 … 9             Wert/Note (Ziffernblock oder Zahlentasten)
+Q / E             Faktor 2 / 4
+X C V B N M       Schrittweiten 7 · 15 · 2 · 5 · 11 · 23
+Y                 Schritt 3
+S / D / W         Auswahl Kk / Kr / keine
+A                 „Alles eins“
+Bild↑ / Bild↓     Seite auf/ab
+F1 … F10          Noten-Tasten
+Esc               Ende
+
+
+3) lissa  —  Lissajous-Figur + zwei Stimmen (SDL2)
+----------------------------------------------------------------
+x / y             Achse wählen
+− / +             Verhältnis
+← / →             X-Achse
+↑ / ↓             Y-Achse
+1 … 6             Presets (2:2, 2:3, 1:2, 3:2, 3:4, 4:5)
+m                 Sägezahn / weich
+l / r             endlos links / rechts
+, / .             Umdrehungen ÷2 / ×2
+[ / ]             Takte ÷2 / ×2
+t                 Ton an/aus
+z / h             Grundton
+b / n             BPM
+Esc               Ende
+
+
+4) imgsh  —  Bild in den Shared Memory legen (SDL2)
+----------------------------------------------------------------
+Aufruf:  imgsh bild.png
+Esc      Ende
+(Anzeige dient als Bildquelle für rrn5 über MyImageShm.)
+
+
+5) jamcast  —  Audio -> .it (CLI, keine Tasten)
+----------------------------------------------------------------
+./result/bin/jamcast <audio> [--bpm 120] [--raster 128] [--feinheit 32]
+                  [--genre techno|groove|breakbeat|dnb]
+                  [--instrument 0…3] [--ausgabe datei.it] [--hilfe]
+Erzeugt .it (mit Order + Song-Message) und .csv.
+
+
+6) Schism Tracker (Import der Ergebnisse)
+----------------------------------------------------------------
+schismtracker /pfad/datei.it
+Eigene Tasten/Doku: F1 = Hilfe im Programm; Pattern/Order direkt sichtbar,
+Song-Message im Song-Info-Dialog.
+
+Schism auf der Konsole starten:  tools/jamdesk-tty.sh schism datei.it
+
+
+7) Konsole / KMSDRM — Hinweise
+----------------------------------------------------------------
+- Auf freie VT wechseln (Strg+Alt+F3 …), nicht aus der Wayland-Sitzung.
+- Auflösung: Standard 1280x720 (2880x1800 wäre auf der Konsole winzig).
+- Zugriff auf /dev/dri (Gruppe video) nötig; der Nutzer ist in video/render.
+- rrn5 legt „ZeitfaktoSharedMemory“ selbst an, wenn pattern_recorder nicht läuft.
+- egui-Programme (eframe) sind auf KMSDRM fragil — dort die SDL2-Tools nutzen.
