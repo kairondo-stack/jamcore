@@ -62,10 +62,17 @@ fn bytes_le(h: &SharedData2) -> [u8; std::mem::size_of::<SharedData2>()] {
 
 impl SharedMemoryEditor {
     pub fn open() -> Result<Self, String> {
-        let shm = ShmemConf::new()
-            .os_id("ZeitfaktoSharedMemory")
-            .open()
-            .map_err(|e| format!("ZeitfaktoSharedMemory: {e:?}"))?;
+        // Auf der Konsole (KMSDRM) läuft kein pattern_recorder, der die
+        // Zeitfakto-Segment anlegt. Dann legt rrn5 sie selbst an (1024 Bytes
+        // wie der Recorder) — sonst bricht der Start mit MapOpenFailed ab.
+        let shm = match ShmemConf::new().os_id("ZeitfaktoSharedMemory").open() {
+            Ok(s) => s,
+            Err(_) => ShmemConf::new()
+                .os_id("ZeitfaktoSharedMemory")
+                .size(1024)
+                .create()
+                .map_err(|e| format!("ZeitfaktoSharedMemory: {e:?}"))?,
+        };
         let shm2 = match ShmemConf::new()
             .os_id("MyImageShm")
             .size(MAPPING_SIZE)
