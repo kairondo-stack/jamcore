@@ -1,5 +1,5 @@
 {
-  description = "jamtools: it_live, pattern_recorder, rrn5, imgsh, bundle_udp";
+  description = "jamtools: it_live, pattern_recorder, rrn5, imgsh, bundle_udp, lissa, jamcast";
 
   inputs.nixpkgs.url = "flake:nixpkgs";
 
@@ -18,6 +18,7 @@
         "imgsh"
         "bundle_udp"
         "lissa"
+        "jamcast"
       ];
     in
     {
@@ -31,7 +32,7 @@
           p = import ./default.nix { inherit pkgs; };
         in
         {
-          inherit (p) it_live pattern_recorder rrn5 imgsh bundle_udp lissa jam-tools;
+          inherit (p) it_live pattern_recorder rrn5 imgsh bundle_udp lissa jamcast jam-tools;
           default = p.jam-tools;
         }
       );

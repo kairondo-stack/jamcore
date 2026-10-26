@@ -1,0 +1,10 @@
+[package]
+name = "jamcast"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+jamcore = { path = "../core" }
+
+[profile.release]
+opt-level = 2

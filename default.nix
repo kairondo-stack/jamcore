@@ -14,6 +14,7 @@ let
     imgsh = "imgsh";
     bundle_udp = "bundle_udp";
     lissa = "lissa";
+    jamcast = "jamcast";
   };
 
   srcDirName = "jam-nix-source";
@@ -94,9 +95,10 @@ let
   imgsh = mkCrate "imgsh";
   bundle_udp = mkCrate "bundle_udp";
   lissa = mkCrate "lissa";
+  jamcast = mkCrate "jamcast";
 in
 {
-  inherit it_live pattern_recorder rrn5 imgsh bundle_udp lissa;
+  inherit it_live pattern_recorder rrn5 imgsh bundle_udp lissa jamcast;
 
   jam-tools = pkgs.symlinkJoin {
     name = "jam-tools-0.1.0";
@@ -107,6 +109,7 @@ in
       imgsh
       bundle_udp
       lissa
+      jamcast
     ];
     postBuild = ''
       mkdir -p $out/share/jam-tools

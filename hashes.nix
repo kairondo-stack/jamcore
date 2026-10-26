@@ -5,4 +5,5 @@
   imgsh = "sha256-zRFXya7g6kit05ORCDeoru+I1bwBbjMEfBgaY9I3Zws=";
   bundle_udp = "sha256-7onQOv3cNZo3CowlrEMtqcau/krMfSjYB6dVfS8tr8Y=";
   lissa = "sha256-Teu00S8puNyAheCALS5Iih/b1kxCyxBbAlW3bZiqXAs=";
+  jamcast = "sha256-fxv3GiewxuDqi5hcmVOrBEPJ8TOke1HmL9wvuFxS07c=";
 }
