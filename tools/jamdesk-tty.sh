@@ -38,7 +38,8 @@ case "$PROG" in
   rrn5)
     # Bevorzugt den frisch gebauten Stand (result-rrn5), sonst das Paket.
     R="$BIN/rrn5"; [ -x "$ROOT/result-rrn5/bin/rrn5" ] && R="$ROOT/result-rrn5/bin/rrn5"
-    exec "$R" --size "${1:-1280x720}" ;;
+    hat=0; for a in "$@"; do [ "$a" = "--size" ] && hat=1; done
+    if [ "$hat" = 1 ]; then exec "$R" "$@"; else exec "$R" --size 1280x720 "$@"; fi ;;
   pattern_recorder) exec "$BIN/pattern_recorder" ;;
   imgsh)            exec "$BIN/imgsh" "$@" ;;
   lissa)            exec "$BIN/lissa" ;;
