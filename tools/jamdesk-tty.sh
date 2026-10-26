@@ -35,7 +35,10 @@ export SDL_AUDIODRIVER=alsa
 export SDL_VIDEO_KMSDRM_DEVICE="${SDL_VIDEO_KMSDRM_DEVICE:-/dev/dri/card0}"
 
 case "$PROG" in
-  rrn5)             exec "$BIN/rrn5" --size "${1:-1280x720}" ;;
+  rrn5)
+    # Bevorzugt den frisch gebauten Stand (result-rrn5), sonst das Paket.
+    R="$BIN/rrn5"; [ -x "$ROOT/result-rrn5/bin/rrn5" ] && R="$ROOT/result-rrn5/bin/rrn5"
+    exec "$R" --size "${1:-1280x720}" ;;
   pattern_recorder) exec "$BIN/pattern_recorder" ;;
   imgsh)            exec "$BIN/imgsh" "$@" ;;
   lissa)            exec "$BIN/lissa" ;;
