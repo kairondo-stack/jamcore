@@ -47,8 +47,8 @@ pub fn start(app: &android_activity::AndroidApp, pfad: &str, fps: u32) -> Result
     match ergebnis {
         Some(Ok(())) => {
             // Die Dauer kommt aus den Datei-Metadaten der Brücke. Eigene Zeile,
-            // damit sie im Logcat leicht zu greifen ist (Punkt 9: der
-            // Laub-Tab sampelt später über die ganze Länge).
+            // damit sie im Logcat leicht zu greifen ist (der Laub-Tab leitet
+            // daraus seinen Abtastabstand ab).
             info!(
                 "video: dauer={}",
                 jamcore::videotempo::dauer_text(dauer_s(app))
@@ -87,10 +87,10 @@ pub fn fps_setzen(app: &android_activity::AndroidApp, fps: u32) {
 
 /// Dauer der **laufenden** Videoquelle in Sekunden; `None` = unbekannt.
 ///
-/// Warum die Brücke sie merkt: der Laub-Tab sampelt über die ganze Länge
-/// (`jamcore::laub::stichproben_zeiten(dauer_s, 30)`), und ein zweiter
-/// Dateizugriff aus Rust wäre teuer und fehleranfällig. Der Wert steht ab
-/// dem erfolgreichen [`start`] bereit und bleibt bis zum nächsten Start
+/// Warum die Brücke sie merkt: der Laub-Tab verteilt seine ~40 Proben über die
+/// ganze Länge (feste 400 ms reichten nur für die ersten Sekunden), und ein
+/// zweiter Dateizugriff aus Rust wäre teuer und fehleranfällig. Der Wert steht
+/// ab dem erfolgreichen [`start`] bereit und bleibt bis zum nächsten Start
 /// gültig (auch nach [`stop`]).
 pub fn dauer_s(app: &android_activity::AndroidApp) -> Option<f32> {
     dauer_ms(app, None).map(|ms| ms as f32 / 1000.0)

@@ -41,16 +41,20 @@
 //! Bilder in denselben Framepuffer wie die Kamera. Statt nur die ersten
 //! Sekunden zu prüfen, sieht [`LaubPanel::video_schritt`] (von der JamApp je
 //! Anzeigeframe gerufen, auch außerhalb des Tabs) **über die ganze Dauer**
-//! verteilt Bilder an: höchstens eines alle 400 ms Wanduhr, bis zu
-//! [`VIDEO_FRAMES_MAX`] Stück bzw. [`VIDEO_FRIST_S`] Sekunden. Das Bild mit
-//! den **meisten Blättern** gewinnt. Danach wird der Dekoder gestoppt und
-//! dieses Bild läuft durch dieselbe Kette wie ein Foto.
+//! verteilt Bilder an: höchstens eines alle `abstand_ms` Wanduhr (aus der
+//! Videodauer abgeleitet, ≈[`VIDEO_PROBEN`] Proben; 400 ms bei unbekannter
+//! Dauer), bis zu [`VIDEO_FRAMES_MAX`] Stück bzw. [`VIDEO_FRIST_S`] Sekunden.
+//! Das Bild mit den **meisten Blättern** gewinnt. Danach wird der Dekoder
+//! gestoppt und dieses Bild läuft durch dieselbe Kette wie ein Foto.
 //!
-//! Warum Wanduhr statt `jamcore::laub::stichproben_zeiten`: die Java-Brücke
-//! liefert keine Videodauer, und der Dekoder läuft nach dem Dateiende in
-//! Schleife. Die Drosselung braucht beides nicht und tastet ein
-//! Echtzeit-Video trotzdem gleichmäßig ab (15 Dekodier-fps genügen für 2,5
-//! Proben je Sekunde).
+//! Warum Wanduhr statt `jamcore::laub::stichproben_zeiten`: die Funktion
+//! liefert Soll-Zeitpunkte für ein **Seek** („Frame genau bei t holen“). Die
+//! Java-Brücke dekodiert dagegen sequenziell in Echtzeit und kann nicht
+//! springen; ein Zeitplan ließe sich nur durch Warten auf den passenden
+//! Zeitpunkt erfüllen — genau das leistet die Drosselung, ohne Seek. Seit die
+//! Brücke die Dauer kennt, wird der Abstand daraus abgeleitet, damit die
+//! ~40 Proben wirklich über die ganze Länge fallen und nicht nur über die
+//! ersten 30 s.
 //!
 //! Warum der beste **einzelne** Frame und keine Sammlung über die Zeit: beim
 //! Filmen bewegt sich die Kamera, dasselbe Blatt liegt in verschiedenen Bildern
@@ -130,21 +134,28 @@ const PX_PRO_METER: f32 = 200.0;
 /// Lange Kante eines geladenen Bildes (wie Kamera und Bild-Tab).
 const BILD_KANTE: u32 = 640;
 
-/// Harte Obergrenze ausgewerteter Videobilder. Bei [`VIDEO_ABTAST_MS`] sind
-/// das gut 30 s Film — genug, um Blätter auch in der zweiten Hälfte eines
-/// Videos zu finden; die Auswertung je Bild kostet auf dem Handy spürbar Zeit,
-/// deshalb keine unbegrenzte Sammlung.
+/// Harte Obergrenze ausgewerteter Videobilder. Bei unbekannter Dauer
+/// ([`VIDEO_ABTAST_MS`]) sind das gut 32 s Film; bei bekannter Dauer liefert
+/// die aus ihr abgeleitete Abtastung nur ~40 Proben, sodass die Grenze dort
+/// praktisch nie greift. Die Auswertung je Bild kostet auf dem Handy spürbar
+/// Zeit, deshalb keine unbegrenzte Sammlung.
 const VIDEO_FRAMES_MAX: usize = 80;
 
 /// Bildrate beim Video-Prüfen: 15 fps. Der Dekoder läuft damit ungefähr in
-/// Echtzeit; ausgewertet wird trotzdem nur alle [`VIDEO_ABTAST_MS`].
+/// Echtzeit; ausgewertet wird trotzdem nur alle `abstand_ms`
+/// ([`video_abstand_ms`]).
 const VIDEO_FPS: u32 = 15;
 
-/// Wanduhr-Abstand zwischen zwei ausgewerteten Videobildern: 400 ms
-/// (≈ 2,5 Bilder je Sekunde Film). Der Dekoder liefert 15 fps; dazwischen
-/// liegende Bilder werden bewusst übersprungen, sonst kostet ein langes Video
-/// Minuten statt Sekunden.
+/// Ersatz-Abstand zwischen zwei ausgewerteten Videobildern, wenn die Dauer
+/// unbekannt ist: 400 ms (≈ 2,5 Bilder je Sekunde Film). Der Dekoder liefert
+/// 15 fps; dazwischen liegende Bilder werden bewusst übersprungen, sonst
+/// kostet ein langes Video Minuten statt Sekunden.
 const VIDEO_ABTAST_MS: u64 = 400;
+
+/// Zahl der Stichproben, über die eine bekannte Videodauer verteilt wird.
+/// 40 ist der Kompromiss aus „über die ganze Länge sehen“ und Rechenzeit je
+/// Bild (die Blatterkennung auf 640 px kostet auf dem Handy spürbar Zeit).
+const VIDEO_PROBEN: f32 = 40.0;
 
 /// Frist ohne ein einziges Bild (Sekunden): kommt in dieser Zeit kein Frame,
 /// gilt der Dekoder als hängend und das Prüfen endet mit Meldung.
@@ -155,9 +166,11 @@ const VIDEO_START_FRIST_S: u64 = 10;
 /// einem hängenden oder am Dateiende stehengebliebenen Dekoder.
 const VIDEO_ENDE_OHNE_BILD_S: f64 = 1.5;
 
-/// Obergrenze für das ganze Prüfen (Sekunden). Sie deckt auch Videos ab, deren
-/// Dauer die App nicht kennt (die Java-Brücke liefert sie nicht): nach 45 s
-/// ist Schluss und das beste bisherige Bild wird übernommen.
+/// Obergrenze für das ganze Prüfen (Sekunden): Notbremse für Videos mit
+/// unbekannter Dauer und für Dekoder, die trotz laufender Bilder nicht fertig
+/// werden. Nach 45 s ist Schluss und das beste bisherige Bild wird übernommen.
+/// Bei sehr langen Videos (> 45 s) werden dadurch nicht alle ~40 Proben
+/// erreicht — die Frist hat Vorrang vor der Vollständigkeit.
 const VIDEO_FRIST_S: f64 = 45.0;
 
 /// Dauer des Kamera-Sammelns und Zahl der Proben (eine alle 500 ms).
@@ -209,8 +222,12 @@ struct Videolauf {
     /// Wann zuletzt ein **neues** Dekodierbild ankam — daraus folgt das Ende
     /// „seit [`VIDEO_ENDE_OHNE_BILD_S`] kein neues Bild“.
     letzte_bildzeit: Instant,
+    /// Wanduhr-Abstand zwischen zwei ausgewerteten Bildern, beim Start aus der
+    /// Videodauer abgeleitet ([`video_abstand_ms`]) — ~40 Proben über die
+    /// ganze Länge statt nur über die ersten Sekunden.
+    abstand_ms: u64,
     /// Wann zuletzt ein Bild ausgewertet wurde (Drosselung auf
-    /// [`VIDEO_ABTAST_MS`]).
+    /// [`Videolauf::abstand_ms`]).
     letzte_pruefung: Option<Instant>,
     /// Wie viele Bilder geprüft wurden.
     geprueft: usize,
@@ -431,11 +448,11 @@ impl LaubPanel {
                 camera::ruhebild_setzen(w, h, rgba.clone());
                 self.bild_uebernehmen(w, h, rgba);
                 self.status = format!("Bild geladen: {w}x{h}");
-                log::info!("laub: Bild geladen: {pfad} ({w}x{h})");
+                log::info!("Bild geladen: {pfad} ({w}x{h})");
             }
             Err(e) => {
                 self.status = format!("Bild nicht lesbar: {e}");
-                log::info!("laub: Bild nicht lesbar: {pfad}: {e}");
+                log::info!("Bild nicht lesbar: {pfad}: {e}");
             }
         }
     }
@@ -451,31 +468,39 @@ impl LaubPanel {
         }
         let ergebnis = crate::current_app()
             .map_err(|e| e.to_string())
-            .and_then(|app| crate::video::start(&app, pfad, VIDEO_FPS));
+            .and_then(|app| {
+                // Nach dem geglückten Start kennt die Brücke die Dauer der
+                // laufenden Quelle (`dauer_s`); ein zweiter Dateizugriff über
+                // `dauer_s_von` wäre teuer und fehleranfällig.
+                crate::video::start(&app, pfad, VIDEO_FPS).map(|()| crate::video::dauer_s(&app))
+            });
         match ergebnis {
-            Ok(()) => {
+            Ok(dauer) => {
                 let name = pfad.rsplit('/').next().unwrap_or(pfad);
+                let abstand_ms = video_abstand_ms(dauer);
                 self.videolauf = Some(Videolauf {
                     pfad: pfad.to_string(),
                     start: std::time::Instant::now(),
                     letzte_nummer: camera::stand().0,
                     letzte_bildzeit: Instant::now(),
+                    abstand_ms,
                     letzte_pruefung: None,
                     geprueft: 0,
                     bester: None,
                 });
+                let dauer_text = jamcore::videotempo::dauer_text(dauer);
                 self.status = format!(
-                    "Video läuft: {name} — höchstens alle {VIDEO_ABTAST_MS} ms ein Bild, \
-                     bis zu {VIDEO_FRAMES_MAX} insgesamt …"
+                    "Video läuft: {name} — {dauer_text}, Abtastung alle {abstand_ms} ms \
+                     (max {VIDEO_FRAMES_MAX} Bilder)"
                 );
                 log::info!(
-                    "laub: Video startet: {pfad} ({VIDEO_FPS} fps, Abtastung alle \
-                     {VIDEO_ABTAST_MS} ms, bis zu {VIDEO_FRAMES_MAX} Bilder, Frist {VIDEO_FRIST_S:.0} s)"
+                    "Video {dauer_text}, Abtastung alle {abstand_ms} ms \
+                     (max {VIDEO_FRAMES_MAX} Bilder)"
                 );
             }
             Err(e) => {
                 self.status = format!("Video: {e}");
-                log::info!("laub: Video nicht startbar: {pfad}: {e}");
+                log::info!("Video nicht startbar: {pfad}: {e}");
             }
         }
     }
@@ -490,7 +515,7 @@ impl LaubPanel {
         if self.video_laeuft() {
             self.video_stoppen();
             self.status = "Video abgebrochen".to_string();
-            log::info!("laub: Video abgebrochen");
+            log::info!("Video abgebrochen");
         }
     }
 
@@ -504,7 +529,7 @@ impl LaubPanel {
     }
 
     /// Ein Schritt des Video-Prüfens: **höchstens eines alle
-    /// [`VIDEO_ABTAST_MS`] Wanduhr** ansehen, Blätter zählen, das beste
+    /// [`Videolauf::abstand_ms`] Wanduhr** ansehen, Blätter zählen, das beste
     /// behalten. So verteilen sich die Proben über die ganze Videodauer statt
     /// nur über die ersten zwei Sekunden; nach [`VIDEO_FRAMES_MAX`] Bildern,
     /// [`VIDEO_FRIST_S`] Sekunden oder [`VIDEO_ENDE_OHNE_BILD_S`] ohne neues
@@ -512,11 +537,12 @@ impl LaubPanel {
     /// auf — auch außerhalb des Laub-Tabs, damit der Dekoder nicht im
     /// Hintergrund weiterläuft.
     ///
-    /// Warum Wanduhr und nicht `stichproben_zeiten` aus dem Kern: die
-    /// Java-Brücke (`crate::video`) liefert keine Videodauer, und der Dekoder
-    /// läuft in Schleife. Die 400-ms-Drosselung braucht beides nicht und
-    /// tastet ein Echtzeit-Video trotzdem gleichmäßig ab (15 Dekodier-fps
-    /// genügen für 2,5 Proben je Sekunde).
+    /// Warum Wanduhr und nicht `stichproben_zeiten` aus dem Kern: die Funktion
+    /// liefert Soll-Zeitpunkte für ein Seek; der Java-Dekoder läuft dagegen
+    /// sequenziell in Echtzeit und kann nicht springen. Der aus der Dauer
+    /// abgeleitete Abstand ([`video_abstand_ms`]) verteilt die ~40 Proben
+    /// trotzdem über die ganze Länge — ohne Seek, ohne Zeitplan. Bei
+    /// unbekannter Dauer bleibt es bei [`VIDEO_ABTAST_MS`].
     pub fn video_schritt(&mut self, ctx: &egui::Context) {
         let Some(mut lauf) = self.videolauf.take() else {
             return;
@@ -529,7 +555,7 @@ impl LaubPanel {
         }
         let faellig = lauf
             .letzte_pruefung
-            .map(|zeit| zeit.elapsed() >= Duration::from_millis(VIDEO_ABTAST_MS))
+            .map(|zeit| zeit.elapsed() >= Duration::from_millis(lauf.abstand_ms))
             .unwrap_or(true);
         if neues_bild && faellig {
             if let Some((w, h, rgba)) = camera::letztes_bild() {
@@ -573,7 +599,8 @@ impl LaubPanel {
         } else {
             self.videolauf = Some(lauf);
             // Ohne Nutzereingabe zeichnet egui nicht neu — der nächste Schritt
-            // braucht aber einen neuen Durchlauf (Abtastung 400 ms).
+            // braucht aber einen neuen Durchlauf (Abtastung je nach Videodauer
+            // 150…2000 ms; 40 ms halten auch die Stillstands-Erkennung flott).
             ctx.request_repaint_after(std::time::Duration::from_millis(40));
         }
     }
@@ -594,7 +621,7 @@ impl LaubPanel {
             } else {
                 format!("Video: {meldung}")
             };
-            log::info!("laub: Video ohne Bilder: {} ({meldung})", lauf.pfad);
+            log::info!("Video ohne Bilder: {} ({meldung})", lauf.pfad);
             ctx.request_repaint();
             return;
         };
@@ -608,7 +635,7 @@ impl LaubPanel {
             best.index, sekunden, best.blaetter, lauf.geprueft
         );
         log::info!(
-            "laub: Video geladen: {} ({}x{}, {} Bilder ueber {:.1} s, bester Frame {}, {} Blaetter)",
+            "Video geladen: {} ({}x{}, {} Bilder ueber {:.1} s, bester Frame {}, {} Blaetter)",
             lauf.pfad,
             best.w,
             best.h,
@@ -662,7 +689,7 @@ impl LaubPanel {
             Some((w, h, rgba)) => {
                 self.bild_uebernehmen(w, h, rgba);
                 self.status = format!("Foto aufgenommen ({w}x{h})");
-                log::info!("laub: Foto aufgenommen ({w}x{h})");
+                log::info!("Foto aufgenommen ({w}x{h})");
             }
             None => {
                 self.status = "Kein Kamerabild — erst „Kamera an“.".to_string();
@@ -695,7 +722,7 @@ impl LaubPanel {
              {SAMMELN_DAUER_S:.0} s)"
         );
         log::info!(
-            "laub: Sammeln startet ({SAMMELN_PROBEN} Bilder ueber {SAMMELN_DAUER_S:.0} s, \
+            "Sammeln startet ({SAMMELN_PROBEN} Bilder ueber {SAMMELN_DAUER_S:.0} s, \
              alle {SAMMELN_ABSTAND_MS} ms)"
         );
     }
@@ -769,7 +796,7 @@ impl LaubPanel {
                     lauf.geprueft, best.blaetter, sekunden
                 );
                 log::info!(
-                    "laub: Sammeln: {} Bilder ueber {:.1} s, bestes mit {} Blaettern",
+                    "Sammeln: {} Bilder ueber {:.1} s, bestes mit {} Blaettern",
                     lauf.geprueft,
                     sekunden,
                     best.blaetter
@@ -778,7 +805,7 @@ impl LaubPanel {
             None => {
                 self.status = "Sammeln: kein Kamerabild — erst „Kamera an“.".to_string();
                 log::info!(
-                    "laub: Sammeln ohne Bilder ({:.1} s) — Kamera pruefen",
+                    "Sammeln ohne Bilder ({:.1} s) — Kamera pruefen",
                     sekunden
                 );
             }
@@ -792,7 +819,7 @@ impl LaubPanel {
         if war_an {
             self.status = "Sammeln abgebrochen".to_string();
             if loggen {
-                log::info!("laub: Sammeln abgebrochen");
+                log::info!("Sammeln abgebrochen");
             }
         }
         war_an
@@ -829,7 +856,7 @@ impl LaubPanel {
         if let Some(farbe) = haeufigste_farbe(*w, *h, rgb) {
             self.hintergrund = farbe;
             let (r, g, b) = farbe;
-            log::info!("laub: Hintergrund automatisch RGB({r}, {g}, {b})");
+            log::info!("Hintergrund automatisch RGB({r}, {g}, {b})");
         }
     }
 
@@ -857,16 +884,16 @@ impl LaubPanel {
         let (anzeige, log_text) = erkennungstexte(self.blaetter.len(), median(&self.abstaende));
         self.erkennung = anzeige;
         if loggen {
-            log::info!("laub: {log_text}");
+            log::info!("{log_text}");
             // Die Gruppen mit Beschreibung (Schritte, Farb-/Form-Mix) ins Log:
             // im Gerätetest ist das die einzige Quelle für die Einordnung der
             // Taktabstände, ohne Screenshots zu lesen.
             for (i, text) in self.gruppen_beschreibungen().iter().enumerate() {
                 let unter = self.untergruppen_beschreibung(i);
                 if unter.is_empty() {
-                    log::info!("laub: Gruppen: {text}");
+                    log::info!("Gruppen: {text}");
                 } else {
-                    log::info!("laub: Gruppen: {text} [{unter}]");
+                    log::info!("Gruppen: {text} [{unter}]");
                 }
             }
         }
@@ -1003,7 +1030,7 @@ impl LaubPanel {
         let eingabe = self.eingabe_abstaenden(abstaende);
         let schritte = schritte_aus_abstaenden_bpm(&eingabe, self.raster, modus, &g, self.bpm);
         log::info!(
-            "laub: Genre {}, Raster {}, {} -> {} Schritte",
+            "Genre {}, Raster {}, {} -> {} Schritte",
             g.name,
             self.raster,
             if self.relativ { "relativ" } else { "absolut" },
@@ -1148,7 +1175,7 @@ impl LaubPanel {
             takte.len(),
             slot_text.join(", ")
         );
-        log::info!("laub: {}", self.status);
+        log::info!("{}", self.status);
     }
 
     /// „als Rhythmus rendern“: die Schrittnummern des Kerns ins aktuelle
@@ -1165,7 +1192,7 @@ impl LaubPanel {
         let noten = rhythm.laub_setzen(&takt, self.raster);
         self.status = format!("ins Raster geschrieben ({noten} Noten auf {kanaele} Kanaelen)");
         log::info!(
-            "laub: ins Raster geschrieben ({noten} Noten auf {kanaele} Kanaelen, \
+            "ins Raster geschrieben ({noten} Noten auf {kanaele} Kanaelen, \
              {} Schritte je Takt)",
             takt.len()
         );
@@ -1208,7 +1235,7 @@ impl LaubPanel {
             teile.join(", ")
         );
         log::info!(
-            "laub: Gruppen -> Patterns: {} — auf {kanaele} Kanaelen",
+            "Gruppen -> Patterns: {} — auf {kanaele} Kanaelen",
             teile.join(", ")
         );
     }
@@ -1335,7 +1362,7 @@ impl LaubPanel {
                     anzahl
                 );
                 log::info!(
-                    "laub: Anhören G{} ({anzahl} Schritte, 1/{feinheit}, {bpm:.0} BPM)",
+                    "Anhören G{} ({anzahl} Schritte, 1/{feinheit}, {bpm:.0} BPM)",
                     gruppe + 1
                 );
             }
@@ -1365,7 +1392,7 @@ impl LaubPanel {
             crate::transport::teil_aus(crate::transport::Teil::Laub);
             self.status = "Anhören gestoppt".to_string();
             if loggen {
-                log::info!("laub: Anhören gestoppt");
+                log::info!("Anhören gestoppt");
             }
         }
     }
@@ -1419,10 +1446,10 @@ impl LaubPanel {
         self.vorschau_live = live;
         self.vorschau_nummer = 0;
         if live {
-            log::info!("laub: Vorschau live");
+            log::info!("Vorschau live");
             self.status = "Vorschau live".to_string();
         } else {
-            log::info!("laub: Standbild");
+            log::info!("Standbild");
             self.status = "Standbild".to_string();
         }
     }
@@ -1494,7 +1521,7 @@ impl LaubPanel {
         {
             self.sammeln_stoppen(false);
             self.status = "Sammeln abgebrochen (Tab gewechselt)".to_string();
-            log::info!("laub: Sammeln abgebrochen (Tab gewechselt)");
+            log::info!("Sammeln abgebrochen (Tab gewechselt)");
         }
         self.sammeln_letzte_ui = Instant::now();
         self.sammeln_schritt();
@@ -1764,7 +1791,7 @@ impl LaubPanel {
                                 self.hintergrund = farbe;
                                 self.auto_hintergrund = false;
                                 log::info!(
-                                    "laub: Hintergrund RGB({}, {}, {}) getippt",
+                                    "Hintergrund RGB({}, {}, {}) getippt",
                                     farbe.0,
                                     farbe.1,
                                     farbe.2
@@ -1936,7 +1963,7 @@ impl LaubPanel {
                 .changed();
             if ui.button("Filter zurück").clicked() {
                 self.filter = Blattfilter::default();
-                log::info!("laub: Filter zurueckgesetzt");
+                log::info!("Filter zurueckgesetzt");
                 self.erkennen(true);
             }
             if geaendert {
@@ -1974,7 +2001,7 @@ impl LaubPanel {
                         .gruppe_auswahl
                         .min(self.gruppen().len().saturating_sub(1));
                     self.taktfolge_anpassen();
-                    log::info!("laub: Gruppengroesse {wert} Abstaende");
+                    log::info!("Gruppengroesse {wert} Abstaende");
                 }
             }
             ui.label("Abstände");
@@ -1988,12 +2015,12 @@ impl LaubPanel {
             if ui.selectable_label(self.farbe_gemischt, "gemischt").clicked() {
                 self.farbe_gemischt = true;
                 self.status = "Farbe: gemischt (Mischwerte)".to_string();
-                log::info!("laub: Farbe gemischt (Mischwerte)");
+                log::info!("Farbe gemischt (Mischwerte)");
             }
             if ui.selectable_label(!self.farbe_gemischt, "exakt").clicked() {
                 self.farbe_gemischt = false;
                 self.status = "Farbe: exakt (RGB-Grenzen)".to_string();
-                log::info!("laub: Farbe exakt (RGB-Grenzen)");
+                log::info!("Farbe exakt (RGB-Grenzen)");
             }
             ui.label(
                 RichText::new("wirkt auf Gruppen, Anhören, Rendern")
@@ -2040,7 +2067,7 @@ impl LaubPanel {
                     {
                         self.taktgruppe_len = wert;
                         self.taktfolge_anpassen();
-                        log::info!("laub: Taktgruppe {wert} Takte");
+                        log::info!("Taktgruppe {wert} Takte");
                     }
                 }
                 ui.label("Takte");
@@ -2056,7 +2083,7 @@ impl LaubPanel {
                         {
                             let naechste = (index + 1) % anzahl;
                             self.taktfolge[i] = naechste;
-                            log::info!("laub: Takt {} -> G{}", i + 1, naechste + 1);
+                            log::info!("Takt {} -> G{}", i + 1, naechste + 1);
                         }
                     }
                 });
@@ -2144,7 +2171,7 @@ impl LaubPanel {
                 } else {
                     "Laub-Rendern: 1 Pattern".to_string()
                 };
-                log::info!("laub: 2 Patterns = {zwei}");
+                log::info!("2 Patterns = {zwei}");
             }
         });
         // Gruppen-Umschalter direkt über den Aktionen: „Anhören“ spielt die
@@ -2273,6 +2300,25 @@ fn anhoer_noten(takt: &[(u32, u8)], raster: u16, feinheit: u16) -> Vec<(u16, u8,
         .into_iter()
         .map(|(zeile, (farbe, schritt))| (zeile, farbe, schritt))
         .collect()
+}
+
+/// Abtastabstand für ein Video: ≈[`VIDEO_PROBEN`] Stichproben über die ganze
+/// Dauer, begrenzt auf 150…2000 ms; ohne bekannte Dauer [`VIDEO_ABTAST_MS`].
+///
+/// Warum aus der Dauer: mit festen 400 ms wäre ein langes Video schon nach
+/// wenigen Sekunden durch (bzw. von der Frist gekappt) und Blätter in der
+/// zweiten Hälfte gingen verloren. Warum die Grenzen: unter 150 ms bringt bei
+/// 15 Dekodier-fps fast jedes Bild dasselbe und kostet nur Rechenzeit; über
+/// 2000 ms verpasst auch ein langes Video kaum etwas, weil das beste
+/// **Einzelbild** gewinnt und Blätter über viele Sekunden sichtbar sind.
+fn video_abstand_ms(dauer_s: Option<f32>) -> u64 {
+    match dauer_s {
+        // Gerundet, damit 12,3 s → 308 ms wird (40 Proben, letzte bei 12,32 s).
+        Some(s) if s.is_finite() && s > 0.0 => {
+            (s * 1000.0 / VIDEO_PROBEN).clamp(150.0, 2000.0).round() as u64
+        }
+        _ => VIDEO_ABTAST_MS,
+    }
 }
 
 /// Ist das Video-Prüfen fertig? Nach [`VIDEO_FRAMES_MAX`] Bildern; ohne ein
@@ -2417,7 +2463,7 @@ fn farben_je_schritt(
     menge.sort_unstable();
     if menge != schritte {
         log::warn!(
-            "laub: Spiegelrechnung weicht vom Kern ab ({menge:?} statt {schritte:?}) — \
+            "Spiegelrechnung weicht vom Kern ab ({menge:?} statt {schritte:?}) — \
              Farbe je Schritt kann verschoben sein"
         );
     }
@@ -2684,6 +2730,19 @@ mod tests {
         assert!(video_fertig(1, 10.0, 1.5), "kein neues Bild mehr");
         assert!(!video_fertig(1, 10.0, 1.4), "noch nicht lange genug still");
         assert!(video_fertig(1, 46.0, 0.0), "Notbremse greift");
+    }
+
+    /// Die Abtastung folgt der Videodauer: ~40 Proben, aber nie schneller als
+    /// 150 ms und nie langsamer als 2000 ms; ohne Dauer 400 ms.
+    #[test]
+    fn video_abstand_folgt_der_dauer() {
+        assert_eq!(video_abstand_ms(None), VIDEO_ABTAST_MS, "unbekannt: 400 ms");
+        assert_eq!(video_abstand_ms(Some(f32::NAN)), VIDEO_ABTAST_MS);
+        assert_eq!(video_abstand_ms(Some(0.0)), VIDEO_ABTAST_MS);
+        assert_eq!(video_abstand_ms(Some(12.3)), 308, "≈40 Proben, gerundet");
+        assert_eq!(video_abstand_ms(Some(1.0)), 150, "kurz: Untergrenze");
+        assert_eq!(video_abstand_ms(Some(6.0)), 150, "genau 40 Proben");
+        assert_eq!(video_abstand_ms(Some(120.0)), 2000, "lang: Obergrenze");
     }
 
     /// Ein Videobild wird wie ein Foto vorbereitet: verkleinert und mit der
