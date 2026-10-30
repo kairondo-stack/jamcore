@@ -1,0 +1,134 @@
+JAMCORE — BEDIENUNGSANLEITUNG DESKTOP-PAKET AUF DER KONSOLE (TTY/KMSDRM)
+========================================================================
+Stand 2026-10-30 · Tasten aus Programmausgabe/Quellcode geprüft.
+
+
+VORBEREITUNG
+------------
+1. Auf eine freie Konsole wechseln: Strg+Alt+F3 (oder F4 …).
+   Die Wayland-Sitzung läuft auf F1/F2 weiter.
+2. Start über das Skript (setzt SDL_VIDEODRIVER=kmsdrm, SDL_AUDIODRIVER=alsa):
+      tools/jamdesk-tty.sh <programm> [argumente]
+3. Zurück zur Sitzung: Strg+Alt+F1 (bzw. F2).
+
+Zugriff auf /dev/dri (Gruppe video) ist nötig — vorhanden.
+Auflösung: Standard 1280x720 auf 2880x1800 (per --size änderbar).
+Keine Fensterverwaltung, kein Maus-Zeiger garantiert — alles per Tastatur.
+Beenden der Programme: Esc (bzw. Q, siehe unten).
+
+
+PROGRAMME
+---------
+  rrn5              Bild/Farben -> Noten
+  pattern_recorder  Rhythmus-Recorder
+  imgsh             Bild in den Shared Memory (Quelle für rrn5)
+  lissa             Lissajous + zwei Stimmen
+  jamcast           CLI: Audio -> .it
+  schism            Schism Tracker (.it laden)
+
+
+1) rrn5 — BILD/FARBEN -> NOTEN
+------------------------------
+Aufruf:  tools/jamdesk-tty.sh rrn5 [--dir ~/Pictures] [--size 1280x720]
+         Ohne Ordner startet der Text-Dateibrowser:
+           19  frame4save.bmp
+           20  mpv-shot0001.jpg
+           Nummer wählen, Enter = diesen Ordner laden, .. = hoch, q = abbrechen
+
+  Z                 Kamera an/aus
+  8                 SHM-Modus
+  o                 Datei-Browser (Text-Auswahl: Nummer + Enter)
+  a                 OSC aus/an
+  F9                Stroboskop an/aus
+  F10               Stroboskop-Richtung
+  F11 / F12         Umdrehungen ÷ / ×
+  − / +             Takte ÷ / ×
+  Shift+F8          Scan: Linie / Spirale
+  Alt+− / Alt++     Spirale: Schrittweite ÷ / ×
+  Strg+o            Pattern-Ausgabe
+  Esc               Ende
+
+  Oszillator-Scan:
+  Shift+F1          Anzeige: grün ⇄ echte Farben
+  Shift+F2          Linie an/aus
+  Shift+F3          Linie verschieben (Klick setzt, ←/→ schieben)
+  Shift+F4          Bereich statt Linie
+  Shift+F5          Sweep / alle Spalten
+  Shift+F6          Takt-Maske / alle y
+  Shift+F7          Harmonie-x: Gesamt / Bereich
+  Alt+− / Alt++     Bereichs-Dauer ÷ / ×
+
+  Hinweis: rrn5 legt „ZeitfaktoSharedMemory“ selbst an, wenn pattern_recorder
+  nicht läuft (Konsole). Tempo-Sync läuft dann auf der internen Uhr.
+
+
+2) pattern_recorder — RHYTHMUS
+------------------------------
+Aufruf:  tools/jamdesk-tty.sh pattern_recorder
+  0                 Stop
+  1 … 9             Wert/Note
+  Q / E             Faktor 2 / 4
+  X C V B N M       Schrittweiten 7 · 15 · 2 · 5 · 11 · 23
+  Y                 Schritt 3
+  S / D / W         Auswahl Kk / Kr / keine
+  A                 „Alles eins“
+  Bild↑ / Bild↓     Seite auf/ab
+  F1 … F10          Noten-Tasten
+  ← / → / ↑ / ↓     Navigation
+  Enter             übernehmen
+  Esc               Ende
+
+
+3) lissa — LISSAJOUS
+--------------------
+Aufruf:  tools/jamdesk-tty.sh lissa
+  x / y             Achse wählen
+  − / +             Verhältnis
+  ← / →             X-Achse
+  ↑ / ↓             Y-Achse
+  1 … 6             Presets
+  m                 Sägezahn / weich
+  l / r             endlos links / rechts
+  , / .             Umdrehungen ÷2 / ×2
+  [ / ]             Takte ÷2 / ×2
+  t                 Ton an/aus
+  z / h             Grundton
+  b / n             BPM
+  Esc               Ende
+
+
+4) imgsh — BILD IN DEN SHARED MEMORY
+------------------------------------
+Aufruf:  tools/jamdesk-tty.sh imgsh bild.png [weitere …]
+  ← / →             voriges / nächstes Bild
+  Enter             neu laden
+  S                 Snapshot (TGA)
+  Esc               Ende
+  (rrn5 liest dieses Bild über den SHM-Modus „8“.)
+
+
+5) jamcast — AUDIO -> .it (CLI, keine Tasten)
+---------------------------------------------
+  tools/jamdesk-tty.sh jamcast stimme.wav --genre techno --bpm 120 \
+      --raster 128 --feinheit 32 --ausgabe stimme.it
+  Optionen: --bpm 32…255 · --raster 1…256 · --feinheit 16|32|64 ·
+            --genre techno|groove|breakbeat|dnb · --instrument 0…3 ·
+            --ausgabe <datei.it> · --hilfe
+
+
+6) SCHISM TRACKER
+-----------------
+  tools/jamdesk-tty.sh schism /pfad/datei.it
+  F1                Hilfe im Programm
+  .it enthält Order + Song-Message (Quelle/Datum/Dauer).
+
+
+KONSOLE — BESONDERHEITEN
+------------------------
+- Text-Auswahl: auf einer nackten Konsole gibt es **keine Maus-Auswahl**
+  (dafür bräuchte es gpm oder tmux/screen) — Befehle kurz tippen.
+- Kein Alt+Tab: jedes Programm belegt den Bildschirm; Esc beendet.
+- Absturz-Diagnose: Ausgaben landen im Log, z. B.
+      ~/tty-rrn5.sh     → /tmp/opencode/tty2-rrn5.log
+- Wenn ein Programm „hängt“: oft wartet es auf eine Texteingabe
+  (z. B. rrn5-Dateibrowser: Nummer + Enter, q = abbrechen).

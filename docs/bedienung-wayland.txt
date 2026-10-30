@@ -1,0 +1,141 @@
+JAMCORE — BEDIENUNGSANLEITUNG DESKTOP-PAKET (WINDOWMANAGER / WAYLAND)
+=====================================================================
+Stand 2026-10-30 · Alle Tasten wurden aus Programmausgabe bzw. Quellcode geprüft.
+
+
+START UND STOP
+--------------
+Starten:        tools/jamdesk.sh
+                → Arbeitsfläche 9: Renoise (Vollbild-Hintergrund, 27 % Deckkraft),
+                  rechts drei Shells: pattern_recorder, rrn5, OSC & Logs.
+Nur Tools:      tools/jamdesk.sh --ohne-renoise
+Beenden:        tools/jamdesk.sh --stop
+Arbeitsfläche:  Super+9 (Hyprland) — dorthin werden die Fenster gelegt.
+Fenster:        frei schwebend; verschieben mit Super+Linksklick,
+                Größe mit Super+Rechtsklick, schließen mit Super+C.
+
+
+DIE PROGRAMME
+-------------
+  rrn5              Bild/Farben -> Noten (Farbrad, Scan, Stroboskop, Spirale)
+  pattern_recorder  Rhythmus-Recorder (Referenz für Maske 2)
+  imgsh             Bildbetrachter, legt das Bild in den Shared Memory
+  lissa             Lissajous-Figur mit zwei Stimmen
+  jamcast           CLI: Audio (Sprache/Musik) -> .it + .csv
+  bundle_udp        CLI: OSC-Relay Handys -> Renoise
+  it_live           CLI: Modul-Renderer (.it)
+  Schism Tracker    extern: .it laden/abspielen (F1 = Hilfe im Programm)
+
+
+1) rrn5 — BILD/FARBEN -> NOTEN
+------------------------------
+  Z                 Kamera an/aus
+  8                 SHM-Modus (Bild aus imgsh/Shared Memory)
+  o                 Datei-Browser (Bildordner/-datei wählen)
+  a                 OSC aus/an
+  F9                Stroboskop an/aus
+  F10               Stroboskop-Richtung
+  F11 / F12         Umdrehungen ÷ / ×
+  − / +             Takte ÷ / ×
+  Shift+F8          Scan: Linie / Spirale
+  Alt+− / Alt++     Spirale: Schrittweite ÷ / ×
+  Strg+o            Pattern-Ausgabe (Text)
+  Esc               Ende
+
+  Oszillator-Scan:
+  Shift+F1          Anzeige: grün ⇄ echte Farben
+  Shift+F2          Linie an/aus
+  Shift+F3          Linie verschieben (Klick setzt, ←/→ schieben)
+  Shift+F4          Bereich statt Linie
+  Shift+F5          Sweep / alle Spalten
+  Shift+F6          Takt-Maske / alle y
+  Shift+F7          Harmonie-x: Gesamt / Bereich
+  Alt+− / Alt++     Bereichs-Dauer ÷ / × (1/64 … 4 Takt)
+
+  Start mit Ordner: ./result/bin/rrn5 --dir ~/Pictures   (lädt alle Bilder)
+  Fenstergröße:     --size 1280x720
+  Video:            --video datei.mp4
+
+
+2) pattern_recorder — RHYTHMUS AUFNEHMEN
+----------------------------------------
+  0                 Stop (Aufnahme beenden)
+  1 … 9             Wert/Note (Zahlentasten/Nummernblock)
+  Q / E             Faktor 2 / 4
+  X C V B N M       Schrittweiten 7 · 15 · 2 · 5 · 11 · 23
+  Y                 Schritt 3
+  S / D / W         Auswahl Kk / Kr / keine
+  A                 „Alles eins“
+  Bild↑ / Bild↓     Seite auf/ab
+  F1 … F10          Noten-Tasten
+  ← / → / ↑ / ↓     Navigation
+  Enter             übernehmen
+  Esc               Ende
+
+
+3) lissa — LISSAJOUS + ZWEI STIMMEN
+-----------------------------------
+  x / y             Achse wählen
+  − / +             Verhältnis
+  ← / →             X-Achse
+  ↑ / ↓             Y-Achse
+  1 … 6             Presets (2:2, 2:3, 1:2, 3:2, 3:4, 4:5)
+  m                 Sägezahn / weich
+  l / r             endlos links / rechts
+  , / .             Umdrehungen ÷2 / ×2
+  [ / ]             Takte ÷2 / ×2
+  t                 Ton an/aus
+  z / h             Grundton
+  b / n             BPM
+  Esc               Ende
+
+
+4) imgsh — BILD IN DEN SHARED MEMORY
+------------------------------------
+  Aufruf:  ./result/bin/imgsh bild.png [weitere Bilder …]
+  ← / →             voriges / nächstes Bild
+  Enter             aktuelles Bild neu laden
+  S                 Snapshot als TGA
+  Esc               Ende
+
+
+5) jamcast — AUDIO -> .it (CLI)
+-------------------------------
+  ./result/bin/jamcast <audio> [Optionen]
+    --bpm 120                 Tempo (32…255)
+    --raster 128              Schritte je Takt (1…256)
+    --feinheit 16|32|64       Zeilen je Takt
+    --genre techno|groove|breakbeat|dnb
+    --instrument 0…3          Sinus/Dreieck/Sägezahn/Rechteck
+    --ausgabe datei.it        Zielpfad
+    --hilfe                   Hilfe
+  Ergebnis: .it (Order + Song-Message) und .csv
+
+
+6) bundle_udp — OSC-RELAY (CLI)
+-------------------------------
+  ./result/bin/bundle_udp 127.0.0.1            → alle Handys an Port 7003
+  OSC_MAP="10.0.0.5=127.0.0.1:7005,…" ./result/bin/bundle_udp
+  Beenden: Strg+C
+
+
+7) it_live — MODUL-RENDERER (CLI)
+---------------------------------
+  ./result/bin/it_live track.it
+  Beenden: Strg+C
+
+
+8) SCHISM TRACKER (IMPORT)
+--------------------------
+  schismtracker datei.it
+  F1                Hilfe im Programm
+  Die .it aus jamcast/der App enthält Order und Song-Message
+  (Quelle, Datum, Dauer) — sichtbar im Song-Info-Dialog.
+
+
+HINWEISE
+--------
+- Auf Wayland laufen alle SDL-Programme normal im Fenster.
+- Renoise startet auf NixOS über steam-run:
+  NIXPKGS_ALLOW_UNFREE=1 nix-shell -p steam-run --run "steam-run ./renoise"
+- OSC-Ziel in der App = Laptop-IP; Renoise-OSC-Port 7000.
