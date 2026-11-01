@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+sudo mount -o bind /home/tuxedo/Pictures/ /home/tuxedo/Documents/Default\ Project/picture/
+sudo mount -o bind /home/tuxedo/Videos/ /home/tuxedo/Documents/Default\ Project/picture/
 # jamdesk — startet das JamCore-Desktop-Paket übersichtlich auf einem
 # Hyprland-Workspace: links Renoise, rechts drei Shell-Fenster
 # (pattern_recorder, rrn5, OSC-Relay/Logs).
@@ -88,7 +90,7 @@ done < <(hyprctl monitors -j | tr -d '\n' | sed 's/},{/}\n{/g')
 MW=${MW:-2880}; MH=${MH:-1800}
 LINKS=$((MW * 58 / 100))
 RECHTS=$((MW - LINKS))
-H3=$((MH / 3))
+H4=$((MH / 4))
 
 echo "JamCore-Desktop auf Workspace ${WS:-?} (${MW}x${MH})"
 
@@ -103,14 +105,20 @@ fi
 shell "JamCore: pattern_recorder" "cd '$ROOT' && '$BIN/pattern_recorder'" 
 shell "JamCore: rrn5" "cd '$ROOT' && '$BIN/rrn5' --size 800x600"
 shell "JamCore: OSC & Logs" "cd '$ROOT' && echo 'bundle_udp -> 127.0.0.1:7003' && '$BIN/bundle_udp' 127.0.0.1"
+# Desktop-Recorder (Aufnahme + Video-Player mit variabler Fenstergröße).
+shell "JamCore: Desktop-Recorder" "cd '$ROOT' && tools/jam-rec.sh"
 
 sleep 1
 [ "$MIT_RENOISE" = 1 ] && setze "Renoise" 0 0 "$MW" "$MH"
-setze "JamCore: pattern_recorder" "$LINKS" 0 "$RECHTS" "$H3"
-setze "JamCore: rrn5" "$LINKS" "$H3" "$RECHTS" "$H3"
-setze "JamCore: OSC & Logs" "$LINKS" $((H3 * 2)) "$RECHTS" "$((MH - H3 * 2))"
+setze "JamCore: pattern_recorder" "$LINKS" 0 "$RECHTS" "$H4"
+setze "JamCore: rrn5" "$LINKS" "$H4" "$RECHTS" "$H4"
+setze "JamCore: OSC & Logs" "$LINKS" $((H4 * 2)) "$RECHTS" "$H4"
+setze "JamCore: Desktop-Recorder" "$LINKS" $((H4 * 3)) "$RECHTS" "$((MH - H4 * 3))"
 
 # Zur Arbeitsfläche wechseln, damit das Paket direkt sichtbar ist.
 hyprctl dispatch workspace "$WS" >/dev/null 2>&1
 
 echo "Fertig. Beenden: tools/jamdesk.sh --stop"
+
+sudo umount -o bind /home/tuxedo/Pictures/ /home/tuxedo/Documents/Default\ Project/picture/
+sudo umount -o bind /home/tuxedo/Videos/ /home/tuxedo/Documents/Default\ Project/picture/
